@@ -44,6 +44,7 @@
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
+#include "utils/session_state.h"
 
 #include "cdb/cdbmutate.h"		/* cdbmutate_warn_ctid_without_segid */
 #include "cdb/cdbpath.h"		/* cdbpath_rows() */
@@ -166,6 +167,7 @@ make_one_rel(PlannerInfo *root, List *joinlist)
 	/*
 	 * Generate access paths for the base rels.
 	 */
+	ereport(NOTICE, (errmsg("%s sessionVmem = %i", __func__, MySessionState->sessionVmem)));
 	set_base_rel_sizes(root);
 
 	/*
