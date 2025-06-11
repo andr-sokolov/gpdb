@@ -245,6 +245,20 @@ drop tuple rule nonesuch;
 drop instance rule nonesuch on noplace;
 drop rewrite rule nonesuch;
 
+
+-- start_matchsubs
+--
+-- # SPARC diff for divide by zero:
+-- # ignore the floating point error
+-- m/ERROR\:.*floating\-point exception/
+-- s/(.*)/GP_IGNORE: $1/
+--
+-- # change the detail to the "correct" error
+-- m/DETAIL\:\s+An invalid floating\-point operation was signaled.*division by zer/
+-- s/(.*)/ERROR:  division by zero/
+--
+-- end_matchsubs
+
 --
 -- Check that division-by-zero is properly caught.
 --

@@ -71,8 +71,7 @@ typedef struct _parallelReadyList
 static ArchiveHandle *_allocAH(const char *FileSpec, const ArchiveFormat fmt,
 							   const int compression, bool dosync, ArchiveMode mode,
 							   SetupWorkerPtrType setupWorkerPtr);
-static void _getObjectDescription(PQExpBuffer buf, TocEntry *te,
-								  ArchiveHandle *AH);
+static void _getObjectDescription(PQExpBuffer buf, TocEntry *te);
 static void _printTocEntry(ArchiveHandle *AH, TocEntry *te, bool isData);
 static char *sanitize_line(const char *str, bool want_hyphen);
 static void _doSetFixedOutputState(ArchiveHandle *AH);
@@ -92,7 +91,7 @@ static bool _tocEntryIsACL(TocEntry *te);
 static void _disableTriggersIfNecessary(ArchiveHandle *AH, TocEntry *te);
 static void _enableTriggersIfNecessary(ArchiveHandle *AH, TocEntry *te);
 static void buildTocEntryArrays(ArchiveHandle *AH);
-static void _moveBefore(ArchiveHandle *AH, TocEntry *pos, TocEntry *te);
+static void _moveBefore(TocEntry *pos, TocEntry *te);
 static int	_discoverArchiveFormat(ArchiveHandle *AH);
 
 static int	RestoringToDB(ArchiveHandle *AH);
@@ -122,8 +121,7 @@ static int	TocEntrySizeCompare(const void *p1, const void *p2);
 static void move_to_ready_list(TocEntry *pending_list,
 							   ParallelReadyList *ready_list,
 							   RestorePass pass);
-static TocEntry *pop_next_work_item(ArchiveHandle *AH,
-									ParallelReadyList *ready_list,
+static TocEntry *pop_next_work_item(ParallelReadyList *ready_list,
 									ParallelState *pstate);
 static void mark_dump_job_done(ArchiveHandle *AH,
 							   TocEntry *te,
@@ -418,7 +416,7 @@ RestoreArchive(Archive *AHX)
 		AHX->minRemoteVersion = 0;
 		AHX->maxRemoteVersion = 9999999;
 
-		ConnectDatabase(AHX, &ropt->cparams, false);
+		ConnectDatabase(AHX, &ropt->cparams, false, false);
 
 		/*
 		 * If we're talking to the DB directly, don't send comments since they
@@ -462,7 +460,7 @@ RestoreArchive(Archive *AHX)
 	if (ropt->filename || ropt->compression)
 		SetOutput(AH, ropt->filename, ropt->compression);
 
-	ahprintf(AH, "--\n-- PostgreSQL database dump\n--\n\n");
+	ahprintf(AH, "--\n-- Greenplum Database database dump\n--\n\n");
 
 	if (AH->archiveRemoteVersion)
 		ahprintf(AH, "-- Dumped from database version %s\n",
@@ -494,11 +492,21 @@ RestoreArchive(Archive *AHX)
 	/*
 	 * Drop the items at the start, in reverse order
 	 */
-	if (ropt->dropSchema)
+	if (ropt->dropSchema || ropt->binary_upgrade)
 	{
 		for (te = AH->toc->prev; te != AH->toc; te = te->prev)
 		{
 			AH->currentTE = te;
+
+			/*
+			 * GPDB: In order to maintain the OID of the public schema during
+			 * binary upgrade, we have to drop (and recreate) it even if the
+			 * user doesn't specify --clean.
+			 */
+			if (ropt->binary_upgrade && !ropt->dropSchema &&
+				!(strcmp(te->desc, "SCHEMA") == 0 &&
+				  strcmp(te->tag, "public") == 0))
+				continue;
 
 			/*
 			 * In createDB mode, issue a DROP *only* for the database as a
@@ -733,7 +741,7 @@ RestoreArchive(Archive *AHX)
 	if (AH->public.verbose)
 		dumpTimestamp(AH, "Completed on", time(NULL));
 
-	ahprintf(AH, "--\n-- PostgreSQL database dump complete\n--\n\n");
+	ahprintf(AH, "--\n-- Greenplum Database database dump complete\n--\n\n");
 
 	/*
 	 * Clean up & we're done.
@@ -794,7 +802,9 @@ restore_toc_entry(ArchiveHandle *AH, TocEntry *te, bool is_parallel)
 		_printTocEntry(AH, te, false);
 		defnDumped = true;
 
-		if (strcmp(te->desc, "TABLE") == 0)
+		if (strcmp(te->desc, "TABLE") == 0 ||
+			strcmp(te->desc, "EXTERNAL TABLE") == 0 ||
+			strcmp(te->desc, "FOREIGN TABLE") == 0)
 		{
 			if (AH->lastErrorTE == te)
 			{
@@ -974,6 +984,10 @@ NewRestoreOptions(void)
 	opts->cparams.promptPassword = TRI_DEFAULT;
 	opts->dumpSections = DUMP_UNSECTIONED;
 
+	/* GPDB_92_MERGE_FIXEME: do we need the following two lines? */
+	opts->suppressDumpWarnings = false;
+	opts->exit_on_error = false;
+
 	return opts;
 }
 
@@ -997,7 +1011,9 @@ _disableTriggersIfNecessary(ArchiveHandle *AH, TocEntry *te)
 	_becomeUser(AH, ropt->superuser);
 
 	/*
-	 * Disable them.
+	 * Disable them.  Assume that the table name should be schema-qualified
+	 * (we can't look at PQserverVersion, since we might not have any
+	 * connection; and anyway we don't promise our output will load pre-7.3).
 	 */
 	ahprintf(AH, "ALTER TABLE %s DISABLE TRIGGER ALL;\n\n",
 			 fmtQualifiedId(te->namespace, te->tag));
@@ -1023,7 +1039,7 @@ _enableTriggersIfNecessary(ArchiveHandle *AH, TocEntry *te)
 	_becomeUser(AH, ropt->superuser);
 
 	/*
-	 * Enable them.
+	 * Enable them.  As above, force schema qualification.
 	 */
 	ahprintf(AH, "ALTER TABLE %s ENABLE TRIGGER ALL;\n\n",
 			 fmtQualifiedId(te->namespace, te->tag));
@@ -1046,6 +1062,37 @@ WriteData(Archive *AHX, const void *data, size_t dLen)
 
 	return;
 }
+
+/*
+ * Amend an existing TOC entry by changing its definition. This can be used
+ * in situations where the TOC entry must be restored first, but dumped last.
+ * By first issuing the ArchiveEntry() to create a TOC with a placeholder
+ * defn, the defn can be updated with the actual contents later using this.
+ * The current usecase is binary upgrade Oid preassignment where we need to
+ * restore the preassignments before any object that allocate Oids has been
+ * created, but the definition of the preassignments can only be dumped last
+ * when we've seen all the relevant Oids.
+ */
+void
+AmendArchiveEntry(Archive *AHX, DumpId dumpId, const char *defn)
+{
+	ArchiveHandle *AH = (ArchiveHandle *) AHX;
+
+	TocEntry *toc = AH->toc;
+
+	while (toc)
+	{
+		if (toc->dumpId == dumpId)
+		{
+			if (toc->defn)
+				pg_free(toc->defn);
+			toc->defn = pg_strdup(defn);
+			return;
+		}
+		toc = toc->next;
+	}
+}
+
 
 /*
  * Create a new TOC entry. The TOC was designed as a TOC, but is now the
@@ -1442,7 +1489,7 @@ SortTocFromFile(Archive *AHX)
 		 * side-effects on the order in which restorable items actually get
 		 * restored.
 		 */
-		_moveBefore(AH, AH->toc, te);
+		_moveBefore(AH->toc, te);
 	}
 
 	if (fclose(fh) != 0)
@@ -1793,7 +1840,7 @@ warn_or_exit_horribly(ArchiveHandle *AH, const char *fmt,...)
 #ifdef NOT_USED
 
 static void
-_moveAfter(ArchiveHandle *AH, TocEntry *pos, TocEntry *te)
+			_moveAfter(ArchiveHandle *AH pg_attribute_unused(), TocEntry *pos, TocEntry *te)
 {
 	/* Unlink te from list */
 	te->prev->next = te->next;
@@ -1808,7 +1855,7 @@ _moveAfter(ArchiveHandle *AH, TocEntry *pos, TocEntry *te)
 #endif
 
 static void
-_moveBefore(ArchiveHandle *AH, TocEntry *pos, TocEntry *te)
+_moveBefore(TocEntry *pos, TocEntry *te)
 {
 	/* Unlink te from list */
 	te->prev->next = te->next;
@@ -2904,7 +2951,9 @@ _tocEntryRequired(TocEntry *te, teSection curSection, ArchiveHandle *AH)
 				strcmp(te->desc, "MATERIALIZED VIEW") == 0 ||
 				strcmp(te->desc, "MATERIALIZED VIEW DATA") == 0 ||
 				strcmp(te->desc, "SEQUENCE") == 0 ||
-				strcmp(te->desc, "SEQUENCE SET") == 0)
+				strcmp(te->desc, "SEQUENCE SET") == 0 ||
+				/* Greenplum additions */
+				strcmp(te->desc, "EXTERNAL TABLE") == 0)
 			{
 				if (!ropt->selTable)
 					return 0;
@@ -3068,6 +3117,16 @@ _tocEntryIsACL(TocEntry *te)
 static void
 _doSetFixedOutputState(ArchiveHandle *AH)
 {
+	/*
+	 * SET gp_default_storage_options GUC to built-in default values (similar
+	 * to resetAOStorageOpts function) to prevent restoring a table into a
+	 * different storage format. Note that this works assuming the built-in
+	 * default values dictated by resetAOStorageOpts function are the same
+	 * between database versions that the data is being dumped from and
+	 * restored to.
+	 */
+	ahprintf(AH, "SET gp_default_storage_options = '';\n");
+
 	RestoreOptions *ropt = AH->public.ropt;
 
 	/*
@@ -3391,6 +3450,8 @@ _selectTableAccessMethod(ArchiveHandle *AH, const char *tableam)
 
 	destroyPQExpBuffer(cmd);
 
+	if (AH->currTableAm)
+		free(AH->currTableAm);
 	AH->currTableAm = pg_strdup(want);
 }
 
@@ -3400,7 +3461,7 @@ _selectTableAccessMethod(ArchiveHandle *AH, const char *tableam)
  * This is used for ALTER ... OWNER TO.
  */
 static void
-_getObjectDescription(PQExpBuffer buf, TocEntry *te, ArchiveHandle *AH)
+_getObjectDescription(PQExpBuffer buf, TocEntry *te)
 {
 	const char *type = te->desc;
 
@@ -3414,6 +3475,8 @@ _getObjectDescription(PQExpBuffer buf, TocEntry *te, ArchiveHandle *AH)
 		strcmp(type, "CONVERSION") == 0 ||
 		strcmp(type, "DOMAIN") == 0 ||
 		strcmp(type, "TABLE") == 0 ||
+		strcmp(type, "EXTERNAL TABLE") == 0 ||
+		strcmp(type, "FOREIGN TABLE") == 0 ||
 		strcmp(type, "TYPE") == 0 ||
 		strcmp(type, "FOREIGN TABLE") == 0 ||
 		strcmp(type, "TEXT SEARCH DICTIONARY") == 0 ||
@@ -3453,7 +3516,9 @@ _getObjectDescription(PQExpBuffer buf, TocEntry *te, ArchiveHandle *AH)
 		strcmp(type, "OPERATOR") == 0 ||
 		strcmp(type, "OPERATOR CLASS") == 0 ||
 		strcmp(type, "OPERATOR FAMILY") == 0 ||
-		strcmp(type, "PROCEDURE") == 0)
+		strcmp(type, "PROCEDURE") == 0 ||
+		/* Greenplum Additions */
+		strcmp(type, "PROTOCOL") == 0)
 	{
 		/* Chop "DROP " off the front and make a modifiable copy */
 		char	   *first = pg_strdup(te->dropStmt + 5);
@@ -3593,6 +3658,8 @@ _printTocEntry(ArchiveHandle *AH, TocEntry *te, bool isData)
 			strcmp(te->desc, "SCHEMA") == 0 ||
 			strcmp(te->desc, "EVENT TRIGGER") == 0 ||
 			strcmp(te->desc, "TABLE") == 0 ||
+			strcmp(te->desc, "EXTERNAL TABLE") == 0 ||
+			strcmp(te->desc, "FOREIGN TABLE") == 0 ||
 			strcmp(te->desc, "TYPE") == 0 ||
 			strcmp(te->desc, "VIEW") == 0 ||
 			strcmp(te->desc, "MATERIALIZED VIEW") == 0 ||
@@ -3602,6 +3669,7 @@ _printTocEntry(ArchiveHandle *AH, TocEntry *te, bool isData)
 			strcmp(te->desc, "TEXT SEARCH CONFIGURATION") == 0 ||
 			strcmp(te->desc, "FOREIGN DATA WRAPPER") == 0 ||
 			strcmp(te->desc, "SERVER") == 0 ||
+			strcmp(te->desc, "PROTOCOL") == 0 ||
 			strcmp(te->desc, "STATISTICS") == 0 ||
 			strcmp(te->desc, "PUBLICATION") == 0 ||
 			strcmp(te->desc, "SUBSCRIPTION") == 0)
@@ -3609,7 +3677,7 @@ _printTocEntry(ArchiveHandle *AH, TocEntry *te, bool isData)
 			PQExpBuffer temp = createPQExpBuffer();
 
 			appendPQExpBufferStr(temp, "ALTER ");
-			_getObjectDescription(temp, te, AH);
+			_getObjectDescription(temp, te);
 			appendPQExpBuffer(temp, " OWNER TO %s;", fmtId(te->owner));
 			ahprintf(AH, "%s\n\n", temp->data);
 			destroyPQExpBuffer(temp);
@@ -3625,7 +3693,8 @@ _printTocEntry(ArchiveHandle *AH, TocEntry *te, bool isData)
 				 strcmp(te->desc, "TRIGGER") == 0 ||
 				 strcmp(te->desc, "ROW SECURITY") == 0 ||
 				 strcmp(te->desc, "POLICY") == 0 ||
-				 strcmp(te->desc, "USER MAPPING") == 0)
+				 strcmp(te->desc, "USER MAPPING") == 0 ||
+				 strcmp(te->desc, "BINARY UPGRADE"))
 		{
 			/* these object types don't have separate owners */
 		}
@@ -4043,7 +4112,7 @@ restore_toc_entries_parallel(ArchiveHandle *AH, ParallelState *pstate,
 	for (;;)
 	{
 		/* Look for an item ready to be dispatched to a worker */
-		next_work_item = pop_next_work_item(AH, &ready_list, pstate);
+		next_work_item = pop_next_work_item(&ready_list, pstate);
 		if (next_work_item != NULL)
 		{
 			/* If not to be restored, don't waste time launching a worker */
@@ -4065,6 +4134,22 @@ restore_toc_entries_parallel(ArchiveHandle *AH, ParallelState *pstate,
 			/* Dispatch to some worker */
 			DispatchJobForTocEntry(AH, pstate, next_work_item, ACT_RESTORE,
 								   mark_restore_job_done, &ready_list);
+		}
+		else if (IsEveryWorkerIdle(pstate))
+		{
+			/*
+			 * Nothing is ready and no worker is running, so we're done with
+			 * the current pass or maybe with the whole process.
+			 */
+			if (AH->restorePass == RESTORE_PASS_LAST)
+				break;			/* No more parallel processing is possible */
+
+			/* Advance to next restore pass */
+			AH->restorePass++;
+			/* That probably allows some stuff to be made ready */
+			move_to_ready_list(pending_list, &ready_list, AH->restorePass);
+			/* Loop around to see if anything's now ready */
+			continue;
 		}
 		else if (IsEveryWorkerIdle(pstate))
 		{
@@ -4135,7 +4220,7 @@ restore_toc_entries_postfork(ArchiveHandle *AH, TocEntry *pending_list)
 	/*
 	 * Now reconnect the single parent connection.
 	 */
-	ConnectDatabase((Archive *) AH, &ropt->cparams, true);
+	ConnectDatabase((Archive *) AH, &ropt->cparams, true, false);
 
 	/* re-establish fixed state */
 	_doSetFixedOutputState(AH);
@@ -4347,7 +4432,7 @@ move_to_ready_list(TocEntry *pending_list,
  * no remaining dependencies, but we have to check for lock conflicts.
  */
 static TocEntry *
-pop_next_work_item(ArchiveHandle *AH, ParallelReadyList *ready_list,
+pop_next_work_item(ParallelReadyList *ready_list,
 				   ParallelState *pstate)
 {
 	/*
@@ -4800,7 +4885,7 @@ CloneArchive(ArchiveHandle *AH)
 	 * Connect our new clone object to the database, using the same connection
 	 * parameters used for the original connection.
 	 */
-	ConnectDatabase((Archive *) clone, &clone->public.ropt->cparams, true);
+	ConnectDatabase((Archive *) clone, &clone->public.ropt->cparams, true, false);
 
 	/* re-establish fixed state */
 	if (AH->mode == archModeRead)

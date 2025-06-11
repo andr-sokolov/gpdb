@@ -1193,8 +1193,8 @@ SimpleLruFlush(SlruCtl ctl, bool allow_redirtied)
  * when the SLRU is quite full, SimpleLruTruncate() might delete that segment
  * after it has accrued freshly-written data.
  */
-void
-SimpleLruTruncate(SlruCtl ctl, int cutoffPage)
+static void
+SimpleLruTruncate_internal(SlruCtl ctl, int cutoffPage, bool lockHeld)
 {
 	SlruShared	shared = ctl->shared;
 	int			slotno;
@@ -1205,7 +1205,8 @@ SimpleLruTruncate(SlruCtl ctl, int cutoffPage)
 	 * or just after a checkpoint, any dirty pages should have been flushed
 	 * already ... we're just being extra careful here.)
 	 */
-	LWLockAcquire(shared->ControlLock, LW_EXCLUSIVE);
+	if (!lockHeld)
+		LWLockAcquire(shared->ControlLock, LW_EXCLUSIVE);
 
 restart:;
 
@@ -1215,7 +1216,9 @@ restart:;
 	 */
 	if (ctl->PagePrecedes(shared->latest_page_number, cutoffPage))
 	{
-		LWLockRelease(shared->ControlLock);
+		if (!lockHeld)
+			LWLockRelease(shared->ControlLock);
+
 		ereport(LOG,
 				(errmsg("could not truncate directory \"%s\": apparent wraparound",
 						ctl->Dir)));
@@ -1256,10 +1259,22 @@ restart:;
 		goto restart;
 	}
 
-	LWLockRelease(shared->ControlLock);
+	if (!lockHeld)
+		LWLockRelease(shared->ControlLock);
 
 	/* Now we can remove the old segment(s) */
 	(void) SlruScanDirectory(ctl, SlruScanDirCbDeleteCutoff, &cutoffPage);
+}
+void
+SimpleLruTruncate(SlruCtl ctl, int cutoffPage)
+{
+	SimpleLruTruncate_internal(ctl, cutoffPage, false);
+}
+/* Like SimpleLruTruncate, but we're already holding the control lock */
+void
+SimpleLruTruncateWithLock(SlruCtl ctl, int cutoffPage)
+{
+	SimpleLruTruncate_internal(ctl, cutoffPage, true);
 }
 
 /*

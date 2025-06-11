@@ -56,6 +56,8 @@ static StringInfo tblspc_map_file;
  *
  * Permission checking for this function is managed through the normal
  * GRANT system.
+
+ * **Note :- Currently this functionality is not supported.**
  */
 Datum
 pg_start_backup(PG_FUNCTION_ARGS)
@@ -66,6 +68,11 @@ pg_start_backup(PG_FUNCTION_ARGS)
 	char	   *backupidstr;
 	XLogRecPtr	startpoint;
 	SessionBackupState status = get_backup_status();
+
+	ereport(NOTICE,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("pg_start_backup() is not supported in Greenplum Database"),
+			 errhint("Contact support to get more information and resolve the issue")));
 
 	backupidstr = text_to_cstring(backupid);
 
@@ -120,12 +127,19 @@ pg_start_backup(PG_FUNCTION_ARGS)
  *
  * Permission checking for this function is managed through the normal
  * GRANT system.
+ *
+ * **Note :- Currently this functionality is not supported.**
  */
 Datum
 pg_stop_backup(PG_FUNCTION_ARGS)
 {
-	XLogRecPtr	stoppoint;
+	XLogRecPtr	stoppoint = InvalidXLogRecPtr;
 	SessionBackupState status = get_backup_status();
+
+	ereport(NOTICE,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("pg_stop_backup() is not supported in Greenplum Database"),
+			 errhint("Contact support to get more information and resolve the issue")));
 
 	if (status == SESSION_BACKUP_NON_EXCLUSIVE)
 		ereport(ERROR,

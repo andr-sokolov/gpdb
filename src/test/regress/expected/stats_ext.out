@@ -1,4 +1,9 @@
 -- Generic extended statistics support
+-- By default, Greenplum computes selectivity slightly differently from
+-- upstream. Disable selectivity damping for these tests, so that we get
+-- roughly the same estimates as in upstream.
+set gp_selectivity_damping_for_scans = off;
+set gp_selectivity_damping_for_joins = off;
 -- We will be checking execution plans without/with statistics, so
 -- let's make sure we get simple non-parallel plans. Also set the
 -- work_mem low so that we can use small amounts of data.
@@ -89,6 +94,7 @@ ALTER TABLE ab1 DROP COLUMN a;
  c      | integer |           |          | 
 Statistics objects:
     "public"."ab1_b_c_stats" (ndistinct, dependencies, mcv) ON b, c FROM ab1
+Distributed randomly
 
 -- Ensure statistics are dropped when table is
 SELECT stxname FROM pg_statistic_ext WHERE stxname LIKE 'ab1%';
@@ -143,7 +149,7 @@ SELECT * FROM check_estimated_rows('SELECT a, b FROM stxdinh* GROUP BY 1, 2');
 SELECT * FROM check_estimated_rows('SELECT a, b FROM stxdinh* WHERE a = 0 AND b = 0');
  estimated | actual 
 -----------+--------
-         3 |     40
+         9 |     40
 (1 row)
 
 CREATE STATISTICS stxdinh ON a, b FROM stxdinh;
@@ -161,7 +167,7 @@ SELECT * FROM check_estimated_rows('SELECT a, b FROM stxdinh* GROUP BY 1, 2');
 SELECT * FROM check_estimated_rows('SELECT a, b FROM stxdinh* WHERE a = 0 AND b = 0');
  estimated | actual 
 -----------+--------
-        22 |     40
+        26 |     40
 (1 row)
 
 DROP TABLE stxdinh, stxdinh1, stxdinh2;
@@ -265,16 +271,18 @@ SELECT * FROM check_estimated_rows('SELECT COUNT(*) FROM ndistinct GROUP BY a, b
        100 |     11
 (1 row)
 
+-- GPDB: the next two fall back to the default ndistinct estimate, which is 200 in
+-- PostgreSQL and 1000 in Greenplum.
 SELECT * FROM check_estimated_rows('SELECT COUNT(*) FROM ndistinct GROUP BY a, b, c, d');
  estimated | actual 
 -----------+--------
-       200 |     11
+      1000 |     11
 (1 row)
 
 SELECT * FROM check_estimated_rows('SELECT COUNT(*) FROM ndistinct GROUP BY b, c, d');
  estimated | actual 
 -----------+--------
-       200 |     11
+      1000 |     11
 (1 row)
 
 -- correct command
@@ -317,16 +325,17 @@ SELECT * FROM check_estimated_rows('SELECT COUNT(*) FROM ndistinct GROUP BY a, b
 
 -- last two plans keep using Group Aggregate, because 'd' is not covered
 -- by the statistic and while it's NULL-only we assume 200 values for it
+-- (In Greenplum the default estimate is 1000, not 200)
 SELECT * FROM check_estimated_rows('SELECT COUNT(*) FROM ndistinct GROUP BY a, b, c, d');
  estimated | actual 
 -----------+--------
-       200 |     11
+      1000 |     11
 (1 row)
 
 SELECT * FROM check_estimated_rows('SELECT COUNT(*) FROM ndistinct GROUP BY b, c, d');
  estimated | actual 
 -----------+--------
-       200 |     11
+      1000 |     11
 (1 row)
 
 TRUNCATE TABLE ndistinct;
@@ -373,7 +382,7 @@ SELECT * FROM check_estimated_rows('SELECT COUNT(*) FROM ndistinct GROUP BY b, c
 SELECT * FROM check_estimated_rows('SELECT COUNT(*) FROM ndistinct GROUP BY a, d');
  estimated | actual 
 -----------+--------
-       500 |     50
+      1000 |     50
 (1 row)
 
 DROP STATISTICS s10;
@@ -401,19 +410,19 @@ SELECT * FROM check_estimated_rows('SELECT COUNT(*) FROM ndistinct GROUP BY a, b
 SELECT * FROM check_estimated_rows('SELECT COUNT(*) FROM ndistinct GROUP BY a, b, c, d');
  estimated | actual 
 -----------+--------
-       500 |   5000
+      1000 |   5000
 (1 row)
 
 SELECT * FROM check_estimated_rows('SELECT COUNT(*) FROM ndistinct GROUP BY b, c, d');
  estimated | actual 
 -----------+--------
-       500 |   1632
+      1000 |   1632
 (1 row)
 
 SELECT * FROM check_estimated_rows('SELECT COUNT(*) FROM ndistinct GROUP BY a, d');
  estimated | actual 
 -----------+--------
-       500 |     50
+      1000 |     50
 (1 row)
 
 -- functional dependencies tests
@@ -900,3 +909,281 @@ NOTICE:  drop cascades to 2 other objects
 DETAIL:  drop cascades to table tststats.priv_test_tbl
 drop cascades to view tststats.priv_test_view
 DROP USER regress_stats_user1;
+    -- Test pg_ndistinct_in
+drop table if exists tbl_distinct;
+NOTICE:  table "tbl_distinct" does not exist, skipping
+create table tbl_distinct(i int, ii pg_ndistinct);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'i' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+insert into tbl_distinct values (1, '{"1, 2": 1}');
+insert into tbl_distinct values (2, '{"1, 2": 2, "1, 3": 3, "2, 3": 2, "1, 2, 3": 3}');
+insert into tbl_distinct values (3, '{"123, 234": 11}');
+select * from tbl_distinct;
+ i |                       ii                        
+---+-------------------------------------------------
+ 2 | {"1, 2": 2, "1, 3": 3, "2, 3": 2, "1, 2, 3": 3}
+ 3 | {"123, 234": 11}
+ 1 | {"1, 2": 1}
+(3 rows)
+
+-- leading space
+insert into tbl_distinct values (1, ' {"1, 2": 1}');
+-- trailing space
+insert into tbl_distinct values (1, '{"1, 2": 1} ');
+-- unmatched quote
+insert into tbl_distinct values (1, '{"1", 2": 1} ');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_distinct values (1, '{"1", 2": 1} ');
+                                            ^
+DETAIL:  syntax error at or near """
+-- space in attribute list
+insert into tbl_distinct values (1, '{"1 3, 2": 1} ');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_distinct values (1, '{"1 3, 2": 1} ');
+                                            ^
+DETAIL:  syntax error at or near "3"
+-- colon in attribute list
+insert into tbl_distinct values (1, '{"1: 2": 1}');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_distinct values (1, '{"1: 2": 1}');
+                                            ^
+DETAIL:  syntax error at or near ":"
+insert into tbl_distinct values (1, '{"1, 2:" 1}');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_distinct values (1, '{"1, 2:" 1}');
+                                            ^
+DETAIL:  syntax error at or near ":"
+insert into tbl_distinct values (1, '{":1 2": 1}');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_distinct values (1, '{":1 2": 1}');
+                                            ^
+DETAIL:  syntax error at or near ":"
+-- zero/single item attribute list
+insert into tbl_distinct values (1, '{"1": 1}');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_distinct values (1, '{"1": 1}');
+                                            ^
+DETAIL:  syntax error at or near """
+insert into tbl_distinct values (1, '{: 1}');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_distinct values (1, '{: 1}');
+                                            ^
+DETAIL:  syntax error at or near ":"
+insert into tbl_distinct values (1, '{"": 1}');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_distinct values (1, '{"": 1}');
+                                            ^
+DETAIL:  syntax error at or near """
+insert into tbl_distinct values (1, '{" ": 1}');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_distinct values (1, '{" ": 1}');
+                                            ^
+DETAIL:  syntax error at or near """
+insert into tbl_distinct values (1, '{}');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_distinct values (1, '{}');
+                                            ^
+DETAIL:  syntax error at or near "}"
+insert into tbl_distinct values (1, '{:}');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_distinct values (1, '{:}');
+                                            ^
+DETAIL:  syntax error at or near ":"
+-- illegal character
+insert into tbl_distinct values (1, '{"1,| 2": 1}');
+-- multiple consecutive characters
+insert into tbl_distinct values (1, '{"1,, 2": 1}');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_distinct values (1, '{"1,, 2": 1}');
+                                            ^
+DETAIL:  syntax error at or near ","
+insert into tbl_distinct values (1, '{"1": 1}');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_distinct values (1, '{"1": 1}');
+                                            ^
+DETAIL:  syntax error at or near """
+-- Need to add check on catalog table insert that atribute numbers are legal
+-- (e.g. there shouldn't be attribute number 100 for a table with only 2
+-- columns also it should match)
+select * from tbl_distinct;
+ i |                       ii                        
+---+-------------------------------------------------
+ 1 | {"1, 2": 1}
+ 1 | {"1, 2": 1}
+ 1 | {"1, 2": 1}
+ 1 | {"1, 2": 1}
+ 2 | {"1, 2": 2, "1, 3": 3, "2, 3": 2, "1, 2, 3": 3}
+ 3 | {"123, 234": 11}
+(6 rows)
+
+    -- Test pg_dependencies_in
+drop table if exists tbl_dependencies;
+NOTICE:  table "tbl_dependencies" does not exist, skipping
+create table tbl_dependencies(i int, ii pg_dependencies);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'i' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+insert into tbl_dependencies values (1, '{"1 => 2": 1.000000}');
+insert into tbl_dependencies values (2, '{"1 => 2": 2.000000, "1 => 3": 3.000000, "2 => 3": 2.000000, "1, 2 => 3": 3.000000}');
+select * from tbl_dependencies;
+ i |                                         ii                                          
+---+-------------------------------------------------------------------------------------
+ 2 | {"1 => 2": 2.000000, "1 => 3": 3.000000, "2 => 3": 2.000000, "1, 2 => 3": 3.000000}
+ 1 | {"1 => 2": 1.000000}
+(2 rows)
+
+-- leading space
+insert into tbl_dependencies values (1, ' {"1 => 2": 1.000000}');
+-- trailing space
+insert into tbl_dependencies values (1, '{"1 => 2": 1.000000} ');
+-- unmatched quote
+insert into tbl_dependencies values (1, '{"1" => 2": 1.000000} ');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_dependencies values (1, '{"1" => 2": 1.00000...
+                                                ^
+DETAIL:  syntax error at or near """
+-- Wrong format
+insert into tbl_dependencies values (1, '{"1, 2": 1.000000}');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_dependencies values (1, '{"1, 2": 1.000000}'...
+                                                ^
+DETAIL:  syntax error at or near "1.000000"
+insert into tbl_dependencies values (1, '{"1 => 2": 1}');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_dependencies values (1, '{"1 => 2": 1}');
+                                                ^
+DETAIL:  syntax error at or near "1"
+insert into tbl_dependencies values (1, '{"1 => 2": 1.000000, " 2 => 1": 2}');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_dependencies values (1, '{"1 => 2": 1.000000...
+                                                ^
+DETAIL:  syntax error at or near "2"
+-- space in attribute list
+insert into tbl_dependencies values (1, '{"1 3 => 2": 1.000000} ');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_dependencies values (1, '{"1 3 => 2": 1.0000...
+                                                ^
+DETAIL:  syntax error at or near "3"
+-- colon in attribute list
+insert into tbl_dependencies values (1, '{"1: 2": 1.000000}');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_dependencies values (1, '{"1: 2": 1.000000}'...
+                                                ^
+DETAIL:  syntax error at or near ":"
+insert into tbl_dependencies values (1, '{"1 => 2:" 1.000000}');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_dependencies values (1, '{"1 => 2:" 1.000000...
+                                                ^
+DETAIL:  syntax error at or near ":"
+insert into tbl_dependencies values (1, '{":1 2": 1.000000}');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_dependencies values (1, '{":1 2": 1.000000}'...
+                                                ^
+DETAIL:  syntax error at or near ":"
+insert into tbl_dependencies values (1, '{"1, 2" 1.000000}');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_dependencies values (1, '{"1, 2" 1.000000}')...
+                                                ^
+DETAIL:  syntax error at or near "1.000000"
+-- zero/single item attribute list
+insert into tbl_dependencies values (1, '{"1": 1.000000}');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_dependencies values (1, '{"1": 1.000000}');
+                                                ^
+DETAIL:  syntax error at or near """
+insert into tbl_dependencies values (1, '{: 1.000000}');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_dependencies values (1, '{: 1.000000}');
+                                                ^
+DETAIL:  syntax error at or near ":"
+insert into tbl_dependencies values (1, '{"": 1.000000}');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_dependencies values (1, '{"": 1.000000}');
+                                                ^
+DETAIL:  syntax error at or near """
+insert into tbl_dependencies values (1, '{" ": 1.000000}');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_dependencies values (1, '{" ": 1.000000}');
+                                                ^
+DETAIL:  syntax error at or near """
+insert into tbl_dependencies values (1, '{}');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_dependencies values (1, '{}');
+                                                ^
+DETAIL:  syntax error at or near "}"
+insert into tbl_dependencies values (1, '{:}');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_dependencies values (1, '{:}');
+                                                ^
+DETAIL:  syntax error at or near ":"
+-- multiple consecutive characters
+insert into tbl_dependencies values (1, '{"1 =>=> 2": 1.000000}');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_dependencies values (1, '{"1 =>=> 2": 1.0000...
+                                                ^
+DETAIL:  syntax error at or near "=>"
+insert into tbl_dependencies values (1, '{"1": 1.000000}');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_dependencies values (1, '{"1": 1.000000}');
+                                                ^
+DETAIL:  syntax error at or near """
+select * from tbl_dependencies;
+ i |                                         ii                                          
+---+-------------------------------------------------------------------------------------
+ 2 | {"1 => 2": 2.000000, "1 => 3": 3.000000, "2 => 3": 2.000000, "1, 2 => 3": 3.000000}
+ 1 | {"1 => 2": 1.000000}
+ 1 | {"1 => 2": 1.000000}
+ 1 | {"1 => 2": 1.000000}
+(4 rows)
+
+-- Test a table with columns of type pg_ndistinct and pg_dependencies
+drop table if exists tbl_dist_dep;
+NOTICE:  table "tbl_dist_dep" does not exist, skipping
+create table tbl_dist_dep(i pg_ndistinct, ii pg_dependencies);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'i' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+insert into tbl_dist_dep values ('{"1, 2" : 1}', '{"1 => 2": 1.000000}');
+insert into tbl_dist_dep values ('{"1, 2" : 3, "1, 3" : 3, "2, 3" : 2, "1, 2, 3" : 3}', '{"1 => 2": 2.000000, "1 => 3": 3.000000, "2 => 3": 2.000000, "1, 2 => 3": 3.000000}');
+-- unmatched quote
+insert into tbl_dist_dep values ('{1, 2 : 1}', '{"1 => 2": 1.000000}');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_dist_dep values ('{1, 2 : 1}', '{"1 => 2": 1...
+                                         ^
+DETAIL:  syntax error at or near "1"
+insert into tbl_dist_dep values ('{"1, 2" : 1}', '{1 => 2: 1.000000}');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_dist_dep values ('{"1, 2" : 1}', '{1 => 2: 1...
+                                                         ^
+DETAIL:  syntax error at or near "1"
+insert into tbl_dist_dep values ('{1, 2 : 1}', '{1 => 2: 1.000000}');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_dist_dep values ('{1, 2 : 1}', '{1 => 2: 1.0...
+                                         ^
+DETAIL:  syntax error at or near "1"
+-- Invalid type
+insert into tbl_dist_dep values ('{"1, 2" : 1}', '{"1 => 2": 1}');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_dist_dep values ('{"1, 2" : 1}', '{"1 => 2":...
+                                                         ^
+DETAIL:  syntax error at or near "1"
+insert into tbl_dist_dep values ('{"1, 2" : 1.000000}', '{"1 => 2": 1.000000}');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_dist_dep values ('{"1, 2" : 1.000000}', '{"1...
+                                         ^
+DETAIL:  syntax error at or near "1.000000"
+insert into tbl_dist_dep values ('{"1, 2" : 1}', '{"1.000000 => 2.000000": 1.000000}');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_dist_dep values ('{"1, 2" : 1}', '{"1.000000...
+                                                         ^
+DETAIL:  syntax error at or near "1.000000"
+insert into tbl_dist_dep values ('{"1, 2.000000" : 1}', '{"1 => 2": 1.000000}');
+ERROR:  invalid input syntax for extended stats type
+LINE 1: insert into tbl_dist_dep values ('{"1, 2.000000" : 1}', '{"1...
+                                         ^
+DETAIL:  syntax error at or near "2.000000"
+select * from tbl_dist_dep;
+                        i                        |                                         ii                                          
+-------------------------------------------------+-------------------------------------------------------------------------------------
+ {"1, 2": 3, "1, 3": 3, "2, 3": 2, "1, 2, 3": 3} | {"1 => 2": 2.000000, "1 => 3": 3.000000, "2 => 3": 2.000000, "1, 2 => 3": 3.000000}
+ {"1, 2": 1}                                     | {"1 => 2": 1.000000}
+(2 rows)
+

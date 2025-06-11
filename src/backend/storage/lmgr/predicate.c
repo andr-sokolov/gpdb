@@ -1823,7 +1823,7 @@ GetSerializableTransactionSnapshotInt(Snapshot snapshot,
 
 	/* Get the snapshot, or check that it's safe to use */
 	if (!sourcevxid)
-		snapshot = GetSnapshotData(snapshot);
+		snapshot = GetSnapshotData(snapshot, DistributedTransactionContext);
 	else if (!ProcArrayInstallImportedXmin(snapshot->xmin, sourcevxid))
 	{
 		ReleasePredXact(sxact);
@@ -4163,7 +4163,7 @@ CheckForSerializableConflictOut(bool visible, Relation relation,
 	 * been concurrently updated (by a separate transaction), the xmin of the
 	 * tuple will be used -- not the updater's xid.
 	 */
-	htsvResult = HeapTupleSatisfiesVacuum(tuple, TransactionXmin, buffer);
+	htsvResult = HeapTupleSatisfiesVacuum(relation, tuple, TransactionXmin, buffer);
 	switch (htsvResult)
 	{
 		case HEAPTUPLE_LIVE:

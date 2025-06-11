@@ -40,11 +40,13 @@
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/objectaccess.h"
+#include "catalog/oid_dispatch.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_cast.h"
 #include "catalog/pg_language.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_proc_callback.h"
 #include "catalog/pg_transform.h"
 #include "catalog/pg_type.h"
 #include "commands/alter.h"
@@ -64,6 +66,7 @@
 #include "tcop/pquery.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/faultinjector.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
@@ -72,6 +75,15 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
+
+#include "catalog/heap.h"
+#include "catalog/oid_dispatch.h"
+#include "cdb/cdbdisp_query.h"
+#include "cdb/cdbvars.h"
+
+
+static void CheckForModifySystemFunc(Oid funcOid, List *funcName);
+
 
 /*
  *	 Examine the RETURNS clause of the CREATE FUNCTION statement
@@ -104,7 +116,7 @@ compute_return_type(TypeName *returnType, Oid languageOid,
 						(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
 						 errmsg("SQL function cannot return shell type %s",
 								TypeNameToString(returnType))));
-			else
+			else if (Gp_role != GP_ROLE_EXECUTE)
 				ereport(NOTICE,
 						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 						 errmsg("return type %s is only a shell",
@@ -141,10 +153,20 @@ compute_return_type(TypeName *returnType, Oid languageOid,
 							typnam)));
 
 		/* Otherwise, go ahead and make a shell type */
-		ereport(NOTICE,
+		if (Gp_role == GP_ROLE_EXECUTE)
+		{
+			ereport(DEBUG1,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("type \"%s\" is not yet defined", typnam),
 				 errdetail("Creating a shell type definition.")));
+		}
+		else
+		{
+			ereport(NOTICE,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("type \"%s\" is not yet defined", typnam),
+					 errdetail("Creating a shell type definition.")));
+		}
 		namespaceId = QualifiedNameGetCreationNamespace(returnType->names,
 														&typname);
 		aclresult = pg_namespace_aclcheck(namespaceId, GetUserId(),
@@ -202,6 +224,7 @@ interpret_function_parameter_list(ParseState *pstate,
 	Datum	   *paramNames;
 	int			outCount = 0;
 	int			varCount = 0;
+	int			multisetCount = 0;
 	bool		have_names = false;
 	bool		have_defaults = false;
 	ListCell   *x;
@@ -209,7 +232,11 @@ interpret_function_parameter_list(ParseState *pstate,
 
 	*variadicArgType = InvalidOid;	/* default result */
 	*requiredResultType = InvalidOid;	/* default result */
+	*parameterNames		= NULL;
+	*allParameterTypes	= NULL;
+	*parameterModes		= NULL;
 
+	/* Allocate local memory */
 	inTypes = (Oid *) palloc(parameterCount * sizeof(Oid));
 	allTypes = (Datum *) palloc(parameterCount * sizeof(Datum));
 	paramModes = (Datum *) palloc(parameterCount * sizeof(Datum));
@@ -244,7 +271,7 @@ interpret_function_parameter_list(ParseState *pstate,
 							(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
 							 errmsg("aggregate cannot accept shell type %s",
 									TypeNameToString(t))));
-				else
+				else if (Gp_role != GP_ROLE_EXECUTE)
 					ereport(NOTICE,
 							(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 							 errmsg("argument type %s is only a shell",
@@ -301,11 +328,20 @@ interpret_function_parameter_list(ParseState *pstate,
 						 errmsg("VARIADIC parameter must be the last input parameter")));
 			inTypes[inCount++] = toid;
 			isinput = true;
+
+			/* Keep track of the number of anytable arguments */
+			if (toid == ANYTABLEOID)
+				multisetCount++;
 		}
 
 		/* handle output parameters */
 		if (fp->mode != FUNC_PARAM_IN && fp->mode != FUNC_PARAM_VARIADIC)
 		{
+			if (toid == ANYTABLEOID)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+						 errmsg("functions cannot return \"anytable\" arguments")));
+
 			if (objtype == OBJECT_PROCEDURE)
 				*requiredResultType = RECORDOID;
 			else if (outCount == 0) /* save first output param's type */
@@ -331,6 +367,8 @@ interpret_function_parameter_list(ParseState *pstate,
 								 errmsg("VARIADIC parameter must be an array")));
 					break;
 			}
+
+			isinput = true;
 		}
 
 		allTypes[i] = ObjectIdGetDatum(toid);
@@ -385,6 +423,11 @@ interpret_function_parameter_list(ParseState *pstate,
 						(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
 						 errmsg("only input parameters can have default values")));
 
+			if (toid == ANYTABLEOID)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+						 errmsg("anytable parameter cannot have default value")));
+
 			def = transformExpr(pstate, fp->defexpr,
 								EXPR_KIND_FUNCTION_DEFAULT);
 			def = coerce_to_specific_type(pstate, def, toid, "DEFAULT");
@@ -428,6 +471,14 @@ interpret_function_parameter_list(ParseState *pstate,
 		i++;
 	}
 
+	/* Currently only support single multiset input parameters */
+	if (multisetCount > 1)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("functions cannot have multiple \"anytable\" arguments")));
+	}
+
 	/* Now construct the proper outputs as needed */
 	*parameterTypes = buildoidvector(inTypes, inCount);
 
@@ -441,11 +492,6 @@ interpret_function_parameter_list(ParseState *pstate,
 			*requiredResultType = RECORDOID;
 		/* otherwise we set requiredResultType correctly above */
 	}
-	else
-	{
-		*allParameterTypes = NULL;
-		*parameterModes = NULL;
-	}
 
 	if (have_names)
 	{
@@ -457,8 +503,7 @@ interpret_function_parameter_list(ParseState *pstate,
 		*parameterNames = construct_array(paramNames, parameterCount, TEXTOID,
 										  -1, false, 'i');
 	}
-	else
-		*parameterNames = NULL;
+
 }
 
 
@@ -482,7 +527,10 @@ compute_common_attribute(ParseState *pstate,
 						 DefElem **cost_item,
 						 DefElem **rows_item,
 						 DefElem **support_item,
-						 DefElem **parallel_item)
+						 DefElem **parallel_item,
+						 DefElem **describe_item,
+						 DefElem **data_access_item,
+						 DefElem **exec_location_item)
 {
 	if (strcmp(defel->defname, "volatility") == 0)
 	{
@@ -558,6 +606,27 @@ compute_common_attribute(ParseState *pstate,
 
 		*parallel_item = defel;
 	}
+	else if (strcmp(defel->defname, "describe") == 0)
+	{
+		if (*describe_item)
+			goto duplicate_error;
+
+		*describe_item = defel;
+	}
+	else if (strcmp(defel->defname, "data_access") == 0)
+	{
+		if (*data_access_item)
+			goto duplicate_error;
+
+		*data_access_item = defel;
+	}
+	else if (strcmp(defel->defname, "exec_location") == 0)
+	{
+		if (*exec_location_item)
+			goto duplicate_error;
+
+		*exec_location_item = defel;
+	}
 	else
 		return false;
 
@@ -594,6 +663,122 @@ interpret_func_volatility(DefElem *defel)
 	{
 		elog(ERROR, "invalid volatility \"%s\"", str);
 		return 0;				/* keep compiler quiet */
+	}
+}
+
+static char
+interpret_data_access(DefElem *defel)
+{
+	char *str = strVal(defel->arg);
+	char proDataAccess = PRODATAACCESS_NONE;
+
+	if (strcmp(str, "none") == 0)
+		proDataAccess = PRODATAACCESS_NONE;
+	else if (strcmp(str, "contains") == 0)
+		proDataAccess = PRODATAACCESS_CONTAINS;
+	else if (strcmp(str, "reads") == 0)
+		proDataAccess = PRODATAACCESS_READS;
+	else if (strcmp(str, "modifies") == 0)
+		proDataAccess = PRODATAACCESS_MODIFIES;
+	else
+		elog(ERROR, "invalid data access \"%s\"", str);
+
+	return proDataAccess;
+}
+
+static char
+getDefaultDataAccess(Oid languageOid)
+{
+	char proDataAccess = PRODATAACCESS_NONE;
+	if (languageOid == SQLlanguageId)
+		proDataAccess = PRODATAACCESS_CONTAINS;
+
+	return proDataAccess;
+}
+
+static void
+validate_sql_data_access(char data_access, char volatility, Oid languageOid)
+{
+	/* IMMUTABLE is not compatible with READS SQL DATA or MODIFIES SQL DATA */
+	if (volatility == PROVOLATILE_IMMUTABLE &&
+			data_access == PRODATAACCESS_READS)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				errmsg("conflicting options"),
+				errhint("IMMUTABLE conflicts with READS SQL DATA.")));
+
+	if (volatility == PROVOLATILE_IMMUTABLE &&
+			data_access == PRODATAACCESS_MODIFIES)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("conflicting options"),
+				 errhint("IMMUTABLE conflicts with MODIFIES SQL DATA.")));
+
+	/* SQL language function cannot specify NO SQL */
+	if (languageOid == SQLlanguageId && data_access == PRODATAACCESS_NONE)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("conflicting options"),
+				 errhint("A SQL function cannot specify NO SQL.")));
+}
+
+static char
+interpret_exec_location(DefElem *defel)
+{
+	char	   *str = strVal(defel->arg);
+	char		exec_location;
+
+	if (strcmp(str, "any") == 0)
+		exec_location = PROEXECLOCATION_ANY;
+	else if (strcmp(str, "coordinator") == 0)
+		exec_location = PROEXECLOCATION_COORDINATOR;
+	else if (strcmp(str, "initplan") == 0)
+		exec_location = PROEXECLOCATION_INITPLAN;
+	else if (strcmp(str, "all_segments") == 0)
+		exec_location = PROEXECLOCATION_ALL_SEGMENTS;
+	else
+		elog(ERROR, "invalid data access \"%s\"", str);
+
+	return exec_location;
+}
+
+
+static void
+validate_sql_exec_location(char exec_location, bool proretset)
+{
+	/*
+	 * ON COORDINATOR and ON ALL SEGMENTS are only supported for set-returning
+	 * functions.
+	 */
+	switch (exec_location)
+	{
+		case PROEXECLOCATION_ANY:
+			/* ok */
+			break;
+
+		case PROEXECLOCATION_COORDINATOR:
+			if (!proretset)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("EXECUTE ON COORDINATOR is only supported for set-returning functions")));
+			break;
+
+		case PROEXECLOCATION_INITPLAN:
+			if (!proretset)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("EXECUTE ON INITPLAN is only supported for set-returning functions")));
+			break;
+
+		case PROEXECLOCATION_ALL_SEGMENTS:
+			if (!proretset)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("EXECUTE ON ALL SEGMENTS is only supported for set-returning functions")));
+			break;
+
+		default:
+			elog(ERROR, "unrecognized EXECUTE ON type '%c'", exec_location);
 	}
 }
 
@@ -707,7 +892,10 @@ compute_function_attributes(ParseState *pstate,
 							float4 *procost,
 							float4 *prorows,
 							Oid *prosupport,
-							char *parallel_p)
+							char *parallel_p,
+							List **describeQualName_p,
+							char *data_access_p,
+							char *exec_location_p)
 {
 	ListCell   *option;
 	DefElem    *as_item = NULL;
@@ -723,6 +911,9 @@ compute_function_attributes(ParseState *pstate,
 	DefElem    *rows_item = NULL;
 	DefElem    *support_item = NULL;
 	DefElem    *parallel_item = NULL;
+	DefElem    *describe_item = NULL;
+	DefElem    *data_access_item = NULL;
+	DefElem    *exec_location_item = NULL;
 
 	foreach(option, options)
 	{
@@ -780,7 +971,10 @@ compute_function_attributes(ParseState *pstate,
 										  &cost_item,
 										  &rows_item,
 										  &support_item,
-										  &parallel_item))
+										  &parallel_item,
+										  &describe_item,
+										  &data_access_item,
+										  &exec_location_item))
 		{
 			/* recognized common option */
 			continue;
@@ -846,6 +1040,12 @@ compute_function_attributes(ParseState *pstate,
 		*prosupport = interpret_func_support(support_item);
 	if (parallel_item)
 		*parallel_p = interpret_func_parallel(parallel_item);
+	if (describe_item)
+		*describeQualName_p = defGetQualifiedName(describe_item);
+	if (data_access_item)
+		*data_access_p = interpret_data_access(data_access_item);
+	if (exec_location_item)
+		*exec_location_p = interpret_exec_location(exec_location_item);
 }
 
 
@@ -911,6 +1111,143 @@ interpret_AS_clause(Oid languageOid, const char *languageName,
 				*prosrc_str_p = funcname;
 		}
 	}
+
+	if (languageOid == INTERNALlanguageId)
+	{
+		/*
+		 * In PostgreSQL versions before 6.5, the SQL name of the created
+		 * function could not be different from the internal name, and
+		 * "prosrc" wasn't used.  So there is code out there that does
+		 * CREATE FUNCTION xyz AS '' LANGUAGE internal. To preserve some
+		 * modicum of backwards compatibility, accept an empty "prosrc"
+		 * value as meaning the supplied SQL function name.
+		 */
+		if (strlen(*prosrc_str_p) == 0)
+			*prosrc_str_p = funcname;
+	}
+}
+
+
+/*
+ * Handle functions that try to define a "DESCRIBE" callback.
+ */
+static Oid
+validate_describe_callback(List *describeQualName, 
+						   Oid returnTypeOid, 
+						   ArrayType *parameterModes)
+{
+	int					 nargs			  = 1;
+	Oid					 inputTypeOids[1] = {INTERNALOID};
+	Oid					*actualInputTypeOids;
+	Oid					 describeReturnTypeOid;
+	Oid					 describeFuncOid;
+	bool				 describeReturnsSet;
+	FuncDetailCode		 fdResult;
+	AclResult			 aclresult;
+	int					 i;
+
+	if (describeQualName == NIL)
+		return InvalidOid;
+
+	/* 
+	 * describe callbacks only supported for functions that return either
+	 * a pseudotype or a generic record.
+	 */
+	if (!TypeSupportsDescribe(returnTypeOid))
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+				 errmsg("DESCRIBE only supported for functions returning \"record\"")));
+	}
+	if (parameterModes)
+	{
+		int   len   = ARR_DIMS(parameterModes)[0];
+		char *modes = ARR_DATA_PTR(parameterModes);
+		
+		Assert(ARR_NDIM(parameterModes) == 1);
+		for (i = 0; i < len; i++)
+		{
+			switch (modes[i])
+			{
+				case FUNC_PARAM_IN:
+				case FUNC_PARAM_VARIADIC:
+					break;
+
+				case FUNC_PARAM_INOUT:
+				case FUNC_PARAM_OUT:
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+							 errmsg("DESCRIBE is not supported for functions "
+									"with OUT parameters")));
+					break;
+
+				case FUNC_PARAM_TABLE:
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+							 errmsg("DESCRIBE is not supported for functions "
+									"that return TABLE")));				
+					break;
+
+				/* above list should be exhaustive */
+				default:
+					elog(ERROR, "unrecognized function parameter mode: %c", modes[i]);
+					break;
+			}
+		}
+	}
+	int nvargs;
+	Oid vatype;
+	/* Lookup the function in the catalog */
+	fdResult = func_get_detail(describeQualName,
+							   NIL,   /* argument expressions */
+							   NIL,	  /* argument names */
+							   nargs, 
+							   inputTypeOids,
+							   false,	/* expand_variadic */
+							   false,	/* expand_defaults */
+							   &describeFuncOid,
+							   &describeReturnTypeOid, 
+							   &describeReturnsSet,
+							   &nvargs,
+							   &vatype,
+							   &actualInputTypeOids,
+							   NULL);
+
+	if (fdResult != FUNCDETAIL_NORMAL || !OidIsValid(describeFuncOid))
+	{
+		/* Should we try to create the function when not found? */
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_FUNCTION),
+				 errmsg("function %s does not exist",
+						func_signature_string(describeQualName, nargs, NIL, inputTypeOids))));
+	}
+	if (describeReturnTypeOid != INTERNALOID)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+				 errmsg("return type of function %s is not \"internal\"",
+						func_signature_string(describeQualName, nargs, NIL, inputTypeOids))));
+	}
+	if (describeReturnsSet)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+				 errmsg("function %s returns a set",
+						func_signature_string(describeQualName, nargs, NIL, inputTypeOids))));
+	}
+
+	if (OidIsValid(vatype))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("describe function cannot be variadic")));
+
+	/* Check that the creator has permission to call the function */
+	aclresult = pg_proc_aclcheck(describeFuncOid, GetUserId(), ACL_EXECUTE);
+	if (aclresult != ACLCHECK_OK)
+		aclcheck_error(aclresult, OBJECT_PROCEDURE, get_func_name(describeFuncOid));
+
+	/* Looks reasonable */
+	return describeFuncOid;
 }
 
 
@@ -954,7 +1291,13 @@ CreateFunction(ParseState *pstate, CreateFunctionStmt *stmt)
 	Form_pg_language languageStruct;
 	List	   *as_clause;
 	char		parallel;
+	List       *describeQualName = NIL;
+	Oid         describeFuncOid  = InvalidOid;
+	char		dataAccess;
+	char		execLocation;
+	ObjectAddress objAddr;
 
+	SIMPLE_FAULT_INJECTOR("create_function_fail");
 	/* Convert list of names to a name and namespace */
 	namespaceId = QualifiedNameGetCreationNamespace(stmt->funcname,
 													&funcname);
@@ -976,6 +1319,8 @@ CreateFunction(ParseState *pstate, CreateFunctionStmt *stmt)
 	prorows = -1;				/* indicates not set */
 	prosupport = InvalidOid;
 	parallel = PROPARALLEL_UNSAFE;
+	dataAccess = '\0';			/* indicates not set */
+	execLocation = '\0';		/* indicates not set */
 
 	/* Extract non-default attributes from stmt->options list */
 	compute_function_attributes(pstate,
@@ -985,7 +1330,9 @@ CreateFunction(ParseState *pstate, CreateFunctionStmt *stmt)
 								&isWindowFunc, &volatility,
 								&isStrict, &security, &isLeakProof,
 								&proconfig, &procost, &prorows,
-								&prosupport, &parallel);
+								&prosupport, &parallel,
+								&describeQualName,
+								&dataAccess, &execLocation);
 
 	/* Look up the language and validate permissions */
 	languageTuple = SearchSysCache1(LANGNAME, PointerGetDatum(language));
@@ -998,6 +1345,14 @@ CreateFunction(ParseState *pstate, CreateFunctionStmt *stmt)
 
 	languageStruct = (Form_pg_language) GETSTRUCT(languageTuple);
 	languageOid = languageStruct->oid;
+
+	/* If prodataaccess indicator not specified, fill in default. */
+	if (dataAccess == '\0')
+		dataAccess = getDefaultDataAccess(languageOid);
+
+	/* If proexeclocation indicator not specified, fill in default. */
+	if (execLocation == '\0')
+		execLocation = PROEXECLOCATION_ANY;
 
 	if (languageStruct->lanpltrusted)
 	{
@@ -1020,6 +1375,12 @@ CreateFunction(ParseState *pstate, CreateFunctionStmt *stmt)
 	languageValidator = languageStruct->lanvalidator;
 
 	ReleaseSysCache(languageTuple);
+
+	/*
+	 * Check consistency for data access.  Note this comes after the language
+	 * tuple lookup, as we need language oid.
+	 */
+	validate_sql_data_access(dataAccess, volatility, languageOid);
 
 	/*
 	 * Only superuser is allowed to create leakproof functions because
@@ -1097,6 +1458,8 @@ CreateFunction(ParseState *pstate, CreateFunctionStmt *stmt)
 		returnsSet = false;
 	}
 
+	validate_sql_exec_location(execLocation, returnsSet);
+
 	if (list_length(trftypes_list) > 0)
 	{
 		ListCell   *lc;
@@ -1118,6 +1481,17 @@ CreateFunction(ParseState *pstate, CreateFunctionStmt *stmt)
 
 	interpret_AS_clause(languageOid, language, funcname, as_clause,
 						&prosrc_str, &probin_str);
+	
+	/* double check that we really have a function body */
+	/* prosrc_str doesn't point to a palloc()'d string in interpret_AS_clause() */
+	if (prosrc_str == NULL)
+		prosrc_str = "";
+
+	/* Handle the describe callback, if any */
+	if (describeQualName != NIL)
+		describeFuncOid = validate_describe_callback(describeQualName,
+													 prorettype,
+													 parameterModes);
 
 	/*
 	 * Set default values for COST and ROWS depending on other parameters;
@@ -1149,7 +1523,7 @@ CreateFunction(ParseState *pstate, CreateFunctionStmt *stmt)
 	 * And now that we have all the parameters, and know we're permitted to do
 	 * so, go ahead and create the function.
 	 */
-	return ProcedureCreate(funcname,
+	objAddr = ProcedureCreate(funcname,
 						   namespaceId,
 						   stmt->replace,
 						   returnsSet,
@@ -1157,6 +1531,7 @@ CreateFunction(ParseState *pstate, CreateFunctionStmt *stmt)
 						   GetUserId(),
 						   languageOid,
 						   languageValidator,
+						   describeFuncOid,
 						   prosrc_str,	/* converted to text later */
 						   probin_str,	/* converted to text later */
 						   stmt->is_procedure ? PROKIND_PROCEDURE : (isWindowFunc ? PROKIND_WINDOW : PROKIND_FUNCTION),
@@ -1174,7 +1549,21 @@ CreateFunction(ParseState *pstate, CreateFunctionStmt *stmt)
 						   PointerGetDatum(proconfig),
 						   prosupport,
 						   procost,
-						   prorows);
+						   prorows,
+						   dataAccess,
+						   execLocation);
+
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									GetAssignedOidsForDispatch(),
+									NULL);
+	}
+
+	return objAddr;
 }
 
 /*
@@ -1206,6 +1595,9 @@ RemoveFunctionById(Oid funcOid)
 	ReleaseSysCache(tup);
 
 	table_close(relation, RowExclusiveLock);
+
+	/* Remove anything in pg_proc_callback for this function */
+	deleteProcCallbacks(funcOid);
 
 	/*
 	 * If there's a pg_aggregate tuple, delete that too.
@@ -1250,6 +1642,12 @@ AlterFunction(ParseState *pstate, AlterFunctionStmt *stmt)
 	DefElem    *support_item = NULL;
 	DefElem    *parallel_item = NULL;
 	ObjectAddress address;
+	DefElem    *describe_item = NULL;
+	DefElem    *data_access_item = NULL;
+	DefElem    *exec_location_item = NULL;
+	bool		isnull;
+	char		data_access;
+	char		exec_location;
 
 	rel = table_open(ProcedureRelationId, RowExclusiveLock);
 
@@ -1267,6 +1665,9 @@ AlterFunction(ParseState *pstate, AlterFunctionStmt *stmt)
 	if (!pg_proc_ownercheck(funcOid, GetUserId()))
 		aclcheck_error(ACLCHECK_NOT_OWNER, stmt->objtype,
 					   NameListToString(stmt->func->objname));
+
+	/* check bootstrap object */
+	CheckForModifySystemFunc(funcOid, stmt->func->objname);
 
 	if (procForm->prokind == PROKIND_AGGREGATE)
 		ereport(ERROR,
@@ -1292,7 +1693,10 @@ AlterFunction(ParseState *pstate, AlterFunctionStmt *stmt)
 									 &cost_item,
 									 &rows_item,
 									 &support_item,
-									 &parallel_item) == false)
+									 &parallel_item,
+									 &describe_item,
+									 &data_access_item,
+									 &exec_location_item) == false)
 			elog(ERROR, "option \"%s\" not recognized", defel->defname);
 	}
 
@@ -1388,6 +1792,56 @@ AlterFunction(ParseState *pstate, AlterFunctionStmt *stmt)
 		tup = heap_modify_tuple(tup, RelationGetDescr(rel),
 								repl_val, repl_null, repl_repl);
 	}
+	if (describe_item)
+	{
+		elog(ERROR, "cannot change DESCRIBE function");
+	}
+	if (data_access_item)
+	{
+		Datum		repl_val[Natts_pg_proc];
+		bool		repl_null[Natts_pg_proc];
+		bool		repl_repl[Natts_pg_proc];
+
+		MemSet(repl_null, 0, sizeof(repl_null));
+		MemSet(repl_repl, 0, sizeof(repl_repl));
+		repl_repl[Anum_pg_proc_prodataaccess - 1] = true;
+		repl_val[Anum_pg_proc_prodataaccess - 1] =
+			CharGetDatum(interpret_data_access(data_access_item));
+
+		tup = heap_modify_tuple(tup, RelationGetDescr(rel),
+								repl_val, repl_null, repl_repl);
+	}
+	if (exec_location_item)
+	{
+		Datum		repl_val[Natts_pg_proc];
+		bool		repl_null[Natts_pg_proc];
+		bool		repl_repl[Natts_pg_proc];
+
+		MemSet(repl_null, 0, sizeof(repl_null));
+		MemSet(repl_repl, 0, sizeof(repl_repl));
+		repl_repl[Anum_pg_proc_proexeclocation - 1] = true;
+		repl_val[Anum_pg_proc_proexeclocation - 1] =
+			CharGetDatum(interpret_exec_location(exec_location_item));
+
+		tup = heap_modify_tuple(tup, RelationGetDescr(rel),
+								repl_val, repl_null, repl_repl);
+	}
+
+	data_access = DatumGetChar(
+		heap_getattr(tup, Anum_pg_proc_prodataaccess,
+					 RelationGetDescr(rel), &isnull));
+	Assert(!isnull);
+	exec_location = DatumGetChar(
+		heap_getattr(tup, Anum_pg_proc_proexeclocation,
+					 RelationGetDescr(rel), &isnull));
+	Assert(!isnull);
+	/* Cross check for various properties. */
+	validate_sql_data_access(data_access,
+							 procForm->provolatile,
+							 procForm->prolang);
+	validate_sql_exec_location(exec_location,
+							   procForm->proretset);
+
 	/* DO NOT put more touches of procForm below here; it's now dangling. */
 
 	/* Do the update */
@@ -1397,6 +1851,16 @@ AlterFunction(ParseState *pstate, AlterFunctionStmt *stmt)
 
 	table_close(rel, NoLock);
 	heap_freetuple(tup);
+	
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									NIL,
+									NULL);
+	}
 
 	return address;
 }
@@ -1752,7 +2216,8 @@ CreateCast(CreateCastStmt *stmt)
 						format_type_be(targettypeid))));
 
 	/* ready to go */
-	castid = GetNewOidWithIndex(relation, CastOidIndexId, Anum_pg_cast_oid);
+	castid = GetNewOidForCast(relation, CastOidIndexId, Anum_pg_cast_oid,
+							  sourcetypeid, targettypeid);
 	values[Anum_pg_cast_oid - 1] = ObjectIdGetDatum(castid);
 	values[Anum_pg_cast_castsource - 1] = ObjectIdGetDatum(sourcetypeid);
 	values[Anum_pg_cast_casttarget - 1] = ObjectIdGetDatum(targettypeid);
@@ -1801,6 +2266,16 @@ CreateCast(CreateCastStmt *stmt)
 	heap_freetuple(tuple);
 
 	table_close(relation, RowExclusiveLock);
+
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									GetAssignedOidsForDispatch(),
+									NULL);
+	}
 
 	return myself;
 }
@@ -2033,8 +2508,9 @@ CreateTransform(CreateTransformStmt *stmt)
 	}
 	else
 	{
-		transformid = GetNewOidWithIndex(relation, TransformOidIndexId,
-										 Anum_pg_transform_oid);
+		transformid = GetNewOidForTransform(relation, TransformOidIndexId,
+											Anum_pg_transform_oid,
+											typeid, langid);
 		values[Anum_pg_transform_oid - 1] = ObjectIdGetDatum(transformid);
 		newtuple = heap_form_tuple(RelationGetDescr(relation), values, nulls);
 		CatalogTupleInsert(relation, newtuple);
@@ -2087,6 +2563,33 @@ CreateTransform(CreateTransformStmt *stmt)
 
 	table_close(relation, RowExclusiveLock);
 
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		Assert(stmt->type == T_CreateTransformStmt);
+		Assert(stmt->type < 1000);
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									GetAssignedOidsForDispatch(),
+									NULL);
+		if (is_replace)
+		{
+			MetaTrackUpdObject(TransformRelationId,
+							   myself.objectId,
+							   GetUserId(),
+							   "ALTER", "TRANSFORM");
+		}
+		else
+		{
+			/* MPP-6929: metadata tracking */
+			MetaTrackAddObject(TransformRelationId,
+							   myself.objectId,
+							   GetUserId(),
+							   "CREATE", "TRANSFORM");
+		}
+	}
+
 	return myself;
 }
 
@@ -2136,6 +2639,11 @@ DropTransformById(Oid transformOid)
 	if (!HeapTupleIsValid(tuple))
 		elog(ERROR, "could not find tuple for transform %u", transformOid);
 	CatalogTupleDelete(relation, &tuple->t_self);
+
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		MetaTrackDropObject(TransformRelationId, transformOid);
+	}
 
 	systable_endscan(scan);
 	table_close(relation, RowExclusiveLock);
@@ -2267,6 +2775,16 @@ ExecuteDoStmt(DoStmt *stmt, bool atomic)
 
 	/* execute the inline handler */
 	OidFunctionCall1(laninline, PointerGetDatum(codeblock));
+}
+
+static void
+CheckForModifySystemFunc(Oid funcOid, List *funcName)
+{
+	if (!allowSystemTableMods && funcOid < FirstBootstrapObjectId)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission defined: \"%s\" is a system function",
+						NameListToString(funcName))));
 }
 
 /*

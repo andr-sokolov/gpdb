@@ -25,6 +25,7 @@
 #include "access/sysattr.h"
 #include "access/tableam.h"
 #include "catalog/pg_type.h"
+#include "cdb/cdbvars.h"
 #include "executor/execdebug.h"
 #include "executor/nodeTidscan.h"
 #include "miscadmin.h"
@@ -239,6 +240,7 @@ TidListEval(TidScanState *tidstate)
 							  RelationGetRelid(tidstate->ss.ss_currentRelation),
 							  &cursor_tid))
 			{
+				Assert(ItemPointerIsValid(&cursor_tid));
 				if (numTids >= numAllocTids)
 				{
 					numAllocTids *= 2;

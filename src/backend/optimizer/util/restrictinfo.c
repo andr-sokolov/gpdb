@@ -107,9 +107,12 @@ make_restrictinfo_new(PlannerInfo *root,
 													   outer_relids,
 													   nullable_relids);
 
-	/* Shouldn't be an AND clause, else AND/OR flattening messed up */
+	/* Shouldn't be an AND clause, else AND/OR flattening messed up.
+	 * Orca still generates "AND" clauses here, so we relax this restriction.
+	 */
+#if 0
 	Assert(!is_andclause(clause));
-
+#endif
 	return make_restrictinfo_internal(root,
 									  clause,
 									  NULL,
@@ -150,6 +153,19 @@ make_restrictinfo_internal(PlannerInfo *root,
 	restrictinfo->security_level = security_level;
 	restrictinfo->outer_relids = outer_relids;
 	restrictinfo->nullable_relids = nullable_relids;
+
+	/**
+	 * If this is a IS NOT FALSE boolean test, we can peek underneath.
+	 */
+	if (IsA(clause, BooleanTest))
+	{
+		BooleanTest *bt = (BooleanTest *) clause;
+
+		if (bt->booltesttype == IS_NOT_FALSE)
+		{
+			clause = bt->arg;
+		}
+	}
 
 	/*
 	 * If it's potentially delayable by lower-level security quals, figure out

@@ -161,7 +161,7 @@ AS $$
 try:
     with plpy.subtransaction() as s:
         s.__exit__(None, None, None)
-except ValueError, e:
+except ValueError as e:
     raise ValueError(e)
 $$ LANGUAGE plpythonu;
 

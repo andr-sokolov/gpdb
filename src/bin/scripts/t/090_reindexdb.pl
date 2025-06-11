@@ -3,7 +3,7 @@ use warnings;
 
 use PostgresNode;
 use TestLib;
-use Test::More tests => 34;
+use Test::More tests => 32;
 
 program_help_ok('reindexdb');
 program_version_ok('reindexdb');
@@ -13,7 +13,7 @@ my $node = get_new_node('main');
 $node->init;
 $node->start;
 
-$ENV{PGOPTIONS} = '--client-min-messages=WARNING';
+$ENV{PGOPTIONS} = '-c gp_role=utility --client-min-messages=WARNING';
 
 $node->issues_sql_like(
 	[ 'reindexdb', 'postgres' ],
@@ -44,6 +44,10 @@ $node->issues_sql_like(
 	'reindex with verbose output');
 
 # the same with --concurrently
+# GPDB: REINDEX CONCURRENTLY doesn't work on GPDB, skip.
+SKIP: {
+	skip "REINDEX CONCURRENTLY not implemented on GPDB", 9;
+
 $node->issues_sql_like(
 	[ 'reindexdb', '--concurrently', 'postgres' ],
 	qr/statement: REINDEX DATABASE CONCURRENTLY postgres;/,
@@ -67,6 +71,7 @@ $node->issues_sql_like(
 	[ 'reindexdb', '--concurrently', '-v', '-t', 'test1', 'postgres' ],
 	qr/statement: REINDEX \(VERBOSE\) TABLE CONCURRENTLY public\.test1;/,
 	'reindex with verbose output concurrently');
+} # end SKIP
 
 # connection strings
 $node->command_ok([qw(reindexdb --echo --table=pg_am dbname=template1)],

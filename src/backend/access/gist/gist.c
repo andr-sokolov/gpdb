@@ -1633,7 +1633,7 @@ initGISTstate(Relation index)
 }
 
 void
-freeGISTstate(GISTSTATE *giststate)
+freeGISTstate(GISTSTATE *giststate pg_attribute_unused())
 {
 	/* It's sufficient to delete the scanCxt */
 	MemoryContextDelete(giststate->scanCxt);

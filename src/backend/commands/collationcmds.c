@@ -35,6 +35,11 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
+#include "catalog/oid_dispatch.h"
+#include "cdb/cdbvars.h"
+#include "cdb/cdbdisp_query.h"
+#include "storage/fd.h"
+
 
 typedef struct
 {
@@ -261,6 +266,23 @@ DefineCollation(ParseState *pstate, List *names, List *parameters, bool if_not_e
 
 	ObjectAddressSet(address, CollationRelationId, newoid);
 
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		DefineStmt * stmt = makeNode(DefineStmt);
+		stmt->kind = OBJECT_COLLATION;
+		stmt->oldstyle = false;
+		stmt->defnames = names;
+		stmt->args = NIL;
+		stmt->definition = parameters;
+		stmt->trusted = false;
+		CdbDispatchUtilityStatement((Node *) stmt,
+		                            DF_CANCEL_ON_ERROR|
+			                        DF_WITH_SNAPSHOT|
+			                        DF_NEED_TWO_PHASE,
+		                            GetAssignedOidsForDispatch(),
+		                            NULL);
+	}
+
 	return address;
 }
 
@@ -469,6 +491,42 @@ cmpaliases(const void *a, const void *b)
 }
 #endif							/* READ_LOCALE_A_OUTPUT */
 
+static void
+DispatchCollationCreate(char *alias, char *locale, Oid nspid, int encoding)
+{
+	Assert(Gp_role == GP_ROLE_DISPATCH);
+
+	List *names = NIL;
+	Value *schemaname = makeString(get_namespace_name(nspid));
+	Value *relname = makeString(alias);
+
+	names = lappend(names, schemaname);
+	names = lappend(names, relname);
+
+	List *parameters = NIL;
+	DefElem *defstring = makeNode(DefElem);
+
+	defstring->defname = "locale";
+	defstring->defaction = DEFELEM_UNSPEC;
+	defstring->arg = (Node*) makeString(locale);
+
+	parameters = lappend(parameters, defstring);
+
+	DefineStmt * stmt = makeNode(DefineStmt);
+	stmt->kind = OBJECT_COLLATION;
+	stmt->oldstyle = false;
+	stmt->defnames = names;
+	stmt->args = NIL;
+	stmt->definition = parameters;
+	stmt->trusted = false;
+	CdbDispatchUtilityStatement((Node *) stmt,
+	                            DF_CANCEL_ON_ERROR|
+		                        DF_WITH_SNAPSHOT|
+		                        DF_NEED_TWO_PHASE,
+	                            GetAssignedOidsForDispatch(),
+	                            NULL);
+}
+
 
 #ifdef USE_ICU
 /*
@@ -545,6 +603,10 @@ pg_import_system_collations(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 (errmsg("must be superuser to import system collations"))));
 
+	if (Gp_role != GP_ROLE_DISPATCH)
+		ereport(ERROR,
+					(errmsg("must be dispatcher to import system collations")));
+
 	if (!SearchSysCacheExists1(NAMESPACEOID, ObjectIdGetDatum(nspid)))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_SCHEMA),
@@ -612,6 +674,14 @@ pg_import_system_collations(PG_FUNCTION_ARGS)
 				continue;		/* ignore locales for client-only encodings */
 			if (enc == PG_SQL_ASCII)
 				continue;		/* C/POSIX are already in the catalog */
+            /*
+             * Greenplum specific behavior: this function in Greenplum can only be called after a full cluster is
+             * built, this is different from Postgres which might call this function during initdb. When reaching
+             * here, it must be in a database session, we can just ignore the collations not match current database's
+             * encoding because they cannot be used in this database.
+             */
+			if (enc != GetDatabaseEncoding())
+				continue;       /* Ignore collations incompatible with database encoding */ 
 
 			/* count valid locales found in operating system */
 			nvalid++;
@@ -632,6 +702,7 @@ pg_import_system_collations(PG_FUNCTION_ARGS)
 									 true, true);
 			if (OidIsValid(collid))
 			{
+				DispatchCollationCreate(localebuf, localebuf, nspid, enc);
 				ncreated++;
 
 				/* Must do CCI between inserts to handle duplicates correctly */
@@ -693,6 +764,7 @@ pg_import_system_collations(PG_FUNCTION_ARGS)
 									 true, true);
 			if (OidIsValid(collid))
 			{
+				DispatchCollationCreate(alias, locale, nspid, enc);
 				ncreated++;
 
 				CommandCounterIncrement();

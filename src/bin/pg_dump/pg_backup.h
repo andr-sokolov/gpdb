@@ -26,6 +26,9 @@
 #include "fe_utils/simple_list.h"
 #include "libpq-fe.h"
 
+#define GPDB5_MAJOR_PGVERSION 80300
+#define GPDB6_MAJOR_PGVERSION 90400
+#define GPDB7_MAJOR_PGVERSION 120000
 
 typedef enum trivalue
 {
@@ -58,6 +61,23 @@ typedef enum _teSection
 	SECTION_POST_DATA			/* stuff to be processed after data */
 } teSection;
 
+/* We need one enum entry per prepared query in pg_dump */
+enum _dumpPreparedQueries
+{
+	PREPQUERY_DUMPAGG,
+	PREPQUERY_DUMPBASETYPE,
+	PREPQUERY_DUMPCOMPOSITETYPE,
+	PREPQUERY_DUMPDOMAIN,
+	PREPQUERY_DUMPENUMTYPE,
+	PREPQUERY_DUMPFUNC,
+	PREPQUERY_DUMPOPR,
+	PREPQUERY_DUMPRANGETYPE,
+	PREPQUERY_DUMPTABLEATTACH,
+	PREPQUERY_GETCOLUMNACLS,
+	PREPQUERY_GETDOMAINCONSTRAINTS,
+	NUM_PREP_QUERIES			/* must be last */
+};
+
 /* Parameters needed by ConnectDatabase; same for dump and restore */
 typedef struct _connParams
 {
@@ -83,6 +103,7 @@ typedef struct _restoreOptions
 									 * instead of OWNER TO */
 	char	   *superuser;		/* Username to use as superuser */
 	char	   *use_role;		/* Issue SET ROLE to this */
+	int			postdataSchemaRestore;
 	int			dropSchema;
 	int			disable_dollar_quoting;
 	int			dump_inserts;
@@ -131,6 +152,7 @@ typedef struct _restoreOptions
 	bool		single_txn;
 
 	bool	   *idWanted;		/* array showing which dump IDs to emit */
+
 	int			enable_row_security;
 	int			sequence_data;	/* dump sequence data even in schema-only mode */
 	int			binary_upgrade;
@@ -180,6 +202,10 @@ typedef struct _dumpOptions
 
 	int			sequence_data;	/* dump sequence data even in schema-only mode */
 	int			do_nothing;
+
+	/* GPDB */
+	bool		dumpGpPolicy;
+	bool		isGPbackend;
 } DumpOptions;
 
 /*
@@ -214,6 +240,9 @@ typedef struct Archive
 	bool		exit_on_error;	/* whether to exit on SQL errors... */
 	int			n_errors;		/* number of errors (if no die) */
 
+	/* prepared-query status */
+	bool	   *is_prepared;	/* indexed by enum _dumpPreparedQueries */
+
 	/* The rest is private */
 } Archive;
 
@@ -236,6 +265,7 @@ typedef struct Archive
 
 typedef struct
 {
+	/* Note: this struct must not contain any unused bytes */
 	Oid			tableoid;
 	Oid			oid;
 } CatalogId;
@@ -248,7 +278,7 @@ typedef int DumpId;
  * Function pointer prototypes for assorted callback methods.
  */
 
-typedef int (*DataDumperPtr) (Archive *AH, void *userArg);
+typedef int (*DataDumperPtr) (Archive *AH, const void *userArg);
 
 typedef void (*SetupWorkerPtrType) (Archive *AH);
 
@@ -258,9 +288,12 @@ typedef void (*SetupWorkerPtrType) (Archive *AH);
 
 extern void ConnectDatabase(Archive *AHX,
 							const ConnParams *cparams,
-							bool isReconnect);
+							bool isReconnect,
+							bool binary_upgrade);
 extern void DisconnectDatabase(Archive *AHX);
 extern PGconn *GetConnection(Archive *AHX);
+
+extern void AmendArchiveEntry(Archive *AHX, DumpId dumpId, const char *defn);
 
 /* Called to write *data* to the archive */
 extern void WriteData(Archive *AH, const void *data, size_t dLen);

@@ -71,9 +71,13 @@ pg_GSS_error_int(char *s, size_t len, OM_uint32 stat, int type)
  * each of major and minor).  No known mechanisms will produce error messages
  * beyond this cap.
  */
+/*
+ * In GPDB backend, we also link with fe-gssapi-common.o, which contains
+ * this same function. Rename it with a "_be" suffix here to avoid linker error.
+ */
 void
-pg_GSS_error(const char *errmsg,
-			 OM_uint32 maj_stat, OM_uint32 min_stat)
+pg_GSS_error_be(const char *errmsg,
+				OM_uint32 maj_stat, OM_uint32 min_stat)
 {
 	char		msg_major[128],
 				msg_minor[128];

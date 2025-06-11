@@ -20,6 +20,7 @@
 #include <sys/time.h>
 
 #include "libpq-fe.h"
+#include "libpq/pqcomm.h"
 #include "pqexpbuffer.h"
 #include "access/xlog.h"
 #include "catalog/pg_type.h"
@@ -29,14 +30,19 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "replication/walreceiver.h"
+#include "storage/proc.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
 #include "utils/pg_lsn.h"
 #include "utils/tuplestore.h"
 
-PG_MODULE_MAGIC;
-
-void		_PG_init(void);
+/*
+ * In PostgreSQL, this is a dynamically loaded module, because PostgreSQL
+ * doesn't want to link libpq statically into the backend.  In GPDB, we have
+ * a statically linked copy of libpq in the backend, anyway, so this is
+ * compiled and linked directly as part of the postgres binary, like any
+ * other backend .c file.
+ */
 
 struct WalReceiverConn
 {
@@ -107,7 +113,7 @@ static char *stringlist_to_identifierstr(PGconn *conn, List *strings);
  * Module initialization function
  */
 void
-_PG_init(void)
+libpqwalreceiver_PG_init(void)
 {
 	if (WalReceiverFunctions != NULL)
 		elog(ERROR, "libpqwalreceiver already loaded");
@@ -125,8 +131,8 @@ libpqrcv_connect(const char *conninfo, bool logical, const char *appname,
 {
 	WalReceiverConn *conn;
 	PostgresPollingStatusType status;
-	const char *keys[5];
-	const char *vals[5];
+	const char *keys[5 + 1];
+	const char *vals[5 + 1];
 	int			i = 0;
 
 	/*
@@ -153,6 +159,8 @@ libpqrcv_connect(const char *conninfo, bool logical, const char *appname,
 		keys[++i] = "client_encoding";
 		vals[i] = GetDatabaseEncodingName();
 	}
+	keys[++i] = GPCONN_TYPE;
+	vals[i] = GPCONN_TYPE_DEFAULT;
 	keys[++i] = NULL;
 	vals[i] = NULL;
 

@@ -14,6 +14,8 @@
  *		remove_useless_result_rtes
  *
  *
+ * Portions Copyright (c) 2006-2008, Greenplum inc
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -36,8 +38,12 @@
 #include "optimizer/tlist.h"
 #include "parser/parse_relation.h"
 #include "parser/parsetree.h"
+#include "parser/parse_relation.h"
 #include "rewrite/rewriteManip.h"
+#include "cdb/cdbgroup.h"
+#include "cdb/cdbsubselect.h"
 
+#include "optimizer/transform.h"
 
 /* source-code-compatibility hacks for pull_varnos() API change */
 #define pull_varnos(a,b) pull_varnos_new(a,b)
@@ -85,9 +91,6 @@ static void pull_up_union_leaf_queries(Node *setOp, PlannerInfo *root,
 									   int childRToffset);
 static void make_setop_translation_list(Query *query, Index newvarno,
 										List **translated_vars);
-static bool is_simple_subquery(PlannerInfo *root, Query *subquery,
-							   RangeTblEntry *rte,
-							   JoinExpr *lowest_outer_join);
 static Node *pull_up_simple_values(PlannerInfo *root, Node *jtnode,
 								   RangeTblEntry *rte);
 static bool is_simple_values(PlannerInfo *root, RangeTblEntry *rte);
@@ -450,8 +453,72 @@ pull_up_sublinks_qual_recurse(PlannerInfo *root, Node *node,
 		}
 		else if (sublink->subLinkType == EXISTS_SUBLINK)
 		{
-			if ((j = convert_EXISTS_sublink_to_join(root, sublink, false,
-													available_rels1)) != NULL)
+            Node	   *boolConst;
+
+            /*
+             * Check if the EXISTS sublink doesn't actually need to be executed at all,
+             * and return TRUE/FALSE directly for it in that case.
+             */
+            if ((boolConst = remove_useless_EXISTS_sublink(root, (Query *)sublink->subselect, false)) != NULL)
+                return boolConst;
+
+            if ((j = convert_EXISTS_sublink_to_join(root, sublink, false,
+                                                    available_rels1)) != NULL)
+			{
+				/* Yes; insert the new join node into the join tree */
+				j->larg = *jtlink1;
+				*jtlink1 = (Node *) j;
+				/* Recursively process pulled-up jointree nodes */
+				j->rarg = pull_up_sublinks_jointree_recurse(root,
+															j->rarg,
+															&child_rels);
+
+				/*
+				 * Now recursively process the pulled-up quals.  Any inserted
+				 * joins can get stacked onto either j->larg or j->rarg,
+				 * depending on which rels they reference.
+				 */
+				j->quals = pull_up_sublinks_qual_recurse(root,
+														 j->quals,
+														 &j->larg,
+														 available_rels1,
+														 &j->rarg,
+														 child_rels);
+				/* Return NULL representing constant TRUE */
+				return NULL;
+			}
+
+            if (available_rels2 != NULL &&
+                    (j = convert_EXISTS_sublink_to_join(root, sublink, false,
+                                                        available_rels2)) != NULL)
+            {
+
+                /* Yes; insert the new join node into the join tree */
+                j->larg = *jtlink2;
+                *jtlink2 = (Node *) j;
+                /* Recursively process pulled-up jointree nodes */
+                j->rarg = pull_up_sublinks_jointree_recurse(root,
+                                                            j->rarg,
+                                                            &child_rels);
+
+                /*
+                 * Now recursively process the pulled-up quals.  Any inserted
+                 * joins can get stacked onto either j->larg or j->rarg,
+                 * depending on which rels they reference.
+                 */
+                j->quals = pull_up_sublinks_qual_recurse(root,
+                                                         j->quals,
+                                                         &j->larg,
+                                                         available_rels2,
+                                                         &j->rarg,
+                                                         child_rels);
+                /* Return NULL representing constant TRUE */
+                return NULL;
+			}
+		}
+		else if (sublink->subLinkType == ALL_SUBLINK)
+		{
+			if ((j = convert_IN_to_antijoin(root, sublink, available_rels1)) != NULL)
 			{
 				/* Yes; insert the new join node into the join tree */
 				j->larg = *jtlink1;
@@ -476,8 +543,7 @@ pull_up_sublinks_qual_recurse(PlannerInfo *root, Node *node,
 				return NULL;
 			}
 			if (available_rels2 != NULL &&
-				(j = convert_EXISTS_sublink_to_join(root, sublink, false,
-													available_rels2)) != NULL)
+				(j = convert_IN_to_antijoin(root, sublink, available_rels2)) != NULL)
 			{
 				/* Yes; insert the new join node into the join tree */
 				j->larg = *jtlink2;
@@ -508,14 +574,24 @@ pull_up_sublinks_qual_recurse(PlannerInfo *root, Node *node,
 	if (is_notclause(node))
 	{
 		/* If the immediate argument of NOT is EXISTS, try to convert */
-		SubLink    *sublink = (SubLink *) get_notclausearg((Expr *) node);
+		Node	   *arg = (Node *) get_notclausearg((Expr *) node);
 		JoinExpr   *j;
 		Relids		child_rels;
 
-		if (sublink && IsA(sublink, SubLink))
+		if (arg && IsA(arg, SubLink))
 		{
+			SubLink    *sublink = (SubLink *) arg;
 			if (sublink->subLinkType == EXISTS_SUBLINK)
 			{
+				Node	   *boolConst;
+
+				/*
+				 * Check if the EXISTS sublink doesn't actually need to be executed at all,
+				 * and return TRUE/FALSE directly for it in that case.
+				 */
+				if ((boolConst = remove_useless_EXISTS_sublink(root, (Query *)sublink->subselect, true)) != NULL)
+					return boolConst;
+
 				if ((j = convert_EXISTS_sublink_to_join(root, sublink, true,
 														available_rels1)) != NULL)
 				{
@@ -541,34 +617,84 @@ pull_up_sublinks_qual_recurse(PlannerInfo *root, Node *node,
 					/* Return NULL representing constant TRUE */
 					return NULL;
 				}
+
 				if (available_rels2 != NULL &&
 					(j = convert_EXISTS_sublink_to_join(root, sublink, true,
 														available_rels2)) != NULL)
-				{
-					/* Yes; insert the new join node into the join tree */
-					j->larg = *jtlink2;
-					*jtlink2 = (Node *) j;
-					/* Recursively process pulled-up jointree nodes */
-					j->rarg = pull_up_sublinks_jointree_recurse(root,
-																j->rarg,
-																&child_rels);
+                {
+                    /* Yes; insert the new join node into the join tree */
+                    j->larg = *jtlink2;
+                    *jtlink2 = (Node *) j;
+                    /* Recursively process pulled-up jointree nodes */
+                    j->rarg = pull_up_sublinks_jointree_recurse(root,
+                                                                j->rarg,
+                                                                &child_rels);
 
-					/*
-					 * Now recursively process the pulled-up quals.  Because
-					 * we are underneath a NOT, we can't pull up sublinks that
-					 * reference the left-hand stuff, but it's still okay to
-					 * pull up sublinks referencing j->rarg.
-					 */
-					j->quals = pull_up_sublinks_qual_recurse(root,
-															 j->quals,
-															 &j->rarg,
-															 child_rels,
-															 NULL, NULL);
-					/* Return NULL representing constant TRUE */
-					return NULL;
+                    /*
+                     * Now recursively process the pulled-up quals.  Because
+                     * we are underneath a NOT, we can't pull up sublinks that
+                     * reference the left-hand stuff, but it's still okay to
+                     * pull up sublinks referencing j->rarg.
+                     */
+                    j->quals = pull_up_sublinks_qual_recurse(root,
+                                                             j->quals,
+                                                             &j->rarg,
+                                                             child_rels,
+                                                             NULL, NULL);
+                    /* Return NULL representing constant TRUE */
+                    return NULL;
 				}
+
+				/* Else return it unmodified */
+				return node;
 			}
+
+			/*
+			 *	 We normalize NOT subqueries using the following axioms:
+			 *
+			 *		 val NOT IN (subq)		 =>  val <> ALL (subq)
+			 *		 NOT val op ANY (subq)	 =>  val op' ALL (subq)
+			 *		 NOT val op ALL (subq)	 =>  val op' ANY (subq)
+			 *
+			 *   postgresql do not process ANY_SUBLINK or ALL_SUBLINK expr in not clause,
+			 *   this is an enhanced optimization by GPDB.
+			 *   we can use negate_clause instead of make_notclause to simplify the expr.
+			 *   the is_check param for canonicalize_qual is false,
+			 *   because expr is a qual not check constraint here.
+			 */
+			else if (sublink->subLinkType == ANY_SUBLINK || sublink->subLinkType == ALL_SUBLINK)
+			{
+				sublink->subLinkType = (sublink->subLinkType == ANY_SUBLINK) ? ALL_SUBLINK : ANY_SUBLINK;
+				sublink->testexpr = (Node *) canonicalize_qual((Expr *) negate_clause(sublink->testexpr), false);
+				return pull_up_sublinks_qual_recurse(root, (Node *) sublink,
+														jtlink1, available_rels1,
+														jtlink2, available_rels2);
+			}
+
+			/*
+			 * Return the node unmodified for "NOT (subq)"
+			 * This subquery will get pulled up later during preprocess_qual_conditions()
+			 */
+			return node;
 		}
+
+		else if (is_notclause(arg))
+		{
+			/* NOT NOT (expr) => (expr)  */
+			return (Node *) pull_up_sublinks_qual_recurse(root,
+														 (Node *) get_notclausearg((Expr *) arg),
+														 jtlink1, available_rels1,
+														 jtlink2, available_rels2);
+		}
+		else if (is_orclause(arg))
+		{
+			/* NOT OR (expr1) (expr2) => (expr1) AND (expr2) */
+			return (Node *) pull_up_sublinks_qual_recurse(root,
+														 negate_clause(arg),
+														 jtlink1, available_rels1,
+														 jtlink2, available_rels2);
+		}
+
 		/* Else return it unmodified */
 		return node;
 	}
@@ -600,6 +726,36 @@ pull_up_sublinks_qual_recurse(PlannerInfo *root, Node *node,
 		else
 			return (Node *) make_andclause(newclauses);
 	}
+
+	/*
+	 * (expr) op SUBLINK
+	 */
+	if (IsA(node, OpExpr))
+	{
+		OpExpr *opexp = (OpExpr *) node;
+		JoinExpr   *j;
+
+		if (list_length(opexp->args) == 2)
+		{
+			/**
+			 * Check if second arg is sublink
+			 */
+			Node *rarg = list_nth(opexp->args, 1);
+
+			if (IsA(rarg, SubLink))
+			{
+				j = convert_EXPR_to_join(root, opexp);
+				if (j)
+				{
+					/* Yes, insert the new join node into the join tree */
+					j->larg = *jtlink1;
+					*jtlink1 = (Node *) j;
+				}
+				return node;
+			}
+		}
+	}
+
 	/* Stop if not an AND */
 	return node;
 }
@@ -639,6 +795,13 @@ inline_set_returning_functions(PlannerInfo *root)
 			funcquery = inline_set_returning_function(root, rte);
 			if (funcquery)
 			{
+
+				/*
+				 * GPDB: Normalize the resulting query, like standard_planner()
+				 * does for the main query.
+				 */
+				funcquery = normalize_query(funcquery);
+
 				/* Successful expansion, convert the RTE to a subquery */
 				rte->rtekind = RTE_SUBQUERY;
 				rte->subquery = funcquery;
@@ -729,6 +892,7 @@ pull_up_subqueries_recurse(PlannerInfo *root, Node *jtnode,
 		 * unless is_safe_append_member says so.
 		 */
 		if (rte->rtekind == RTE_SUBQUERY &&
+			!rte->forceDistRandom &&
 			is_simple_subquery(root, rte->subquery, rte, lowest_outer_join) &&
 			(containing_appendrel == NULL ||
 			 is_safe_append_member(rte->subquery)))
@@ -788,6 +952,7 @@ pull_up_subqueries_recurse(PlannerInfo *root, Node *jtnode,
 		switch (j->jointype)
 		{
 			case JOIN_INNER:
+			case JOIN_SEMI:
 				j->larg = pull_up_subqueries_recurse(root, j->larg,
 													 lowest_outer_join,
 													 lowest_nulling_outer_join,
@@ -798,8 +963,8 @@ pull_up_subqueries_recurse(PlannerInfo *root, Node *jtnode,
 													 NULL);
 				break;
 			case JOIN_LEFT:
-			case JOIN_SEMI:
 			case JOIN_ANTI:
+			case JOIN_LASJ_NOTIN:
 				j->larg = pull_up_subqueries_recurse(root, j->larg,
 													 j,
 													 lowest_nulling_outer_join,
@@ -894,6 +1059,7 @@ pull_up_simple_subquery(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte,
 	subroot->cte_plan_ids = NIL;
 	subroot->multiexpr_params = NIL;
 	subroot->eq_classes = NIL;
+	subroot->non_eq_clauses = NIL;
 	subroot->append_rel_list = NIL;
 	subroot->rowMarks = NIL;
 	memset(subroot->upper_rels, 0, sizeof(subroot->upper_rels));
@@ -909,6 +1075,15 @@ pull_up_simple_subquery(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte,
 
 	/* No CTEs to worry about */
 	Assert(subquery->cteList == NIL);
+
+	subroot->list_cteplaninfo = NIL;
+	if (subroot->parse->cteList != NIL)
+	{
+		subroot->list_cteplaninfo = init_list_cteplaninfo(list_length(subroot->parse->cteList));
+	}
+
+    subroot->config = CopyPlannerConfig(root->config);
+	subroot->config->honor_order_by = false;
 
 	/*
 	 * If the FROM clause is empty, replace it with a dummy RTE_RESULT RTE, so
@@ -1051,6 +1226,14 @@ pull_up_simple_subquery(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte,
 		rvcontext.wrap_non_vars = true;
 	}
 
+	List *newTList = (List *)
+		pullup_replace_vars((Node *) parse->targetList, &rvcontext);
+
+	if (parse->scatterClause)
+	{
+		UpdateScatterClause(parse, newTList);
+	}
+
 	/*
 	 * Replace all of the top query's references to the subquery's outputs
 	 * with copies of the adjusted subtlist items, being careful not to
@@ -1060,8 +1243,8 @@ pull_up_simple_subquery(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte,
 	 * outer join.  replace_vars_in_jointree tracks its location in the
 	 * jointree and uses PHVs or not appropriately.
 	 */
-	parse->targetList = (List *)
-		pullup_replace_vars((Node *) parse->targetList, &rvcontext);
+	parse->targetList = newTList;
+
 	parse->returningList = (List *)
 		pullup_replace_vars((Node *) parse->returningList, &rvcontext);
 	if (parse->onConflict)
@@ -1082,6 +1265,21 @@ pull_up_simple_subquery(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte,
 							 lowest_nulling_outer_join);
 	Assert(parse->setOperations == NULL);
 	parse->havingQual = pullup_replace_vars(parse->havingQual, &rvcontext);
+
+	if (parse->windowClause)
+	{
+		foreach(lc, parse->windowClause)
+		{
+			WindowClause *wc = (WindowClause *) lfirst(lc);
+
+			if (wc->startOffset)
+				wc->startOffset =
+					pullup_replace_vars((Node *) wc->startOffset, &rvcontext);
+			if (wc->endOffset)
+				wc->endOffset =
+					pullup_replace_vars((Node *) wc->endOffset, &rvcontext);
+		}
+	}
 
 	/*
 	 * Replace references in the translated_vars lists of appendrels. When
@@ -1119,6 +1317,21 @@ pull_up_simple_subquery(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte,
 			otherrte->joinaliasvars = (List *)
 				pullup_replace_vars((Node *) otherrte->joinaliasvars,
 									&rvcontext);
+		else if (otherrte->rtekind == RTE_SUBQUERY && rte != otherrte)
+		{
+			 /*
+			  * here the sublevels_up can only be 1, because if larger than 1,
+			  * then the sublink is multilevel correlated, and cannot be pulled
+			  * up to be a subquery range table; while on the other hand, we
+			  * cannot directly put a subquery which refer to other relations
+			  * of the same level after FROM.
+			  */
+			otherrte->subquery = (Query *)
+				ReplaceVarsFromTargetList((Node *) otherrte->subquery,
+										  varno, 1, rte,
+										  subquery->targetList, REPLACEVARS_REPORT_ERROR,
+										  0, NULL);
+		}
 	}
 
 	/*
@@ -1142,6 +1355,7 @@ pull_up_simple_subquery(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte,
 					break;
 				case RTE_SUBQUERY:
 				case RTE_FUNCTION:
+				case RTE_TABLEFUNCTION:
 				case RTE_VALUES:
 				case RTE_TABLEFUNC:
 					child_rte->lateral = true;
@@ -1150,6 +1364,7 @@ pull_up_simple_subquery(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte,
 				case RTE_CTE:
 				case RTE_NAMEDTUPLESTORE:
 				case RTE_RESULT:
+				case RTE_VOID:
 					/* these can't contain any lateral references */
 					break;
 			}
@@ -1223,6 +1438,13 @@ pull_up_simple_subquery(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte,
 	 * subquery won't be pulled up if it hasAggs, hasWindowFuncs, or
 	 * hasTargetSRFs, so no work needed on those flags
 	 */
+
+    /*
+     * CDB: Wipe old RTE so subquery parse tree won't be sent to QEs.
+     */
+    Assert(rte->rtekind == RTE_SUBQUERY);
+    rte->rtekind = RTE_VOID;
+    rte->subquery = NULL;
 
 	/*
 	 * Return the adjusted subquery jointree to replace the RangeTblRef entry
@@ -1424,8 +1646,11 @@ make_setop_translation_list(Query *query, Index newvarno,
  * (Note subquery is not necessarily equal to rte->subquery; it could be a
  * processed copy of that.)
  * lowest_outer_join is the lowest outer join above the subquery, or NULL.
+ *
+ * In GPDB, 'rte' can be passed as NULL, if this is a sublink, rather
+ * than a subselect in the FROM list, that we are trying to pull up.
  */
-static bool
+bool
 is_simple_subquery(PlannerInfo *root, Query *subquery, RangeTblEntry *rte,
 				   JoinExpr *lowest_outer_join)
 {
@@ -1460,12 +1685,14 @@ is_simple_subquery(PlannerInfo *root, Query *subquery, RangeTblEntry *rte,
 		subquery->groupClause ||
 		subquery->groupingSets ||
 		subquery->havingQual ||
+		subquery->windowClause ||
 		subquery->sortClause ||
 		subquery->distinctClause ||
 		subquery->limitOffset ||
 		subquery->limitCount ||
 		subquery->hasForUpdate ||
-		subquery->cteList)
+		subquery->cteList ||
+		root->parse->cteList)
 		return false;
 
 	/*
@@ -1473,13 +1700,13 @@ is_simple_subquery(PlannerInfo *root, Query *subquery, RangeTblEntry *rte,
 	 * couldn't prevent information leakage once the RTE's Vars are scattered
 	 * about in the upper query.
 	 */
-	if (rte->security_barrier)
+	if (rte && rte->security_barrier)
 		return false;
 
 	/*
 	 * If the subquery is LATERAL, check for pullup restrictions from that.
 	 */
-	if (rte->lateral)
+	if (rte && rte->lateral)
 	{
 		bool		restricted;
 		Relids		safe_upper_varnos;
@@ -1964,6 +2191,7 @@ replace_vars_in_jointree(Node *jtnode,
 														 context);
 						break;
 					case RTE_FUNCTION:
+					case RTE_TABLEFUNCTION:
 						rte->functions = (List *)
 							pullup_replace_vars((Node *) rte->functions,
 												context);
@@ -1982,6 +2210,7 @@ replace_vars_in_jointree(Node *jtnode,
 					case RTE_CTE:
 					case RTE_NAMEDTUPLESTORE:
 					case RTE_RESULT:
+					case RTE_VOID:
 						/* these shouldn't be marked LATERAL */
 						Assert(false);
 						break;
@@ -2581,6 +2810,7 @@ reduce_outer_joins_pass2(Node *jtnode,
 						jointype = JOIN_RIGHT;
 				}
 				break;
+			case JOIN_LASJ_NOTIN:
 			case JOIN_SEMI:
 			case JOIN_ANTI:
 
@@ -3045,6 +3275,11 @@ remove_useless_results_recurse(PlannerInfo *root, Node *jtnode)
 			case JOIN_ANTI:
 				/* We have no special smarts for these cases */
 				break;
+
+			case JOIN_LASJ_NOTIN:
+				/* no smarts for this case either */
+				break;
+
 			default:
 				elog(ERROR, "unrecognized join type: %d",
 					 (int) j->jointype);
@@ -3462,4 +3697,23 @@ find_jointree_node_for_rel(Node *jtnode, int relid)
 		elog(ERROR, "unrecognized node type: %d",
 			 (int) nodeTag(jtnode));
 	return NULL;
+}
+
+/*
+ * init_list_cteplaninfo
+ *   Create a list of CtePlanInfos of size 'numCtes', and initialize each CtePlanInfo.
+ */
+List *
+init_list_cteplaninfo(int numCtes)
+{
+	List *list_cteplaninfo = NULL;
+	
+	for (int cteNo = 0; cteNo < numCtes; cteNo++)
+	{
+		CtePlanInfo *ctePlanInfo = palloc0(sizeof(CtePlanInfo));
+		list_cteplaninfo = lappend(list_cteplaninfo, ctePlanInfo);
+	}
+
+	return list_cteplaninfo;
+	
 }

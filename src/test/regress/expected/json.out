@@ -387,9 +387,9 @@ SELECT row_to_json(row((select array_agg(x) as d from generate_series(5,10) x)),
 select to_json(histogram_bounds) histogram_bounds
 from pg_stats
 where attname = 'tmplname' and tablename = 'pg_pltemplate';
-                                   histogram_bounds                                    
----------------------------------------------------------------------------------------
- ["plperl","plperlu","plpgsql","plpython2u","plpython3u","plpythonu","pltcl","pltclu"]
+                                                histogram_bounds                                                
+----------------------------------------------------------------------------------------------------------------
+ ["pljava","pljavau","plperl","plperlu","plpgsql","plpython2u","plpython3u","plpythonu","plr","pltcl","pltclu"]
 (1 row)
 
 -- to_json, timestamps
@@ -2132,14 +2132,14 @@ CREATE TEMP TABLE foo (serial_num int, name text, type text);
 INSERT INTO foo VALUES (847001,'t15','GE1043');
 INSERT INTO foo VALUES (847002,'t16','GE1043');
 INSERT INTO foo VALUES (847003,'sub-alpha','GESS90');
-SELECT json_build_object('turbines',json_object_agg(serial_num,json_build_object('name',name,'type',type)))
+SELECT json_build_object('turbines',json_object_agg(serial_num,json_build_object('name',name,'type',type) order by serial_num))
 FROM foo;
                                                                             json_build_object                                                                            
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  {"turbines" : { "847001" : {"name" : "t15", "type" : "GE1043"}, "847002" : {"name" : "t16", "type" : "GE1043"}, "847003" : {"name" : "sub-alpha", "type" : "GESS90"} }}
 (1 row)
 
-SELECT json_object_agg(name, type) FROM foo;
+SELECT json_object_agg(name, type order by type, name) FROM foo;
                         json_object_agg                         
 ----------------------------------------------------------------
  { "t15" : "GE1043", "t16" : "GE1043", "sub-alpha" : "GESS90" }
@@ -2595,5 +2595,24 @@ select ts_headline('[]'::json, tsquery('aaa & bbb'));
  ts_headline 
 -------------
  []
+(1 row)
+
+-- checking proisstrict settings
+select '[{"a":1}]'::json->0->'b';
+ ?column? 
+----------
+ 
+(1 row)
+
+select '[{"a":1}]'::json->1;
+ ?column? 
+----------
+ 
+(1 row)
+
+select '[{"a":1}]'::json->1->'a';
+ ?column? 
+----------
+ 
 (1 row)
 

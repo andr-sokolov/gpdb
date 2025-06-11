@@ -402,6 +402,21 @@ list_nth_cell(const List *list, int n)
 	return match;
 }
 
+/**
+ * Replace the n-th data pointer in the list with newvalue.
+ * Returns oldvalue. Assumes that n is a valid offset.
+ */
+void *
+list_nth_replace(List *list, int n, void *new_data)
+{
+	ListCell *lc = NULL;
+	lc = list_nth_cell(list, n);
+	Assert(lc);
+	void *old_data = lc->data.ptr_value;
+	lc->data.ptr_value = new_data;
+	return old_data;
+}
+
 /*
  * Return the data value contained in the n'th element of the
  * specified list. (List elements begin at 0.)

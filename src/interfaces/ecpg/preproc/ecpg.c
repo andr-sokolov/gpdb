@@ -58,7 +58,7 @@ help(const char *progname)
 	printf(_("  -?, --help     show this help, then exit\n"));
 	printf(_("\nIf no output file is specified, the name is formed by adding .c to the\n"
 			 "input file name, after stripping off .pgc if present.\n"));
-	printf(_("\nReport bugs to <pgsql-bugs@lists.postgresql.org>.\n"));
+	printf(_("\nReport bugs to <bugs@greenplum.org>.\n"));
 }
 
 static void
@@ -149,7 +149,7 @@ main(int argc, char *const argv[])
 		}
 		if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)
 		{
-			printf("ecpg (PostgreSQL) %s\n", PG_VERSION);
+			printf("ecpg (PostgreSQL %s) %s\n", PG_VERSION, GP_VERSION);
 			exit(0);
 		}
 	}
@@ -435,7 +435,7 @@ main(int argc, char *const argv[])
 				if (regression_mode)
 					fprintf(base_yyout, "/* Processed by ecpg (regression mode) */\n");
 				else
-					fprintf(base_yyout, "/* Processed by ecpg (%s) */\n", PG_VERSION);
+					fprintf(base_yyout, "/* Processed by ecpg (%s) */\n", GP_VERSION);
 
 				if (header_mode == false)
 				{

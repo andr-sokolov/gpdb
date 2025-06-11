@@ -158,6 +158,7 @@ extern void SlruPagePrecedesUnitTests(SlruCtl ctl, int per_page);
 #define SlruPagePrecedesUnitTests(ctl, per_page) do {} while (0)
 #endif
 extern void SimpleLruTruncate(SlruCtl ctl, int cutoffPage);
+extern void SimpleLruTruncateWithLock(SlruCtl ctl, int cutoffPage);
 extern bool SimpleLruDoesPhysicalPageExist(SlruCtl ctl, int pageno);
 
 typedef bool (*SlruScanCallback) (SlruCtl ctl, char *filename, int segpage,

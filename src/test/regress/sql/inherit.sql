@@ -205,6 +205,11 @@ DROP TABLE firstparent, secondparent, jointchild, thirdparent, otherchild;
 
 -- Test changing the type of inherited columns
 insert into d values('test','one','two','three');
+alter table z drop constraint z_pkey;
+alter table a alter column aa type integer using bit_length(aa);
+-- In GPDB, the table is distributed by the 'aa' column, changing its type
+-- therefore fails. Change the distribution key and try again.
+alter table a set distributed randomly;
 alter table a alter column aa type integer using bit_length(aa);
 select * from d;
 
@@ -392,11 +397,13 @@ DROP TABLE test_constraints;
 
 CREATE TABLE test_ex_constraints (
     c circle,
-    EXCLUDE USING gist (c WITH &&)
+    dkey inet,
+    EXCLUDE USING gist (dkey inet_ops WITH =, c WITH &&)
 );
+
 CREATE TABLE test_ex_constraints_inh () INHERITS (test_ex_constraints);
 \d+ test_ex_constraints
-ALTER TABLE test_ex_constraints DROP CONSTRAINT test_ex_constraints_c_excl;
+ALTER TABLE test_ex_constraints DROP CONSTRAINT test_ex_constraints_dkey_c_excl;
 \d+ test_ex_constraints
 \d+ test_ex_constraints_inh
 DROP TABLE test_ex_constraints_inh;
@@ -422,6 +429,8 @@ create table inh_fk_2 (x int primary key, y int references inh_fk_1 on delete ca
 insert into inh_fk_2 values (11, 1), (22, 2), (33, 3);
 create table inh_fk_2_child () inherits (inh_fk_2);
 insert into inh_fk_2_child values (111, 1), (222, 2);
+-- The cascading deletion doesn't work on GPDB, because foreign keys are not
+-- enforced in general. So this produces different result than on upstream.
 delete from inh_fk_1 where a = 1;
 select * from inh_fk_1 order by 1;
 select * from inh_fk_2 order by 1, 2;
@@ -471,7 +480,8 @@ order by 1, 2;
 --
 
 create temp table patest0 (id, x) as
-  select x, x from generate_series(0,1000) x;
+  select x, x from generate_series(0,1000) x
+  distributed by (id);
 create temp table patest1() inherits (patest0);
 insert into patest1
   select x, x from generate_series(0,1000) x;
@@ -485,15 +495,19 @@ analyze patest0;
 analyze patest1;
 analyze patest2;
 
+set enable_seqscan=off;
+set enable_bitmapscan=off;
 explain (costs off)
-select * from patest0 join (select f1 from int4_tbl limit 1) ss on id = f1;
-select * from patest0 join (select f1 from int4_tbl limit 1) ss on id = f1;
+select * from patest0 join (select f1 from int4_tbl where f1 < 10 and f1 > -10 limit 1) ss on id = f1;
+select * from patest0 join (select f1 from int4_tbl where f1 < 10 and f1 > -10 limit 1) ss on id = f1;
 
 drop index patest2i;
 
 explain (costs off)
-select * from patest0 join (select f1 from int4_tbl limit 1) ss on id = f1;
-select * from patest0 join (select f1 from int4_tbl limit 1) ss on id = f1;
+select * from patest0 join (select f1 from int4_tbl where f1 < 10 and f1 > -10 limit 1) ss on id = f1;
+select * from patest0 join (select f1 from int4_tbl where f1 < 10 and f1 > -10 limit 1) ss on id = f1;
+reset enable_seqscan;
+reset enable_bitmapscan;
 
 drop table patest0 cascade;
 
@@ -527,12 +541,17 @@ reset enable_indexscan;
 
 set enable_seqscan = off;  -- plan with fewest seqscans should be merge
 set enable_parallel_append = off; -- Don't let parallel-append interfere
+-- GPDB_92_MERGE_FIXME: the cost of bitmap scan is not correct?
+-- the cost of merge append with index scan is bigger than the cost
+-- of append with bitmapscan + sort
+set enable_bitmapscan = off; 
 explain (verbose, costs off) select * from matest0 order by 1-id;
 select * from matest0 order by 1-id;
 explain (verbose, costs off) select min(1-id) from matest0;
 select min(1-id) from matest0;
 reset enable_seqscan;
 reset enable_parallel_append;
+reset enable_bitmapscan;
 
 drop table matest0 cascade;
 
@@ -547,6 +566,7 @@ create index matest0i on matest0 (b, c);
 create index matest1i on matest1 (b, c);
 
 set enable_nestloop = off;  -- we want a plan with two MergeAppends
+set enable_mergejoin=on;
 
 explain (costs off)
 select t1.* from matest0 t1, matest0 t2
@@ -564,6 +584,15 @@ drop table matest0 cascade;
 set enable_seqscan = off;
 set enable_indexscan = on;
 set enable_bitmapscan = off;
+
+-- GPDB: coerce the planner to choose Merge Append plans for the below queries.
+-- In upstream, the Merge Append is cheaper, but in GPDB the Sort within each
+-- segment only has to sort 1 / 3 of the data (with three segments), making
+-- Sort + Append cheaper. Compensate by pretending that there are more rows in
+-- the table.
+begin;
+set allow_system_table_mods = on;
+update pg_class set reltuples = 100000 where oid = 'tenk1'::regclass;
 
 -- Check handling of duplicated, constant, or volatile targetlist items
 explain (costs off)
@@ -628,6 +657,8 @@ FROM generate_series(1, 3) g(i);
 reset enable_seqscan;
 reset enable_indexscan;
 reset enable_bitmapscan;
+
+rollback;
 
 --
 -- Check handling of a constant-null CHECK constraint
@@ -829,8 +860,13 @@ create table bool_rp_true_2k partition of bool_rp for values from (true,1000) to
 create index on bool_rp (b,a);
 explain (costs off) select * from bool_rp where b = true order by b,a;
 explain (costs off) select * from bool_rp where b = false order by b,a;
+-- GPDB: force the planner to choose same plan as in upstream
+set enable_seqscan=off;
+set enable_bitmapscan=off;
 explain (costs off) select * from bool_rp where b = true order by a;
 explain (costs off) select * from bool_rp where b = false order by a;
+reset enable_seqscan;
+reset enable_bitmapscan;
 
 drop table bool_rp;
 
@@ -849,8 +885,8 @@ drop table range_parted;
 -- Check that we allow access to a child table's statistics when the user
 -- has permissions only for the parent table.
 create table permtest_parent (a int, b text, c text) partition by list (a);
-create table permtest_child (b text, c text, a int) partition by list (b);
-create table permtest_grandchild (c text, b text, a int);
+create table permtest_child (b text, c text, a int) partition by list (b) distributed by (a);
+create table permtest_grandchild (c text, b text, a int) distributed by (a);
 alter table permtest_child attach partition permtest_grandchild for values in ('a');
 alter table permtest_parent attach partition permtest_child for values in (1);
 create index on permtest_parent (left(c, 3));
@@ -917,7 +953,7 @@ CREATE TABLE errtst_child_reorder (
     partid int not null,
     CONSTRAINT shdata_small CHECK(shdata < 3),
     CHECK(data < 10)
-);
+) distributed by (partid);
 
 ALTER TABLE errtst_child_fastdef ADD COLUMN data int NOT NULL DEFAULT 0;
 ALTER TABLE errtst_child_fastdef ADD CONSTRAINT errtest_child_fastdef_data_check CHECK (data < 10);

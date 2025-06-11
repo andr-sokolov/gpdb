@@ -128,6 +128,9 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
+#include "catalog/gp_distribution_policy.h"
+#include "cdb/cdbvars.h"
+
 
 /*
  * To minimize palloc traffic, we keep pending requests in successively-
@@ -214,6 +217,8 @@ static struct SYSCACHECALLBACK
 
 static int16 syscache_callback_links[SysCacheSize];
 
+static int16 syscache_callback_links[SysCacheSize];
+
 static int	syscache_callback_count = 0;
 
 static struct RELCACHECALLBACK
@@ -262,6 +267,14 @@ AddInvalidationMessage(InvalidationChunk **listHdr,
 	{
 		/* Need another chunk; double size of last chunk */
 		int			chunksize = 2 * chunk->maxitems;
+
+		/*
+		 * Keep in mind: the max allowed alloc size is about 1GB, for
+		 * simplification we set the upper limit to half of that.
+		 */
+#define MAXCHUNKSIZE (MaxAllocSize / 2 / sizeof(SharedInvalidationMessage))
+		if (chunksize > MAXCHUNKSIZE)
+			chunksize >>= 1;
 
 		chunk = (InvalidationChunk *)
 			MemoryContextAlloc(CurTransactionContext,
@@ -546,6 +559,38 @@ RegisterRelcacheInvalidation(Oid dbId, Oid relId)
 		transInvalInfo->RelcacheInitFileInval = true;
 }
 
+#ifdef USE_ASSERT_CHECKING
+static char *
+si_to_str(SharedInvalidationMessage *msg)
+{
+	StringInfoData buf;
+	int i;
+	char *s;
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "message id = %d", msg->id);
+	s = (char *)&(msg->cc);
+	for (i = 0; i < sizeof(SharedInvalCatcacheMsg); i++)
+	{
+		if (i == 0)
+			appendStringInfo(&buf, " CC:");
+
+		appendStringInfo(&buf, " %x", *(s + i));
+
+	}
+	s = (char *)&(msg->rc);
+	for (i = 0; i < sizeof(SharedInvalRelcacheMsg); i++)
+	{
+		if (i == 0)
+			appendStringInfo(&buf, " RC:");
+
+		appendStringInfo(&buf, " %x", *(s + i));
+
+	}
+	return buf.data;
+}
+#endif
+
 /*
  * RegisterSnapshotInvalidation
  *
@@ -639,7 +684,12 @@ LocalExecuteInvalidationMessage(SharedInvalidationMessage *msg)
 			InvalidateCatalogSnapshot();
 	}
 	else
+	{
+#ifdef USE_ASSERT_CHECKING
+		elog(NOTICE, "invalid SI message: %s", si_to_str(msg));
+#endif
 		elog(FATAL, "unrecognized SI message ID: %d", msg->id);
+	}
 }
 
 /*
@@ -1210,6 +1260,20 @@ CacheInvalidateHeapTuple(Relation relation,
 		 * relations can't have schema changes after bootstrap, so we should
 		 * never come here for a shared rel anyway.)
 		 */
+		databaseId = MyDatabaseId;
+	}
+	else if (tupleRelId == GpPolicyRelationId)
+	{
+		FormData_gp_distribution_policy *gptup = (FormData_gp_distribution_policy *) GETSTRUCT(tuple);
+
+		relationId = gptup->localoid;
+		databaseId = MyDatabaseId;
+	}
+	else if (tupleRelId == AppendOnlyRelationId)
+	{
+		FormData_pg_appendonly *aotup = (FormData_pg_appendonly *) GETSTRUCT(tuple);
+
+		relationId = aotup->relid;
 		databaseId = MyDatabaseId;
 	}
 	else if (tupleRelId == IndexRelationId)

@@ -17,8 +17,5 @@ step s2i:
  <waiting ...>
 step s1i: <... completed>
 step s2i: <... completed>
-unlck
------
-t    
-(1 row)
+unlck          
 

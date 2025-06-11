@@ -18,6 +18,7 @@
 #include "utils/pidfile.h"
 
 #include "pg_upgrade.h"
+#include "greenplum/pg_upgrade_greenplum.h"
 
 
 static void usage(void);
@@ -57,6 +58,9 @@ parseCommandLine(int argc, char *argv[])
 		{"verbose", no_argument, NULL, 'v'},
 		{"clone", no_argument, NULL, 1},
 
+		/* Greenplum specific parameters */
+		GREENPLUM_OPTIONS
+
 		{NULL, 0, NULL, 0}
 	};
 	int			option;			/* Command line option */
@@ -75,6 +79,9 @@ parseCommandLine(int argc, char *argv[])
 	new_cluster.port = getenv("PGPORTNEW") ? atoi(getenv("PGPORTNEW")) : DEF_PGUPORT;
 
 	os_user_effective_id = get_user_info(&os_info.user);
+
+	initialize_greenplum_user_options();
+
 	/* we override just the database user name;  we got the OS id above */
 	if (getenv("PGUSER"))
 	{
@@ -210,9 +217,13 @@ parseCommandLine(int argc, char *argv[])
 				break;
 
 			default:
-				fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
-						os_info.progname);
-				exit(1);
+				if (!process_greenplum_option(option))
+				{
+					fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
+							os_info.progname);
+					exit(1);
+				}
+				break;
 		}
 	}
 
@@ -252,17 +263,22 @@ parseCommandLine(int argc, char *argv[])
 	/* Get values from env if not already set */
 	check_required_directory(&old_cluster.bindir, "PGBINOLD", false,
 							 "-b", _("old cluster binaries reside"));
-	check_required_directory(&new_cluster.bindir, "PGBINNEW", false,
-							 "-B", _("new cluster binaries reside"));
+
+	if(!is_skip_target_check())
+		check_required_directory(&new_cluster.bindir, "PGBINNEW", false,
+					 "-B", "new cluster binaries reside");
+
 	check_required_directory(&old_cluster.pgdata, "PGDATAOLD", false,
 							 "-d", _("old cluster data resides"));
-	check_required_directory(&new_cluster.pgdata, "PGDATANEW", false,
-							 "-D", _("new cluster data resides"));
+
+	if(!is_skip_target_check())
+		check_required_directory(&new_cluster.pgdata, "PGDATANEW", false,
+					 "-D", "new cluster data resides");
+
 	check_required_directory(&user_opts.socketdir, "PGSOCKETDIR", true,
 							 "-s", _("sockets will be created"));
 
 #ifdef WIN32
-
 	/*
 	 * On Windows, initdb --sync-only will fail with a "Permission denied"
 	 * error on file pg_upgrade_utility.log if pg_upgrade is run inside the
@@ -288,7 +304,7 @@ parseCommandLine(int argc, char *argv[])
 static void
 usage(void)
 {
-	printf(_("pg_upgrade upgrades a PostgreSQL cluster to a different major version.\n\n"));
+	printf(_("pg_upgrade upgrades a Greenplum cluster to a different major version.\n\n"));
 	printf(_("Usage:\n"));
 	printf(_("  pg_upgrade [OPTION]...\n\n"));
 	printf(_("Options:\n"));
@@ -309,6 +325,8 @@ usage(void)
 	printf(_("  -v, --verbose                 enable verbose internal logging\n"));
 	printf(_("  -V, --version                 display version information, then exit\n"));
 	printf(_("  --clone                       clone instead of copying files to new cluster\n"));
+	printf(_("  --continue-check-on-fatal     goes through all pg_upgrade checks; should be used with -c\n"));
+	printf(_("  --skip-target-check           skip all checks and comparisons of new cluster; should be used with -c\n"));
 	printf(_("  -?, --help                    show this help, then exit\n"));
 	printf(_("\n"
 			 "Before running pg_upgrade you must:\n"
@@ -338,7 +356,7 @@ usage(void)
 			 "  C:\\> set PGBINNEW=newCluster/bin\n"
 			 "  C:\\> pg_upgrade\n"));
 #endif
-	printf(_("\nReport bugs to <pgsql-bugs@lists.postgresql.org>.\n"));
+	printf(_("\nReport bugs to <bugs@greenplum.org>.\n"));
 }
 
 

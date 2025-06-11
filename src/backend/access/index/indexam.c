@@ -28,6 +28,7 @@
  *		index_fetch_heap		- get the scan's next heap tuple
  *		index_getnext_slot	- get the next tuple from a scan
  *		index_getbitmap - get all tuples from a scan
+ *      index_initbitmap - get an empty bitmap
  *		index_bulk_delete	- bulk deletion of index tuples
  *		index_vacuum_cleanup	- post-deletion cleanup of an index
  *		index_can_return	- does index support index-only scans?
@@ -49,6 +50,7 @@
 #include "access/tableam.h"
 #include "access/transam.h"
 #include "access/xlog.h"
+#include "access/bitmap_private.h"
 #include "catalog/index.h"
 #include "catalog/pg_type.h"
 #include "pgstat.h"
@@ -56,7 +58,7 @@
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
 #include "utils/snapmgr.h"
-
+#include "utils/fmgroids.h"
 
 /* ----------------------------------------------------------------
  *					macros used in index_ routines
@@ -635,21 +637,47 @@ index_getnext_slot(IndexScanDesc scan, ScanDirection direction, TupleTableSlot *
 	return false;
 }
 
+/*
+ * index_initbitmap -- get an empty bitmap
+ * */
+void
+index_initbitmap(IndexScanDesc scan, Node **bitmapP)
+{
+    Relation relation = scan->indexRelation;
+
+    if (relation->rd_amhandler == F_BMHANDLER)
+    {
+        bminitbitmap(bitmapP);
+    }
+    else if (relation->rd_amhandler == F_BTHANDLER)
+    {
+        *bitmapP = (Node *)tbm_create(work_mem * 1024L, NULL);
+    }
+    else
+    {
+        elog(ERROR, "Not support rd_amhandler %u to initbitmap under bitmapscan",
+            relation->rd_amhandler);
+    }
+
+    return;
+}
+
 /* ----------------
  *		index_getbitmap - get all tuples at once from an index scan
  *
- * Adds the TIDs of all heap tuples satisfying the scan keys to a bitmap.
- * Since there's no interlock between the index scan and the eventual heap
- * access, this is only safe to use with MVCC-based snapshots: the heap
- * item slot could have been replaced by a newer tuple by the time we get
- * to it.
+ *		it invokes am's getmulti function to get a bitmap. If am is an on-disk
+ *		bitmap index access method (see bitmap.h), then a StreamBitmap is
+ *		returned; a TIDBitmap otherwise. Note that an index am's getmulti
+ *		function can assume that the bitmap that it's given as argument is of
+ *		the same type as what the function constructs itself.
  *
- * Returns the number of matching tuples found.  (Note: this might be only
- * approximate, so it should only be used for statistical purposes.)
+ *  	GPDB: Since GPDB also support StreamBitmap node in bitmap index.
+ *  	So normally we need to create specific bitmap node in the amgetbitmap AM.
+ *  	This makes the function different from upstream.
  * ----------------
  */
 int64
-index_getbitmap(IndexScanDesc scan, TIDBitmap *bitmap)
+index_getbitmap(IndexScanDesc scan, Node **bitmapP)
 {
 	int64		ntids;
 
@@ -662,7 +690,7 @@ index_getbitmap(IndexScanDesc scan, TIDBitmap *bitmap)
 	/*
 	 * have the am's getbitmap proc do all the work.
 	 */
-	ntids = scan->indexRelation->rd_indam->amgetbitmap(scan, bitmap);
+	ntids = scan->indexRelation->rd_indam->amgetbitmap(scan, bitmapP);
 
 	pgstat_count_index_tuples(scan->indexRelation, ntids);
 

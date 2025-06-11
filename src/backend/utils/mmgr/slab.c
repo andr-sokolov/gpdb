@@ -131,7 +131,7 @@ static void *SlabAlloc(MemoryContext context, Size size);
 static void SlabFree(MemoryContext context, void *pointer);
 static void *SlabRealloc(MemoryContext context, void *pointer, Size size);
 static void SlabReset(MemoryContext context);
-static void SlabDelete(MemoryContext context);
+static void SlabDelete(MemoryContext context, MemoryContext parent);
 static Size SlabGetChunkSpace(MemoryContext context, void *pointer);
 static bool SlabIsEmpty(MemoryContext context);
 static void SlabStats(MemoryContext context,
@@ -323,12 +323,14 @@ SlabReset(MemoryContext context)
 #endif
 			free(block);
 			slab->nblocks--;
+			context->mem_allocated -= slab->blockSize;
 		}
 	}
 
 	slab->minFreeChunks = 0;
 
 	Assert(slab->nblocks == 0);
+	Assert(context->mem_allocated == 0);
 }
 
 /*
@@ -336,7 +338,7 @@ SlabReset(MemoryContext context)
  *		Free all memory which is allocated in the given context.
  */
 static void
-SlabDelete(MemoryContext context)
+SlabDelete(MemoryContext context, MemoryContext parent)
 {
 	/* Reset to release all the SlabBlocks */
 	SlabReset(context);
@@ -406,6 +408,7 @@ SlabAlloc(MemoryContext context, Size size)
 
 		slab->minFreeChunks = slab->chunksPerBlock;
 		slab->nblocks += 1;
+		context->mem_allocated += slab->blockSize;
 	}
 
 	/* grab the block from the freelist (even the new block is there) */
@@ -498,6 +501,9 @@ SlabAlloc(MemoryContext context, Size size)
 #endif
 
 	SlabAllocInfo(slab, chunk);
+
+	Assert(slab->nblocks * slab->blockSize == context->mem_allocated);
+
 	return SlabChunkGetPointer(chunk);
 }
 
@@ -573,11 +579,13 @@ SlabFree(MemoryContext context, void *pointer)
 	{
 		free(block);
 		slab->nblocks--;
+		context->mem_allocated -= slab->blockSize;
 	}
 	else
 		dlist_push_head(&slab->freelist[block->nfree], &block->node);
 
 	Assert(slab->nblocks >= 0);
+	Assert(slab->nblocks * slab->blockSize == context->mem_allocated);
 }
 
 /*
@@ -796,6 +804,8 @@ SlabCheck(MemoryContext context)
 					 name, block->nfree, block, nfree);
 		}
 	}
+
+	Assert(slab->nblocks * slab->blockSize == context->mem_allocated);
 }
 
 #endif							/* MEMORY_CONTEXT_CHECKING */

@@ -3,6 +3,7 @@
  * fe-connect.c
  *	  functions related to setting up a connection to the backend
  *
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -13,7 +14,18 @@
  *-------------------------------------------------------------------------
  */
 
-#include "postgres_fe.h"
+/*
+ * This file is compiled with both frontend and backend codes, symlinked by
+ * src/backend/Makefile, and use macro FRONTEND to switch.
+ *
+ * Include "c.h" to adopt Greenplum C types. Don't include "postgres_fe.h",
+ * which only defines FRONTEND besides including "c.h"
+ */
+#include "c.h"
+
+#ifndef WIN32
+#include <poll.h>
+#endif
 
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -95,6 +107,27 @@ static int	ldapServiceLookup(const char *purl, PQconninfoOption *options,
 #define ERRCODE_INVALID_PASSWORD "28P01"
 /* This too */
 #define ERRCODE_CANNOT_CONNECT_NOW "57P03"
+/* And this GPDB-specific one, too */
+#define ERRCODE_MIRROR_READY "57M02"
+
+/*
+ * Cope with the various platform-specific ways to spell TCP keepalive socket
+ * options.  This doesn't cover Windows, which as usual does its own thing.
+ */
+#if defined(TCP_KEEPIDLE)
+/* TCP_KEEPIDLE is the name of this option on Linux and *BSD */
+#define PG_TCP_KEEPALIVE_IDLE TCP_KEEPIDLE
+#define PG_TCP_KEEPALIVE_IDLE_STR "TCP_KEEPIDLE"
+#elif defined(TCP_KEEPALIVE_THRESHOLD)
+/* TCP_KEEPALIVE_THRESHOLD is the name of this option on Solaris >= 11 */
+#define PG_TCP_KEEPALIVE_IDLE TCP_KEEPALIVE_THRESHOLD
+#define PG_TCP_KEEPALIVE_IDLE_STR "TCP_KEEPALIVE_THRESHOLD"
+#elif defined(TCP_KEEPALIVE) && defined(__darwin__)
+/* TCP_KEEPALIVE is the name of this option on macOS */
+/* Caution: Solaris has this symbol but it means something different */
+#define PG_TCP_KEEPALIVE_IDLE TCP_KEEPALIVE
+#define PG_TCP_KEEPALIVE_IDLE_STR "TCP_KEEPALIVE"
+#endif
 
 /*
  * Cope with the various platform-specific ways to spell TCP keepalive socket
@@ -218,6 +251,10 @@ static const internalPQconninfoOption PQconninfoOptions[] = {
 		"Database-Name", "", 20,
 	offsetof(struct pg_conn, dbName)},
 
+	/*
+	 * For GPDB internal usage, don't honour PGHOST, as this will always lead to
+	 * unexpected behaviour.
+	 */
 	{"host", "PGHOST", NULL, NULL,
 		"Database-Host", "", 40,
 	offsetof(struct pg_conn, pghost)},
@@ -334,6 +371,19 @@ static const internalPQconninfoOption PQconninfoOptions[] = {
 		"Target-Session-Attrs", "", 11, /* sizeof("read-write") = 11 */
 	offsetof(struct pg_conn, target_session_attrs)},
 
+    /* CDB: qExec wants some info from qDisp before GUCs are processed */
+	{"gpqeid", NULL, "", NULL,
+		"gp-debug-qeid", "D", 40,
+	offsetof(struct pg_conn, gpqeid)},
+
+	{GPCONN_TYPE, NULL, NULL, NULL,
+		"connection type", "D", 10,
+	offsetof(struct pg_conn, gpconntype)},
+
+	{"diff_options", NULL, NULL, NULL,
+		"updated synced GUCs", "D", 80,
+	offsetof(struct pg_conn, diffoptions)},
+
 	/* Terminating entry --- MUST BE LAST */
 	{NULL, NULL, NULL, NULL,
 	NULL, NULL, 0}
@@ -341,6 +391,12 @@ static const internalPQconninfoOption PQconninfoOptions[] = {
 
 static const PQEnvironmentOption EnvironmentOptions[] =
 {
+#ifdef FRONTEND
+	/*
+	 * For QD-QE connections, we should ignore these environment variables,
+	 * since env variable of QD should not effect the GUCs of QE, otherwise, the SET
+	 * command would not work in the newly created Gang then
+	 */
 	/* common user-interface settings */
 	{
 		"PGDATESTYLE", "datestyle"
@@ -352,6 +408,7 @@ static const PQEnvironmentOption EnvironmentOptions[] =
 	{
 		"PGGEQO", "geqo"
 	},
+#endif
 	{
 		NULL, NULL
 	}
@@ -1923,12 +1980,14 @@ connectDBStart(PGconn *conn)
 	 * Nobody but developers should see this message, so we don't bother
 	 * translating it.
 	 */
+#ifdef FRONTEND
 	if (!pg_link_canary_is_frontend())
 	{
 		printfPQExpBuffer(&conn->errorMessage,
 						  "libpq is incorrectly linked to backend functions\n");
 		goto connect_errReturn;
 	}
+#endif
 
 	/* Ensure our buffers are empty */
 	conn->inStart = conn->inCursor = conn->inEnd = 0;
@@ -2374,7 +2433,28 @@ keep_going:						/* We will come back to here until there is
 		 * must persist across individual connection attempts, but we must
 		 * reset them when we start to consider a new server.
 		 */
-		conn->pversion = PG_PROTOCOL(3, 0);
+		if (conn->gpconntype &&
+			(strcmp(conn->gpconntype, GPCONN_TYPE_FTS) == 0 ||
+			 strcmp(conn->gpconntype, GPCONN_TYPE_FAULT) == 0 ||
+			 strcmp(conn->gpconntype, GPCONN_TYPE_DEFAULT) == 0))
+		{
+			/*
+			 * GPDB uses the high bits of the major version to indicate special
+			 * internal communications
+			 */
+			conn->pversion = GPDB_INTERNAL_PROTOCOL(3, 0);
+
+			/* hide the default gpconntype option, let it only affect the pversion */
+			if (strcmp(conn->gpconntype, GPCONN_TYPE_DEFAULT) == 0)
+			{
+				free(conn->gpconntype);
+				conn->gpconntype = NULL;
+			}
+		}
+		else if (conn->pversion != GPDB_INTERNAL_PROTOCOL(3, 0)) // Don't reset this while reconnecting
+		{
+			conn->pversion = PG_PROTOCOL(3, 0);
+		}
 		conn->send_appname = true;
 #ifdef USE_SSL
 		/* initialize these values based on SSL mode */
@@ -3803,6 +3883,9 @@ internal_ping(PGconn *conn)
 	if (strlen(conn->last_sqlstate) != 5)
 		return PQPING_NO_RESPONSE;
 
+	if (strcmp(conn->last_sqlstate, ERRCODE_MIRROR_READY) == 0)
+		return PQPING_MIRROR_READY;
+
 	/*
 	 * Report PQPING_REJECT if server says it's not accepting connections. (We
 	 * distinguish this case mainly for the convenience of pg_ctl.)
@@ -3924,6 +4007,16 @@ freePGconn(PGconn *conn)
 {
 	int			i;
 
+	if (!conn)
+		return;
+
+	pqClearAsyncResult(conn);	/* deallocate result and curTuple */
+	if (conn->sock >= 0)
+	{
+		//pqsecure_close(conn);
+		closesocket(conn->sock);
+	}
+
 	/* let any event procs clean up their state data */
 	for (i = 0; i < conn->nEvents; i++)
 	{
@@ -4012,6 +4105,8 @@ freePGconn(PGconn *conn)
 		free(conn->krbsrvname);
 	if (conn->gsslib)
 		free(conn->gsslib);
+	if (conn->gpqeid)			/* CDB */
+		free(conn->gpqeid);
 	if (conn->connip)
 		free(conn->connip);
 	/* Note that conn->Pfdebug is not ours to close or free */
@@ -4021,7 +4116,7 @@ freePGconn(PGconn *conn)
 		free(conn->write_err_msg);
 	if (conn->inBuffer)
 		free(conn->inBuffer);
-	if (conn->outBuffer)
+	if (conn->outBuffer && !conn->outBuffer_shared)
 		free(conn->outBuffer);
 	if (conn->rowBuf)
 		free(conn->rowBuf);
@@ -4056,6 +4151,8 @@ static void
 sendTerminateConn(PGconn *conn)
 {
 	/*
+	 * If possible, send Terminate message to close the connection politely.
+	 *
 	 * Note that the protocol doesn't allow us to send Terminate messages
 	 * during the startup phase.
 	 */
@@ -4288,7 +4385,7 @@ PQfreeCancel(PGcancel *cancel)
  */
 static int
 internal_cancel(SockAddr *raddr, int be_pid, int be_key,
-				char *errbuf, int errbufsize)
+				char *errbuf, int errbufsize, bool requestFinish)
 {
 	int			save_errno = SOCK_ERRNO;
 	pgsocket	tmpsock = PGINVALID_SOCKET;
@@ -4299,6 +4396,12 @@ internal_cancel(SockAddr *raddr, int be_pid, int be_key,
 		CancelRequestPacket cp;
 	}			crp;
 
+#ifndef WIN32
+	struct pollfd	pollFds[1];
+	int				pollRet;
+
+retry2:
+#endif
 	/*
 	 * We need to open a temporary connection to the postmaster. Do this with
 	 * only kernel calls.
@@ -4326,7 +4429,10 @@ retry3:
 	/* Create and send the cancel request packet. */
 
 	crp.packetlen = pg_hton32((uint32) sizeof(crp));
-	crp.cp.cancelRequestCode = (MsgType) pg_hton32(CANCEL_REQUEST_CODE);
+	if (requestFinish)
+		crp.cp.cancelRequestCode = (MsgType) pg_hton32(FINISH_REQUEST_CODE);
+	else
+		crp.cp.cancelRequestCode = (MsgType) pg_hton32(CANCEL_REQUEST_CODE);
 	crp.cp.backendPID = pg_hton32(be_pid);
 	crp.cp.cancelAuthCode = pg_hton32(be_key);
 
@@ -4347,12 +4453,44 @@ retry4:
 	 * one we thought we were canceling.  Note we don't actually expect this
 	 * read to obtain any data, we are just waiting for EOF to be signaled.
 	 */
+#ifndef WIN32
 retry5:
+	pollFds[0].fd = tmpsock;
+	pollFds[0].events = POLLIN;
+	pollFds[0].revents = 0;
+
+	/*
+	 * Wait for at most 660 seconds, which is the sum of max values of
+	 * authentication_timeout and pre_auth_delay. Most likely, it's long enough
+	 * to make sure the process forked by the postmaster on segment is finished.
+	 */
+	pollRet = poll(pollFds, 1, 660 * 1000);
+	if (pollRet == 0)
+	{
+		/* timeout */
+		close(tmpsock);
+		tmpsock = -1;
+		goto retry2;
+	}
+	else if (pollRet < 0)
+	{
+		int olderrno = errno;
+		if (olderrno == EAGAIN || olderrno == EINTR)
+			goto retry5;
+
+		/* error */
+		close(tmpsock);
+		tmpsock = -1;
+		goto retry2;
+	}
+#endif
+
+retry6:
 	if (recv(tmpsock, (char *) &crp, 1, 0) < 0)
 	{
 		if (SOCK_ERRNO == EINTR)
 			/* Interrupted system call - we'll just try again */
-			goto retry5;
+			goto retry6;
 		/* we ignore other error conditions */
 	}
 
@@ -4416,7 +4554,26 @@ PQcancel(PGcancel *cancel, char *errbuf, int errbufsize)
 	}
 
 	return internal_cancel(&cancel->raddr, cancel->be_pid, cancel->be_key,
-						   errbuf, errbufsize);
+						   errbuf, errbufsize, false);
+}
+
+/*
+ * PQrequestFinish: request query finish
+ *
+ * Same as PQcancel, except it sends a finish request.
+ */
+int
+PQrequestFinish(PGcancel *cancel, char *errbuf, int errbufsize)
+{
+	if (!cancel)
+	{
+		strlcpy(errbuf, "PQrequestFinish() -- no cancel object supplied",
+				errbufsize);
+		return false;
+	}
+
+	return internal_cancel(&cancel->raddr, cancel->be_pid, cancel->be_key,
+						   errbuf, errbufsize, true);
 }
 
 /*
@@ -4451,7 +4608,8 @@ PQrequestCancel(PGconn *conn)
 	}
 
 	r = internal_cancel(&conn->raddr, conn->be_pid, conn->be_key,
-						conn->errorMessage.data, conn->errorMessage.maxlen);
+						conn->errorMessage.data, conn->errorMessage.maxlen,
+						false);
 
 	if (!r)
 		conn->errorMessage.len = strlen(conn->errorMessage.data);

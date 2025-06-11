@@ -36,6 +36,7 @@
 #include "commands/trigger.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
+#include "nodes/execnodes.h"
 #include "nodes/bitmapset.h"
 #include "nodes/makefuncs.h"
 #include "optimizer/optimizer.h"
@@ -62,6 +63,9 @@
 #include "utils/syscache.h"
 #include "utils/tuplestore.h"
 
+#include "catalog/oid_dispatch.h"
+#include "cdb/cdbvars.h"
+#include "cdb/cdbdisp_query.h"
 
 /* GUC variables */
 int			SessionReplicationRole = SESSION_REPLICATION_ROLE_ORIGIN;
@@ -187,7 +191,6 @@ CreateTriggerFiringOn(CreateTrigStmt *stmt, const char *queryString,
 	ScanKeyData key;
 	Relation	pgrel;
 	HeapTuple	tuple;
-	Oid			fargtypes[1];	/* dummy */
 	Oid			funcrettype;
 	Oid			trigoid;
 	char		internaltrigname[NAMEDATALEN];
@@ -268,6 +271,15 @@ CreateTriggerFiringOn(CreateTrigStmt *stmt, const char *queryString,
 	}
 	else if (rel->rd_rel->relkind == RELKIND_VIEW)
 	{
+		/*
+		 * Greenplum cannot support INSTEAD OF triggers, see merge fixme in
+		 * CheckValidResultRel().
+		 */
+		if (stmt->timing == TRIGGER_TYPE_INSTEAD)
+			ereport(ERROR,
+					(errcode(ERRCODE_GP_FEATURE_NOT_YET),
+					 errmsg("INSTEAD OF triggers are not supported in Greenplum")));
+
 		/*
 		 * Views can have INSTEAD OF triggers (which we check below are
 		 * row-level), or statement-level BEFORE/AFTER triggers.
@@ -698,7 +710,7 @@ CreateTriggerFiringOn(CreateTrigStmt *stmt, const char *queryString,
 	 * Find and validate the trigger function.
 	 */
 	if (!OidIsValid(funcoid))
-		funcoid = LookupFuncName(stmt->funcname, 0, fargtypes, false);
+		funcoid = LookupFuncName(stmt->funcname, 0, NULL, false);
 	if (!isInternal)
 	{
 		aclresult = pg_proc_aclcheck(funcoid, GetUserId(), ACL_EXECUTE);
@@ -715,6 +727,7 @@ CreateTriggerFiringOn(CreateTrigStmt *stmt, const char *queryString,
 		 */
 		if (funcrettype == OPAQUEOID)
 		{
+			if (Gp_role != GP_ROLE_EXECUTE)
 			ereport(WARNING,
 					(errmsg("changing return type of function %s from %s to %s",
 							NameListToString(stmt->funcname),
@@ -726,6 +739,21 @@ CreateTriggerFiringOn(CreateTrigStmt *stmt, const char *queryString,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 					 errmsg("function %s must return type %s",
 							NameListToString(stmt->funcname), "trigger")));
+	}
+
+	/* Check GPDB limitations */
+	if (RelationIsAppendOptimized(rel) &&
+		TRIGGER_FOR_ROW(tgtype) &&
+		!stmt->isconstraint)
+	{
+		if (TRIGGER_FOR_UPDATE(tgtype))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("ON UPDATE triggers are not supported on append-only tables")));
+		if (TRIGGER_FOR_DELETE(tgtype))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("ON DELETE triggers are not supported on append-only tables")));
 	}
 
 	/*
@@ -793,8 +821,24 @@ CreateTriggerFiringOn(CreateTrigStmt *stmt, const char *queryString,
 	 */
 	tgrel = table_open(TriggerRelationId, RowExclusiveLock);
 
-	trigoid = GetNewOidWithIndex(tgrel, TriggerOidIndexId,
-								 Anum_pg_trigger_oid);
+	/*
+	 * For RI constraint triggers, the trigger's name is derived from the
+	 * trigger OID. That creates a chicken-and-egg problem with the usual
+	 * GPDB OID dispatching mechanism. In a QE, we cannot look up the
+	 * trigger OID to use by trigger name, because the trigger name is
+	 * derived from the OID. To work around that, we use more fields as
+	 * the key. For a user-defined trigger, tgrelid and the trigger name
+	 * should be enough. For internal triggers, we use the name prefix
+	 * together with constraint OID and function OID. That should be
+	 * unique: there should be no need to have more than one internal trigger
+	 * with same function for one constraint.
+	 */
+	trigoid = GetNewOidForTrigger(tgrel, TriggerOidIndexId,
+								  Anum_pg_trigger_oid,
+								  RelationGetRelid(rel),
+								  stmt->trigname,
+								  constraintOid,
+								  funcoid);
 
 	/*
 	 * If trigger is internally generated, modify the provided trigger name to
@@ -860,7 +904,29 @@ CreateTriggerFiringOn(CreateTrigStmt *stmt, const char *queryString,
 															 CStringGetDatum(trigname));
 	values[Anum_pg_trigger_tgfoid - 1] = ObjectIdGetDatum(funcoid);
 	values[Anum_pg_trigger_tgtype - 1] = Int16GetDatum(tgtype);
-	values[Anum_pg_trigger_tgenabled - 1] = trigger_fires_when;
+	
+	/*
+	 * Special for Greenplum Database: Ignore foreign keys for now. Create
+	 * the triggers to back them as 'disabled'.
+	 */
+	char		tgenabled = trigger_fires_when;
+	if (isInternal)
+	{
+		if (RI_FKey_trigger_type(funcoid))
+		{
+			tgenabled = TRIGGER_DISABLED;
+		}
+		else if (funcoid == F_UNIQUE_KEY_RECHECK)
+		{
+			/*
+			 * unique_key_recheck is used for deferrable unique constraints.
+			 * We do enforce unique constraints.
+			 */
+		}
+		else
+			elog(WARNING, "unrecognized internal trigger function %u", funcoid);
+	}
+	values[Anum_pg_trigger_tgenabled - 1] = CharGetDatum(tgenabled);
 	values[Anum_pg_trigger_tgisinternal - 1] = BoolGetDatum(isInternal || in_partition);
 	values[Anum_pg_trigger_tgconstrrelid - 1] = ObjectIdGetDatum(constrrelid);
 	values[Anum_pg_trigger_tgconstrindid - 1] = ObjectIdGetDatum(indexOid);
@@ -2500,6 +2566,12 @@ ExecBSInsertTriggers(EState *estate, ResultRelInfo *relinfo)
 	int			i;
 	TriggerData LocTriggerData;
 
+	if (Gp_role == GP_ROLE_EXECUTE)
+	{
+		/* Don't fire statement-triggers in executor nodes. */
+		return;
+	}
+
 	trigdesc = relinfo->ri_TrigDesc;
 
 	if (trigdesc == NULL)
@@ -2637,10 +2709,15 @@ ExecARInsertTriggers(EState *estate, ResultRelInfo *relinfo,
 
 	if ((trigdesc && trigdesc->trig_insert_after_row) ||
 		(transition_capture && transition_capture->tcs_insert_new_table))
+	{
+		if(RelationIsAoCols(relinfo->ri_RelationDesc))
+			elog(ERROR, "Trigger is not supported on AOCS yet");
+
 		AfterTriggerSaveEvent(estate, relinfo, TRIGGER_EVENT_INSERT,
 							  true, NULL, slot,
 							  recheckIndexes, NULL,
 							  transition_capture);
+	}
 }
 
 bool
@@ -2716,6 +2793,12 @@ ExecBSDeleteTriggers(EState *estate, ResultRelInfo *relinfo)
 	TriggerDesc *trigdesc;
 	int			i;
 	TriggerData LocTriggerData;
+
+	if (Gp_role == GP_ROLE_EXECUTE)
+	{
+		/* Don't fire statement-triggers in executor nodes. */
+		return;
+	}
 
 	trigdesc = relinfo->ri_TrigDesc;
 
@@ -2966,6 +3049,12 @@ ExecBSUpdateTriggers(EState *estate, ResultRelInfo *relinfo)
 	int			i;
 	TriggerData LocTriggerData;
 	Bitmapset  *updatedCols;
+
+	if (Gp_role == GP_ROLE_EXECUTE)
+	{
+		/* Don't fire statement-triggers in executor nodes. */
+		return;
+	}
 
 	trigdesc = relinfo->ri_TrigDesc;
 
@@ -3286,6 +3375,12 @@ ExecBSTruncateTriggers(EState *estate, ResultRelInfo *relinfo)
 	int			i;
 	TriggerData LocTriggerData;
 
+	if (Gp_role == GP_ROLE_EXECUTE)
+	{
+		/* Don't fire statement-triggers in executor nodes. */
+		return;
+	}
+
 	trigdesc = relinfo->ri_TrigDesc;
 
 	if (trigdesc == NULL)
@@ -3356,6 +3451,12 @@ GetTupleForTrigger(EState *estate,
 				   TupleTableSlot **epqslot)
 {
 	Relation	relation = relinfo->ri_RelationDesc;
+
+	/* these should be rejected when you try to create such triggers, but let's check */
+	if (RelationIsAppendOptimized(relation))
+		elog(ERROR, "UPDATE and DELETE triggers are not supported on append-only tables");
+
+	Assert(RelationIsHeap(relation));
 
 	if (epqslot != NULL)
 	{
@@ -4503,7 +4604,9 @@ afterTriggerMarkEvents(AfterTriggerEventList *events,
  * afterTriggerInvokeEvents()
  *
  *	Scan the given event list for events that are marked as to be fired
- *	in the current firing cycle, and fire them.
+ *	in the current firing cycle, and fire them.  query_depth is the index in
+ *	afterTriggers->query_stack, or -1 to examine afterTriggers->events.
+ *	(We have to be careful here because query_stack could move under us.)
  *
  *	If estate isn't NULL, we use its result relation info to avoid repeated
  *	openings and closing of trigger target relations.  If it is NULL, we
@@ -5709,6 +5812,18 @@ AfterTriggerSetState(ConstraintsSetStmt *stmt)
 		if (snapshot_set)
 			PopActiveSnapshot();
 	}
+	else
+	{
+		/* no snapshot needed */
+	}
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_NEED_TWO_PHASE,
+									NIL,
+									NULL);
+	}
 }
 
 /* ----------
@@ -5820,6 +5935,10 @@ AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 	 */
 	if (afterTriggers.query_depth < 0)
 		elog(ERROR, "AfterTriggerSaveEvent() called outside of query");
+
+	/* Don't fire statement-triggers in executor nodes. */
+	if (!row_trigger && Gp_role == GP_ROLE_EXECUTE)
+		return;
 
 	/* Be sure we have enough space to record events at this query depth. */
 	if (afterTriggers.query_depth >= afterTriggers.maxquerydepth)

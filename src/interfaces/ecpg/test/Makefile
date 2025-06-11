@@ -16,7 +16,7 @@ override CPPFLAGS := \
 	$(CPPFLAGS)
 
 # default encoding for regression tests
-ENCODING = SQL_ASCII
+# ENCODING = SQL_ASCII
 
 ifneq ($(build_os),mingw32)
 abs_builddir := $(shell pwd)
@@ -43,10 +43,26 @@ clean distclean maintainer-clean:
 	$(MAKE) -C thread $@
 	rm -rf tmp_check results log
 	rm -f pg_regress regression.diffs regression.out pg_regress_ecpg.o $(WIN32RES)
+	rm -f gpstringsubs.pl gpdiff.pl atmsort.pm explain.pm
 
 # Build regression test driver
 
-all: pg_regress$(X)
+all: pg_regress$(X) gpdiff.pl gpstringsubs.pl
+
+gpstringsubs.pl:
+	rm -f $@ && $(LN_S) $(top_builddir)/src/test/regress/gpstringsubs.pl
+
+gpdiff.pl: atmsort.pm explain.pm GPTest.pm
+	rm -f $@ && $(LN_S) $(top_builddir)/src/test/regress/gpdiff.pl
+
+GPTest.pm:
+	rm -f $@ && $(LN_S) $(top_builddir)/src/test/regress/GPTest.pm
+
+atmsort.pm:
+	rm -f $@ && $(LN_S) $(top_builddir)/src/test/regress/atmsort.pm
+
+explain.pm:
+	rm -f $@ && $(LN_S) $(top_builddir)/src/test/regress/explain.pm
 
 pg_regress$(X): pg_regress_ecpg.o $(WIN32RES) $(top_builddir)/src/test/regress/pg_regress.o
 	$(CC) $(CFLAGS) $^ $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@

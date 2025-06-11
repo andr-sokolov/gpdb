@@ -1,5 +1,12 @@
 -- Generic extended statistics support
 
+
+-- By default, Greenplum computes selectivity slightly differently from
+-- upstream. Disable selectivity damping for these tests, so that we get
+-- roughly the same estimates as in upstream.
+set gp_selectivity_damping_for_scans = off;
+set gp_selectivity_damping_for_joins = off;
+
 -- We will be checking execution plans without/with statistics, so
 -- let's make sure we get simple non-parallel plans. Also set the
 -- work_mem low so that we can use small amounts of data.
@@ -186,6 +193,8 @@ SELECT * FROM check_estimated_rows('SELECT COUNT(*) FROM ndistinct GROUP BY b, c
 
 SELECT * FROM check_estimated_rows('SELECT COUNT(*) FROM ndistinct GROUP BY a, b, c');
 
+-- GPDB: the next two fall back to the default ndistinct estimate, which is 200 in
+-- PostgreSQL and 1000 in Greenplum.
 SELECT * FROM check_estimated_rows('SELECT COUNT(*) FROM ndistinct GROUP BY a, b, c, d');
 
 SELECT * FROM check_estimated_rows('SELECT COUNT(*) FROM ndistinct GROUP BY b, c, d');
@@ -212,6 +221,7 @@ SELECT * FROM check_estimated_rows('SELECT COUNT(*) FROM ndistinct GROUP BY a, b
 
 -- last two plans keep using Group Aggregate, because 'd' is not covered
 -- by the statistic and while it's NULL-only we assume 200 values for it
+-- (In Greenplum the default estimate is 1000, not 200)
 SELECT * FROM check_estimated_rows('SELECT COUNT(*) FROM ndistinct GROUP BY a, b, c, d');
 
 SELECT * FROM check_estimated_rows('SELECT COUNT(*) FROM ndistinct GROUP BY b, c, d');
@@ -595,3 +605,101 @@ DROP FUNCTION op_leak(int, int);
 RESET SESSION AUTHORIZATION;
 DROP SCHEMA tststats CASCADE;
 DROP USER regress_stats_user1;
+
+    -- Test pg_ndistinct_in
+drop table if exists tbl_distinct;
+create table tbl_distinct(i int, ii pg_ndistinct);
+insert into tbl_distinct values (1, '{"1, 2": 1}');
+insert into tbl_distinct values (2, '{"1, 2": 2, "1, 3": 3, "2, 3": 2, "1, 2, 3": 3}');
+insert into tbl_distinct values (3, '{"123, 234": 11}');
+select * from tbl_distinct;
+
+-- leading space
+insert into tbl_distinct values (1, ' {"1, 2": 1}');
+-- trailing space
+insert into tbl_distinct values (1, '{"1, 2": 1} ');
+-- unmatched quote
+insert into tbl_distinct values (1, '{"1", 2": 1} ');
+-- space in attribute list
+insert into tbl_distinct values (1, '{"1 3, 2": 1} ');
+-- colon in attribute list
+insert into tbl_distinct values (1, '{"1: 2": 1}');
+insert into tbl_distinct values (1, '{"1, 2:" 1}');
+insert into tbl_distinct values (1, '{":1 2": 1}');
+-- zero/single item attribute list
+insert into tbl_distinct values (1, '{"1": 1}');
+insert into tbl_distinct values (1, '{: 1}');
+insert into tbl_distinct values (1, '{"": 1}');
+insert into tbl_distinct values (1, '{" ": 1}');
+insert into tbl_distinct values (1, '{}');
+insert into tbl_distinct values (1, '{:}');
+-- illegal character
+insert into tbl_distinct values (1, '{"1,| 2": 1}');
+
+-- multiple consecutive characters
+insert into tbl_distinct values (1, '{"1,, 2": 1}');
+insert into tbl_distinct values (1, '{"1": 1}');
+
+-- Need to add check on catalog table insert that atribute numbers are legal
+-- (e.g. there shouldn't be attribute number 100 for a table with only 2
+-- columns also it should match)
+
+select * from tbl_distinct;
+
+
+    -- Test pg_dependencies_in
+drop table if exists tbl_dependencies;
+create table tbl_dependencies(i int, ii pg_dependencies);
+insert into tbl_dependencies values (1, '{"1 => 2": 1.000000}');
+insert into tbl_dependencies values (2, '{"1 => 2": 2.000000, "1 => 3": 3.000000, "2 => 3": 2.000000, "1, 2 => 3": 3.000000}');
+
+select * from tbl_dependencies;
+
+-- leading space
+insert into tbl_dependencies values (1, ' {"1 => 2": 1.000000}');
+-- trailing space
+insert into tbl_dependencies values (1, '{"1 => 2": 1.000000} ');
+-- unmatched quote
+insert into tbl_dependencies values (1, '{"1" => 2": 1.000000} ');
+-- Wrong format
+insert into tbl_dependencies values (1, '{"1, 2": 1.000000}');
+insert into tbl_dependencies values (1, '{"1 => 2": 1}');
+insert into tbl_dependencies values (1, '{"1 => 2": 1.000000, " 2 => 1": 2}');
+-- space in attribute list
+insert into tbl_dependencies values (1, '{"1 3 => 2": 1.000000} ');
+-- colon in attribute list
+insert into tbl_dependencies values (1, '{"1: 2": 1.000000}');
+insert into tbl_dependencies values (1, '{"1 => 2:" 1.000000}');
+insert into tbl_dependencies values (1, '{":1 2": 1.000000}');
+insert into tbl_dependencies values (1, '{"1, 2" 1.000000}');
+-- zero/single item attribute list
+insert into tbl_dependencies values (1, '{"1": 1.000000}');
+insert into tbl_dependencies values (1, '{: 1.000000}');
+insert into tbl_dependencies values (1, '{"": 1.000000}');
+insert into tbl_dependencies values (1, '{" ": 1.000000}');
+insert into tbl_dependencies values (1, '{}');
+insert into tbl_dependencies values (1, '{:}');
+
+-- multiple consecutive characters
+insert into tbl_dependencies values (1, '{"1 =>=> 2": 1.000000}');
+insert into tbl_dependencies values (1, '{"1": 1.000000}');
+
+select * from tbl_dependencies;
+
+
+-- Test a table with columns of type pg_ndistinct and pg_dependencies
+drop table if exists tbl_dist_dep;
+create table tbl_dist_dep(i pg_ndistinct, ii pg_dependencies);
+insert into tbl_dist_dep values ('{"1, 2" : 1}', '{"1 => 2": 1.000000}');
+insert into tbl_dist_dep values ('{"1, 2" : 3, "1, 3" : 3, "2, 3" : 2, "1, 2, 3" : 3}', '{"1 => 2": 2.000000, "1 => 3": 3.000000, "2 => 3": 2.000000, "1, 2 => 3": 3.000000}');
+-- unmatched quote
+insert into tbl_dist_dep values ('{1, 2 : 1}', '{"1 => 2": 1.000000}');
+insert into tbl_dist_dep values ('{"1, 2" : 1}', '{1 => 2: 1.000000}');
+insert into tbl_dist_dep values ('{1, 2 : 1}', '{1 => 2: 1.000000}');
+-- Invalid type
+insert into tbl_dist_dep values ('{"1, 2" : 1}', '{"1 => 2": 1}');
+insert into tbl_dist_dep values ('{"1, 2" : 1.000000}', '{"1 => 2": 1.000000}');
+insert into tbl_dist_dep values ('{"1, 2" : 1}', '{"1.000000 => 2.000000": 1.000000}');
+insert into tbl_dist_dep values ('{"1, 2.000000" : 1}', '{"1 => 2": 1.000000}');
+
+select * from tbl_dist_dep;

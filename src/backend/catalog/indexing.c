@@ -25,6 +25,7 @@
 #include "executor/executor.h"
 #include "utils/rel.h"
 
+#include "catalog/gp_fastsequence.h"
 
 /*
  * CatalogOpenIndexes - open the indexes on a system catalog.
@@ -326,4 +327,22 @@ void
 CatalogTupleDelete(Relation heapRel, ItemPointer tid)
 {
 	simple_heap_delete(heapRel, tid);
+}
+
+/*
+ * Greenplum: this interface is used to insert tuples into gp_fastsequence
+ * and aoseg relations during an appendoptimized (row as well as column)
+ * insert transaction.
+ */
+void
+CatalogTupleInsertFrozen(Relation heapRel, HeapTuple tup)
+{
+	CatalogIndexState indstate;
+
+	indstate = CatalogOpenIndexes(heapRel);
+
+	frozen_heap_insert(heapRel, tup);
+
+	CatalogIndexInsert(indstate, tup);
+	CatalogCloseIndexes(indstate);
 }

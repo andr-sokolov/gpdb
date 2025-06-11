@@ -4,6 +4,8 @@
  *	  POSTGRES lock manager definitions.
  *
  *
+ * Portions Copyright (c) 2006-2008, Greenplum inc
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -43,6 +45,8 @@ extern void UnlockRelationId(LockRelId *relid, LOCKMODE lockmode);
 extern void UnlockRelationOid(Oid relid, LOCKMODE lockmode);
 
 extern void LockRelation(Relation relation, LOCKMODE lockmode);
+extern LockAcquireResult LockRelationNoWait(Relation relation, LOCKMODE lockmode);
+
 extern bool ConditionalLockRelation(Relation relation, LOCKMODE lockmode);
 extern void UnlockRelation(Relation relation, LOCKMODE lockmode);
 extern bool CheckRelationLockedByMe(Relation relation, LOCKMODE lockmode,
@@ -61,6 +65,7 @@ extern int	RelationExtensionLockWaiterCount(Relation relation);
 
 /* Lock to recompute pg_database.datfrozenxid in the current database */
 extern void LockDatabaseFrozenIds(LOCKMODE lockmode);
+extern void UnLockDatabaseFrozenIds(LOCKMODE lockmode);
 
 /* Lock a page (currently only used within indexes) */
 extern void LockPage(Relation relation, BlockNumber blkno, LOCKMODE lockmode);
@@ -111,4 +116,9 @@ extern void DescribeLockTag(StringInfo buf, const LOCKTAG *tag);
 
 extern const char *GetLockNameFromTagType(uint16 locktag_type);
 
+/* Knowledge about which locktags describe temp objects */
+extern bool LockTagIsTemp(const LOCKTAG *tag);
+
+extern void GxactLockTableInsert(DistributedTransactionId xid);
+extern void GxactLockTableWait(DistributedTransactionId xid);
 #endif							/* LMGR_H */

@@ -23,4 +23,7 @@ SUBDIRS = \
 		  unsafe_tests \
 		  worker_spi
 
+# GPDB subdirs
+SUBDIRS += test_planner
+
 $(recurse)

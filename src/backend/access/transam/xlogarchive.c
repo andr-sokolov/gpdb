@@ -30,6 +30,12 @@
 #include "storage/pmsignal.h"
 
 /*
+ * GPDB specific imports:
+ */
+#include "cdb/cdbvars.h"
+#include "utils/builtins.h"
+
+/*
  * Attempt to retrieve the specified file from off-line archival storage.
  * If successful, fill "path" with its complete path (note that this will be
  * a temp file name that doesn't follow the normal naming convention), and
@@ -63,6 +69,9 @@ RestoreArchivedFile(char *path, const char *xlogfname,
 	XLogSegNo	restartSegNo;
 	XLogRecPtr	restartRedoPtr;
 	TimeLineID	restartTli;
+
+	/* GPDB: contentId of segment */
+	char        contentid[12];  /* sign, 10 digits and '\0' */
 
 	/*
 	 * Ignore restore_command when not in archive recovery (meaning
@@ -179,6 +188,14 @@ RestoreArchivedFile(char *path, const char *xlogfname,
 					/* %r: filename of last restartpoint */
 					sp++;
 					StrNCpy(dp, lastRestartPointFname, endp - dp);
+					dp += strlen(dp);
+					break;
+				case 'c':
+					/* GPDB: %c: contentId of segment */
+					Assert(GpIdentity.segindex != UNINITIALIZED_GP_IDENTITY_VALUE);
+					sp++;
+					pg_ltoa(GpIdentity.segindex, contentid);
+					StrNCpy(dp, contentid, endp - dp);
 					dp += strlen(dp);
 					break;
 				case '%':
@@ -336,6 +353,7 @@ ExecuteRecoveryCommand(const char *command, const char *commandName, bool failOn
 	char	   *endp;
 	const char *sp;
 	int			rc;
+	char		contentid[12];	/* sign, 10 digits and '\0' */
 	XLogSegNo	restartSegNo;
 	XLogRecPtr	restartRedoPtr;
 	TimeLineID	restartTli;
@@ -369,6 +387,14 @@ ExecuteRecoveryCommand(const char *command, const char *commandName, bool failOn
 					/* %r: filename of last restartpoint */
 					sp++;
 					StrNCpy(dp, lastRestartPointFname, endp - dp);
+					dp += strlen(dp);
+					break;
+				case 'c':
+					/* GPDB: %c: contentId of segment */
+					Assert(GpIdentity.segindex != UNINITIALIZED_GP_IDENTITY_VALUE);
+					sp++;
+					pg_ltoa(GpIdentity.segindex, contentid);
+					StrNCpy(dp, contentid, endp - dp);
 					dp += strlen(dp);
 					break;
 				case '%':

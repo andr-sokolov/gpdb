@@ -28,7 +28,6 @@
 #include "fe_utils/simple_list.h"
 #include "fe_utils/string_utils.h"
 
-
 #define ERRCODE_UNDEFINED_TABLE  "42P01"
 
 /* Parallel vacuuming stuff */
@@ -647,6 +646,7 @@ vacuum_one_database(const ConnParams *cparams,
 
 			init_slot(slots + i, conn);
 		}
+
 	}
 
 	/*
@@ -1243,5 +1243,5 @@ help(const char *progname)
 	printf(_("  -W, --password            force password prompt\n"));
 	printf(_("  --maintenance-db=DBNAME   alternate maintenance database\n"));
 	printf(_("\nRead the description of the SQL command VACUUM for details.\n"));
-	printf(_("\nReport bugs to <pgsql-bugs@lists.postgresql.org>.\n"));
+	printf(_("\nReport bugs to <bugs@greenplum.org>.\n"));
 }

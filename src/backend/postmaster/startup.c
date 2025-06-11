@@ -34,6 +34,7 @@
 #include "utils/guc.h"
 #include "utils/timeout.h"
 
+bool am_startup = false;
 
 /*
  * Flags set by interrupt handlers for later service in the redo loop.
@@ -167,6 +168,18 @@ HandleStartupProcInterrupts(void)
 		exit(1);
 }
 
+static void
+HandleCrash(SIGNAL_ARGS)
+{
+    /**
+     * Handle crash is registered as a signal handler for SIGILL/SIGBUS/SIGSEGV
+     *
+     * This simply calls the standard handler which will log the signal and reraise the
+     *      signal if needed
+     */
+    StandardHandlerForSigillSigsegvSigbus_OnMainThread("a startup process", PASS_SIGNAL_ARGS);
+}
+
 
 /* --------------------------------
  *		signal handler routines
@@ -188,6 +201,8 @@ StartupProcExit(int code, Datum arg)
 void
 StartupProcessMain(void)
 {
+	am_startup = true;
+
 	/* Arrange to clean up at startup process exit */
 	on_shmem_exit(StartupProcExit, 0);
 
@@ -202,6 +217,16 @@ StartupProcessMain(void)
 	pqsignal(SIGPIPE, SIG_IGN);
 	pqsignal(SIGUSR1, StartupProcSigUsr1Handler);
 	pqsignal(SIGUSR2, StartupProcTriggerHandler);
+
+#ifdef SIGBUS
+	pqsignal(SIGBUS, HandleCrash);
+#endif
+#ifdef SIGILL
+    pqsignal(SIGILL, HandleCrash);
+#endif
+#ifdef SIGSEGV
+	pqsignal(SIGSEGV, HandleCrash);
+#endif
 
 	/*
 	 * Reset some signals that are accepted by postmaster but not here

@@ -15,6 +15,7 @@
 #define GIST_PRIVATE_H
 
 #include "access/amapi.h"
+#include "access/genam.h"
 #include "access/gist.h"
 #include "access/itup.h"
 #include "fmgr.h"
@@ -22,7 +23,6 @@
 #include "storage/bufmgr.h"
 #include "storage/buffile.h"
 #include "utils/hsearch.h"
-#include "access/genam.h"
 
 /*
  * Maximum number of "halves" a page can be split into in one operation.
@@ -450,7 +450,7 @@ extern XLogRecPtr gistXLogSplit(bool page_is_leaf,
 
 /* gistget.c */
 extern bool gistgettuple(IndexScanDesc scan, ScanDirection dir);
-extern int64 gistgetbitmap(IndexScanDesc scan, TIDBitmap *tbm);
+extern int64 gistgetbitmap(IndexScanDesc scan, Node **bmNodeP);
 extern bool gistcanreturn(Relation index, int attno);
 
 /* gistvalidate.c */

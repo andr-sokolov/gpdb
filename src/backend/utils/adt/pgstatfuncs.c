@@ -15,6 +15,8 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "storage/lock.h"
+#include "commands/resgroupcmds.h"
 #include "access/xlog.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_type.h"
@@ -28,7 +30,11 @@
 #include "storage/procarray.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
+#include "utils/guc.h"
 #include "utils/inet.h"
+#include "utils/lsyscache.h"
+#include "utils/syscache.h"
 #include "utils/timestamp.h"
 
 #define UINT32_ACCESS_ONCE(var)		 ((uint32)(*((volatile uint32 *)&(var))))
@@ -548,7 +554,7 @@ pg_stat_get_progress_info(PG_FUNCTION_ARGS)
 Datum
 pg_stat_get_activity(PG_FUNCTION_ARGS)
 {
-#define PG_STAT_GET_ACTIVITY_COLS	29
+#define PG_STAT_GET_ACTIVITY_COLS	32
 	int			num_backends = pgstat_fetch_stat_numbackends();
 	int			curr_backend;
 	int			pid = PG_ARGISNULL(0) ? -1 : PG_GETARG_INT32(0);
@@ -694,8 +700,22 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 
 				raw_wait_event = UINT32_ACCESS_ONCE(proc->wait_event_info);
 				wait_event_type = pgstat_get_wait_event_type(raw_wait_event);
-				wait_event = pgstat_get_wait_event(raw_wait_event);
 
+				/*
+				 * We don't pass details for resource groups via event id,
+				 * since it's an uint16 and resource group id is an Oid.
+				 *
+				 * Get it from the backend entry, waitOnGroup() had set the
+				 * information in it.
+				 */
+				if (wait_event_type && (pg_strcasecmp(wait_event_type, "ResourceGroup") == 0))
+				{
+					wait_event = GetResGroupNameForId(beentry->st_rsgid);
+				}
+				else
+				{
+					wait_event = pgstat_get_wait_event(raw_wait_event);
+				}
 			}
 			else if (beentry->st_backendType != B_BACKEND)
 			{
@@ -768,7 +788,7 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 #ifdef HAVE_IPV6
 					|| beentry->st_clientaddr.addr.ss_family == AF_INET6
 #endif
-					)
+						)
 				{
 					char		remote_host[NI_MAXHOST];
 					char		remote_port[NI_MAXSERV];
@@ -882,6 +902,19 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 				values[28] = BoolGetDatum(false);	/* GSS Encryption not in
 													 * use */
 			}
+
+			values[29] = Int32GetDatum(beentry->st_session_id);  /* GPDB */
+
+			{
+				char *groupName = GetResGroupNameForId(beentry->st_rsgid);
+
+				values[30] = ObjectIdGetDatum(beentry->st_rsgid);
+
+				if (groupName != NULL)
+					values[31] = CStringGetTextDatum(groupName);
+				else
+					nulls[31] = true;
+			}
 		}
 		else
 		{
@@ -909,6 +942,10 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 			nulls[26] = true;
 			nulls[27] = true;
 			nulls[28] = true;
+
+			values[29] = Int32GetDatum(beentry->st_session_id);
+			nulls[30] = true;
+			nulls[31] = true;
 		}
 
 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
@@ -942,6 +979,19 @@ pg_stat_get_backend_pid(PG_FUNCTION_ARGS)
 		PG_RETURN_NULL();
 
 	PG_RETURN_INT32(beentry->st_procpid);
+}
+
+
+Datum
+pg_stat_get_backend_session_id(PG_FUNCTION_ARGS)
+{
+	int32		beid = PG_GETARG_INT32(0);
+	PgBackendStatus *beentry;
+
+	if ((beentry = pgstat_fetch_stat_beentry(beid)) == NULL)
+		PG_RETURN_NULL();
+
+	PG_RETURN_INT32(beentry->st_session_id);
 }
 
 
@@ -1152,8 +1202,7 @@ pg_stat_get_backend_client_addr(PG_FUNCTION_ARGS)
 
 	clean_ipv6_addr(beentry->st_clientaddr.addr.ss_family, remote_host);
 
-	PG_RETURN_INET_P(DirectFunctionCall1(inet_in,
-										 CStringGetDatum(remote_host)));
+	return DirectFunctionCall1(inet_in, CStringGetDatum(remote_host));
 }
 
 Datum
@@ -1202,7 +1251,6 @@ pg_stat_get_backend_client_port(PG_FUNCTION_ARGS)
 	PG_RETURN_DATUM(DirectFunctionCall1(int4in,
 										CStringGetDatum(remote_port)));
 }
-
 
 Datum
 pg_stat_get_db_numbackends(PG_FUNCTION_ARGS)
@@ -1869,6 +1917,94 @@ pg_stat_clear_snapshot(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
+
+Datum
+pg_stat_get_queue_num_exec(PG_FUNCTION_ARGS)
+{
+	Oid			queueid = PG_GETARG_OID(0);
+	int64		result;
+	PgStat_StatQueueEntry *queueentry;
+
+	if ((queueentry = pgstat_fetch_stat_queueentry(queueid)) == NULL)
+		result = 0;
+	else
+		result = (int64) (queueentry->n_queries_exec);
+
+	PG_RETURN_INT64(result);
+}
+
+
+Datum
+pg_stat_get_queue_num_wait(PG_FUNCTION_ARGS)
+{
+	Oid			queueid = PG_GETARG_OID(0);
+	int64		result;
+	PgStat_StatQueueEntry *queueentry;
+
+	if ((queueentry = pgstat_fetch_stat_queueentry(queueid)) == NULL)
+		result = 0;
+	else
+		result = (int64) (queueentry->n_queries_wait);
+
+	PG_RETURN_INT64(result);
+}
+
+
+Datum
+pg_stat_get_queue_elapsed_exec(PG_FUNCTION_ARGS)
+{
+	Oid			queueid = PG_GETARG_OID(0);
+	int64		result;
+	PgStat_StatQueueEntry *queueentry;
+
+	if ((queueentry = pgstat_fetch_stat_queueentry(queueid)) == NULL)
+		result = 0;
+	else
+		result = (int64) (queueentry->elapsed_exec);
+
+	PG_RETURN_INT64(result);
+}
+
+
+Datum
+pg_stat_get_queue_elapsed_wait(PG_FUNCTION_ARGS)
+{
+	Oid			queueid = PG_GETARG_OID(0);
+	int64		result;
+	PgStat_StatQueueEntry *queueentry;
+
+	if ((queueentry = pgstat_fetch_stat_queueentry(queueid)) == NULL)
+		result = 0;
+	else
+		result = (int64) (queueentry->elapsed_wait);
+
+	PG_RETURN_INT64(result);
+}
+
+
+/*
+ * This should probably be moved to it's own file, or at least some better place.
+ * I put it here because it uses pgstat_fetch_stat_beentry
+ */
+
+#include <sys/time.h>
+#ifndef WIN32
+#include <sys/resource.h>
+#endif
+#include "lib/stringinfo.h"
+#include "cdb/cdbvars.h"
+#include "cdb/cdbdisp_query.h"
+
+/**
+ * We no longer support pg_renice_session. For the time being issue an error.
+ */
+Datum
+pg_renice_session(PG_FUNCTION_ARGS)
+{
+	int prio_out = -1;  
+	elog(NOTICE, "Renicing a session is not longer supported. Please use the Query Prioritization feature.");
+	PG_RETURN_INT32(prio_out);
+}
 
 /* Reset all counters for the current database */
 Datum

@@ -584,22 +584,23 @@ my %tests = (
 		unlike => { no_owner => 1, },
 	},
 
-	'ALTER LARGE OBJECT ... OWNER TO' => {
-		regexp => qr/^ALTER LARGE OBJECT \d+ OWNER TO .+;/m,
-		like   => {
-			%full_runs,
-			column_inserts         => 1,
-			data_only              => 1,
-			inserts                => 1,
-			section_pre_data       => 1,
-			test_schema_plus_blobs => 1,
-		},
-		unlike => {
-			no_blobs    => 1,
-			no_owner    => 1,
-			schema_only => 1,
-		},
-	},
+# Disabled, because GPDB doesn't support large objects
+#	'ALTER LARGE OBJECT ... OWNER TO' => {
+#		regexp => qr/^ALTER LARGE OBJECT \d+ OWNER TO .+;/m,
+#		like   => {
+#			%full_runs,
+#			column_inserts         => 1,
+#			data_only              => 1,
+#			inserts                => 1,
+#			section_pre_data       => 1,
+#			test_schema_plus_blobs => 1,
+#		},
+#		unlike => {
+#			no_blobs    => 1,
+#			no_owner    => 1,
+#			schema_only => 1,
+#		},
+#	},
 
 	'ALTER PROCEDURAL LANGUAGE pltestlang OWNER TO' => {
 		regexp => qr/^ALTER PROCEDURAL LANGUAGE pltestlang OWNER TO .+;/m,
@@ -909,46 +910,48 @@ my %tests = (
 		},
 	},
 
-	'BLOB create (using lo_from_bytea)' => {
-		create_order => 50,
-		create_sql =>
-		  'SELECT pg_catalog.lo_from_bytea(0, \'\\x310a320a330a340a350a360a370a380a390a\');',
-		regexp => qr/^SELECT pg_catalog\.lo_create\('\d+'\);/m,
-		like   => {
-			%full_runs,
-			column_inserts         => 1,
-			data_only              => 1,
-			inserts                => 1,
-			section_pre_data       => 1,
-			test_schema_plus_blobs => 1,
-		},
-		unlike => {
-			schema_only => 1,
-			no_blobs    => 1,
-		},
-	},
+# Disabled, because GPDB doesn't support large objects
+#	'BLOB create (using lo_from_bytea)' => {
+#		create_order => 50,
+#		create_sql =>
+#		  'SELECT pg_catalog.lo_from_bytea(0, \'\\x310a320a330a340a350a360a370a380a390a\');',
+#		regexp => qr/^SELECT pg_catalog\.lo_create\('\d+'\);/m,
+#		like   => {
+#			%full_runs,
+#			column_inserts         => 1,
+#			data_only              => 1,
+#			inserts                => 1,
+#			section_pre_data       => 1,
+#			test_schema_plus_blobs => 1,
+#		},
+#		unlike => {
+#			schema_only => 1,
+#			no_blobs    => 1,
+#		},
+#	},
 
-	'BLOB load (using lo_from_bytea)' => {
-		regexp => qr/^
-			\QSELECT pg_catalog.lo_open\E \('\d+',\ \d+\);\n
-			\QSELECT pg_catalog.lowrite(0, \E
-			\Q'\x310a320a330a340a350a360a370a380a390a');\E\n
-			\QSELECT pg_catalog.lo_close(0);\E
-			/xm,
-		like => {
-			%full_runs,
-			column_inserts         => 1,
-			data_only              => 1,
-			inserts                => 1,
-			section_data           => 1,
-			test_schema_plus_blobs => 1,
-		},
-		unlike => {
-			binary_upgrade => 1,
-			no_blobs       => 1,
-			schema_only    => 1,
-		},
-	},
+# Disabled, because GPDB doesn't support large objects
+#	'BLOB load (using lo_from_bytea)' => {
+#		regexp => qr/^
+#			\QSELECT pg_catalog.lo_open\E \('\d+',\ \d+\);\n
+#			\QSELECT pg_catalog.lowrite(0, \E
+#			\Q'\x310a320a330a340a350a360a370a380a390a');\E\n
+#			\QSELECT pg_catalog.lo_close(0);\E
+#			/xm,
+#		like => {
+#			%full_runs,
+#			column_inserts         => 1,
+#			data_only              => 1,
+#			inserts                => 1,
+#			section_data           => 1,
+#			test_schema_plus_blobs => 1,
+#		},
+#		unlike => {
+#			binary_upgrade => 1,
+#			no_blobs       => 1,
+#			schema_only    => 1,
+#		},
+#	},
 
 	'COMMENT ON DATABASE postgres' => {
 		regexp => qr/^COMMENT ON DATABASE postgres IS .+;/m,
@@ -1058,31 +1061,32 @@ my %tests = (
 		like      => { %full_runs, section_pre_data => 1, },
 	},
 
-	'COMMENT ON LARGE OBJECT ...' => {
-		create_order => 65,
-		create_sql   => 'DO $$
-						 DECLARE myoid oid;
-						 BEGIN
-							SELECT loid FROM pg_largeobject INTO myoid;
-							EXECUTE \'COMMENT ON LARGE OBJECT \' || myoid || \' IS \'\'comment on large object\'\';\';
-						 END;
-						 $$;',
-		regexp => qr/^
-			\QCOMMENT ON LARGE OBJECT \E[0-9]+\Q IS 'comment on large object';\E
-			/xm,
-		like => {
-			%full_runs,
-			column_inserts         => 1,
-			data_only              => 1,
-			inserts                => 1,
-			section_pre_data       => 1,
-			test_schema_plus_blobs => 1,
-		},
-		unlike => {
-			no_blobs    => 1,
-			schema_only => 1,
-		},
-	},
+# Disabled, because GPDB doesn't support large objects
+#	'COMMENT ON LARGE OBJECT ...' => {
+#		create_order => 65,
+#		create_sql   => 'DO $$
+#						 DECLARE myoid oid;
+#						 BEGIN
+#							SELECT loid FROM pg_largeobject INTO myoid;
+#							EXECUTE \'COMMENT ON LARGE OBJECT \' || myoid || \' IS \'\'comment on large object\'\';\';
+#						 END;
+#						 $$;',
+#		regexp => qr/^
+#			\QCOMMENT ON LARGE OBJECT \E[0-9]+\Q IS 'comment on large object';\E
+#			/xm,
+#		like => {
+#			%full_runs,
+#			column_inserts         => 1,
+#			data_only              => 1,
+#			inserts                => 1,
+#			section_pre_data       => 1,
+#			test_schema_plus_blobs => 1,
+#		},
+#		unlike => {
+#			no_blobs    => 1,
+#			schema_only => 1,
+#		},
+#	},
 
 	'COMMENT ON PUBLICATION pub1' => {
 		create_order => 55,
@@ -1545,13 +1549,84 @@ my %tests = (
 		regexp => qr/^
 			\QCREATE FUNCTION dump_test.pltestlang_call_handler() \E
 			\QRETURNS language_handler\E
-			\n\s+\QLANGUAGE c\E
+			\n\s+\QLANGUAGE c NO SQL\E
 			\n\s+AS\ \'\$
 			\Qlibdir\/plpgsql', 'plpgsql_call_handler';\E
 			/xm,
 		like =>
 		  { %full_runs, %dump_test_schema_runs, section_pre_data => 1, },
 		unlike => { exclude_dump_test_schema => 1, },
+	},
+
+	'CREATE FUNCTION dump_test.write_to_file_stable' => {
+		create_order => 17,
+		create_sql   => 'CREATE FUNCTION dump_test.write_to_file_stable()
+					   RETURNS integer AS \'$libdir/gpextprotocol.so\',
+					   \'demoprot_export\' LANGUAGE C STABLE;',
+		regexp => qr/^
+			\QCREATE FUNCTION dump_test.write_to_file_stable() \E
+			\QRETURNS integer\E
+			\n\s+\QLANGUAGE c STABLE NO SQL\E
+			\n\s+AS\ \'\$
+			\Qlibdir\/gpextprotocol.so', 'demoprot_export';\E
+			/xm,
+		like =>
+		  { %full_runs, %dump_test_schema_runs, section_pre_data => 1, },
+		unlike => { exclude_dump_test_schema => 1, },
+	},
+
+	'CREATE FUNCTION dump_test.read_from_file_stable' => {
+		create_order => 17,
+		create_sql   => 'CREATE FUNCTION dump_test.read_from_file_stable()
+					   RETURNS integer AS \'$libdir/gpextprotocol.so\',
+					   \'demoprot_export\' LANGUAGE C STABLE;',
+		regexp => qr/^
+			\QCREATE FUNCTION dump_test.read_from_file_stable() \E
+			\QRETURNS integer\E
+			\n\s+\QLANGUAGE c STABLE NO SQL\E
+			\n\s+AS\ \'\$
+			\Qlibdir\/gpextprotocol.so', 'demoprot_export';\E
+			/xm,
+		like =>
+		  { %full_runs, %dump_test_schema_runs, section_pre_data => 1, },
+		unlike => { exclude_dump_test_schema => 1, },
+	},
+
+	'CREATE PROTOCOL demoprot' => {
+		create_order => 18,
+		create_sql   => 'CREATE PROTOCOL demoprot ( readfunc = dump_test.read_from_file_stable, writefunc = dump_test.write_to_file_stable);',
+		regexp => qr/^
+		\QCREATE  PROTOCOL demoprot ( readfunc = 'read_from_file_stable', writefunc = 'write_to_file_stable');\E
+		/xm,
+		like =>
+		  { %full_runs, %dump_test_schema_runs, section_pre_data => 1, },
+			unlike => { only_dump_test_schema => 1, test_schema_plus_blobs => 1 },
+	},
+
+	'CREATE EXTERNAL WEB TABLE dump_test.dummy_ext_tab' => {
+		create_order => 19,
+		create_sql   => 'CREATE EXTERNAL WEB TABLE dump_test.dummy_ext_tab (x text) EXECUTE \'echo foo\' FORMAT \'text\';',
+		regexp => qr/^
+		\QCREATE FOREIGN TABLE dump_test.dummy_ext_tab (\E
+		\n\s+\Qx text\E
+		\n\Q)\E
+		\n\QSERVER gp_exttable_server\E
+		\n\QOPTIONS (\E
+		\n\s+\Qcommand 'echo foo',\E
+		\n\s+\Qdelimiter '\E\s+\Q',\E
+		\n\s+\Qencoding '\E\d\Q',\E
+		\n\s+\Qescape E'\\',\E
+		\n\s+\Qexecute_on 'ALL_SEGMENTS',\E
+		\n\s+\Qformat 'text',\E
+		\n\s+\Qformat_type 't',\E
+		\n\s+\Qis_writable 'false',\E
+		\n\s+\Qlog_errors 'f',\E
+		\n\s+\Q"null" E'\\N'\E
+		\n\Q);\E
+		/xm,
+		like =>
+		  { %full_runs, %dump_test_schema_runs, section_pre_data => 1, },
+			unlike => { exclude_dump_test_schema => 1, },
 	},
 
 	'CREATE FUNCTION dump_test.trigger_func' => {
@@ -1561,7 +1636,7 @@ my %tests = (
 					   AS $$ BEGIN RETURN NULL; END;$$;',
 		regexp => qr/^
 			\QCREATE FUNCTION dump_test.trigger_func() RETURNS trigger\E
-			\n\s+\QLANGUAGE plpgsql\E
+			\n\s+\QLANGUAGE plpgsql NO SQL\E
 			\n\s+AS\ \$\$
 			\Q BEGIN RETURN NULL; END;\E
 			\$\$;/xm,
@@ -1577,7 +1652,7 @@ my %tests = (
 					   AS $$ BEGIN RETURN; END;$$;',
 		regexp => qr/^
 			\QCREATE FUNCTION dump_test.event_trigger_func() RETURNS event_trigger\E
-			\n\s+\QLANGUAGE plpgsql\E
+			\n\s+\QLANGUAGE plpgsql NO SQL\E
 			\n\s+AS\ \$\$
 			\Q BEGIN RETURN; END;\E
 			\$\$;/xm,
@@ -1885,7 +1960,7 @@ my %tests = (
 					   LANGUAGE internal STRICT IMMUTABLE;',
 		regexp => qr/^
 			\QCREATE FUNCTION dump_test.int42_in(cstring) RETURNS dump_test.int42\E
-			\n\s+\QLANGUAGE internal IMMUTABLE STRICT\E
+			\n\s+\QLANGUAGE internal IMMUTABLE STRICT NO SQL\E
 			\n\s+AS\ \$\$int4in\$\$;
 			/xm,
 		like =>
@@ -1900,7 +1975,7 @@ my %tests = (
 					   LANGUAGE internal STRICT IMMUTABLE;',
 		regexp => qr/^
 			\QCREATE FUNCTION dump_test.int42_out(dump_test.int42) RETURNS cstring\E
-			\n\s+\QLANGUAGE internal IMMUTABLE STRICT\E
+			\n\s+\QLANGUAGE internal IMMUTABLE STRICT NO SQL\E
 			\n\s+AS\ \$\$int4out\$\$;
 			/xm,
 		like =>
@@ -1914,7 +1989,7 @@ my %tests = (
 		  'CREATE FUNCTION dump_test.func_with_support() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$ SUPPORT varchar_support;',
 		regexp => qr/^
 			\QCREATE FUNCTION dump_test.func_with_support() RETURNS integer\E
-			\n\s+\QLANGUAGE sql SUPPORT varchar_support\E
+			\n\s+\QLANGUAGE sql SUPPORT varchar_support CONTAINS SQL\E
 			\n\s+AS\ \$\$\Q SELECT 1 \E\$\$;
 			/xm,
 		like =>
@@ -1928,7 +2003,7 @@ my %tests = (
 					   LANGUAGE SQL AS $$ INSERT INTO dump_test.test_table (col1) VALUES (a) $$;',
 		regexp => qr/^
 			\QCREATE PROCEDURE dump_test.ptest1(a integer)\E
-			\n\s+\QLANGUAGE sql\E
+			\n\s+\QLANGUAGE sql CONTAINS SQL\E
 			\n\s+AS\ \$\$\Q INSERT INTO dump_test.test_table (col1) VALUES (a) \E\$\$;
 			/xm,
 		like =>
@@ -1983,6 +2058,16 @@ my %tests = (
 		regexp       => qr/^\QCREATE TYPE dump_test.undefined;\E/m,
 		like =>
 		  { %full_runs, %dump_test_schema_runs, section_pre_data => 1, },
+		unlike => { exclude_dump_test_schema => 1, },
+	},
+
+	'ALTER TYPE dump_test.int42 SET DEFAULT ENCODING' => {
+		create_order => 43,
+		create_sql => 'ALTER TYPE dump_test.int42 SET DEFAULT ENCODING
+		(compresstype=rle_type, blocksize=8192, compresslevel=4);',
+		regexp => qr/^\QALTER TYPE dump_test.int42 SET DEFAULT ENCODING (compresstype=rle_type, blocksize=8192, compresslevel=4);\E/m,
+		like =>
+			{ %full_runs, %dump_test_schema_runs, section_pre_data => 1, },
 		unlike => { exclude_dump_test_schema => 1, },
 	},
 
@@ -2293,7 +2378,10 @@ my %tests = (
 		regexp => qr/^CREATE SCHEMA public;/m,
 
 		# this shouldn't ever get emitted anymore
-		like => {},
+		# GPDB: It does get dumped in GPDB binary-upgrade.
+		like => {
+			binary_upgrade   => 1,
+		},
 	},
 
 	'CREATE SCHEMA dump_test' => {
@@ -2892,7 +2980,7 @@ my %tests = (
 		create_sql =>
 		  'ALTER VIEW dump_test.test_view ALTER COLUMN col1 SET DEFAULT 1;',
 		regexp => qr/^
-			\QALTER TABLE ONLY dump_test.test_view ALTER COLUMN col1 SET DEFAULT 1;\E/xm,
+			\QALTER TABLE dump_test.test_view ALTER COLUMN col1 SET DEFAULT 1;\E/xm,
 		like =>
 		  { %full_runs, %dump_test_schema_runs, section_pre_data => 1, },
 		unlike => { exclude_dump_test_schema => 1, },
@@ -2918,7 +3006,10 @@ my %tests = (
 		regexp => qr/^DROP SCHEMA IF EXISTS public;/m,
 
 		# this shouldn't ever get emitted anymore
-		like => {},
+		# GPDB: It does get dumped in GPDB binary-upgrade.
+		like => {
+			binary_upgrade   => 1,
+		},
 	},
 
 	'DROP EXTENSION plpgsql' => {
@@ -3177,33 +3268,34 @@ my %tests = (
 		unlike => { no_privs => 1, },
 	},
 
-	'GRANT ALL ON LARGE OBJECT ...' => {
-		create_order => 60,
-		create_sql   => 'DO $$
-						 DECLARE myoid oid;
-						 BEGIN
-							SELECT loid FROM pg_largeobject INTO myoid;
-							EXECUTE \'GRANT ALL ON LARGE OBJECT \' || myoid || \' TO regress_dump_test_role;\';
-						 END;
-						 $$;',
-		regexp => qr/^
-			\QGRANT ALL ON LARGE OBJECT \E[0-9]+\Q TO regress_dump_test_role;\E
-			/xm,
-		like => {
-			%full_runs,
-			column_inserts         => 1,
-			data_only              => 1,
-			inserts                => 1,
-			section_pre_data       => 1,
-			test_schema_plus_blobs => 1,
-			binary_upgrade         => 1,
-		},
-		unlike => {
-			no_blobs    => 1,
-			no_privs    => 1,
-			schema_only => 1,
-		},
-	},
+# Disabled, because GPDB doesn't support large objects
+#	'GRANT ALL ON LARGE OBJECT ...' => {
+#		create_order => 60,
+#		create_sql   => 'DO $$
+#						 DECLARE myoid oid;
+#						 BEGIN
+#							SELECT loid FROM pg_largeobject INTO myoid;
+#							EXECUTE \'GRANT ALL ON LARGE OBJECT \' || myoid || \' TO regress_dump_test_role;\';
+#						 END;
+#						 $$;',
+#		regexp => qr/^
+#			\QGRANT ALL ON LARGE OBJECT \E[0-9]+\Q TO regress_dump_test_role;\E
+#			/xm,
+#		like => {
+#			%full_runs,
+#			column_inserts         => 1,
+#			data_only              => 1,
+#			inserts                => 1,
+#			section_pre_data       => 1,
+#			test_schema_plus_blobs => 1,
+#			binary_upgrade         => 1,
+#		},
+#		unlike => {
+#			no_blobs    => 1,
+#			no_privs    => 1,
+#			schema_only => 1,
+#		},
+#	},
 
 	'GRANT INSERT(col1) ON TABLE test_second_table' => {
 		create_order => 8,

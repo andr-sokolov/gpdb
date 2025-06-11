@@ -169,6 +169,12 @@ list_length(const List *l)
 #define for_each_cell(cell, initcell)	\
 	for ((cell) = (initcell); (cell) != NULL; (cell) = lnext(cell))
 
+#define foreach_with_count(cell, list, counter) \
+	for ((cell) = list_head(list), (counter)=0; \
+	     (cell) != NULL; \
+	     (cell) = lnext(cell), ++(counter))
+
+
 /*
  * forboth -
  *	  a convenience macro for advancing through two linked lists
@@ -294,6 +300,8 @@ extern void list_free_deep(List *list);
 
 extern List *list_copy(const List *list);
 extern List *list_copy_tail(const List *list, int nskip);
+
+extern void *list_nth_replace(List *list, int n, void *new_data);
 
 typedef int (*list_qsort_comparator) (const void *a, const void *b);
 extern List *list_qsort(const List *list, list_qsort_comparator cmp);

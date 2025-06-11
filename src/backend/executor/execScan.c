@@ -20,6 +20,7 @@
 
 #include "executor/executor.h"
 #include "miscadmin.h"
+#include "utils/faultinjector.h"
 #include "utils/memutils.h"
 
 
@@ -39,6 +40,9 @@ ExecScanFetch(ScanState *node,
 	EState	   *estate = node->ps.state;
 
 	CHECK_FOR_INTERRUPTS();
+
+	if (QueryFinishPending)
+		return NULL;
 
 	if (estate->es_epq_active != NULL)
 	{
@@ -163,6 +167,8 @@ ExecScan(ScanState *node,
 	ExprContext *econtext;
 	ExprState  *qual;
 	ProjectionInfo *projInfo;
+
+	SIMPLE_FAULT_INJECTOR("before_exec_scan");
 
 	/*
 	 * Fetch data from node

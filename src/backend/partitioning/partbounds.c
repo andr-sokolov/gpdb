@@ -21,6 +21,7 @@
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_type.h"
 #include "commands/tablecmds.h"
+#include "common/hashfn.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -32,7 +33,6 @@
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/fmgroids.h"
-#include "utils/hashutils.h"
 #include "utils/lsyscache.h"
 #include "utils/partcache.h"
 #include "utils/rel.h"
@@ -1036,6 +1036,7 @@ check_new_partition_bound(char *relname, Relation parent,
 		case PARTITION_STRATEGY_LIST:
 			{
 				Assert(spec->strategy == PARTITION_STRATEGY_LIST);
+				Assert(spec->listdatums != NULL);
 
 				if (partdesc->nparts > 0)
 				{

@@ -22,7 +22,7 @@ export REGRESS_SHLIB
 check:
 	$(prove_check)
 
-installcheck:
+installcheck: checkprep
 	$(prove_installcheck)
 
 clean distclean maintainer-clean:

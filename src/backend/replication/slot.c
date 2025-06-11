@@ -464,6 +464,22 @@ ReplicationSlotRelease(void)
 		ConditionVariableBroadcast(&slot->active_cv);
 	}
 
+
+	/*
+	 * If slot needed to temporarily restrain both data and catalog xmin to
+	 * create the catalog snapshot, remove that temporary constraint.
+	 * Snapshots can only be exported while the initial snapshot is still
+	 * acquired.
+	 */
+	if (!TransactionIdIsValid(slot->data.xmin) &&
+		TransactionIdIsValid(slot->effective_xmin))
+	{
+		SpinLockAcquire(&slot->mutex);
+		slot->effective_xmin = InvalidTransactionId;
+		SpinLockRelease(&slot->mutex);
+		ReplicationSlotsComputeRequiredXmin(false);
+	}
+
 	MyReplicationSlot = NULL;
 
 	/* might not have been set when we've been a plain slot */
@@ -1235,6 +1251,10 @@ SaveSlotToPath(ReplicationSlot *slot, const char *dir, int elevel)
 	ReplicationSlotOnDisk cp;
 	bool		was_dirty;
 
+	ereport(DEBUG2,
+			(errmsg("saving replication slot to path. slot's restart_lsn is %X/%X",
+					(uint32) (slot->data.restart_lsn >> 32), (uint32) slot->data.restart_lsn)));
+
 	/* first check whether there's something to write out */
 	SpinLockAcquire(&slot->mutex);
 	was_dirty = slot->dirty;
@@ -1250,8 +1270,8 @@ SaveSlotToPath(ReplicationSlot *slot, const char *dir, int elevel)
 	/* silence valgrind :( */
 	memset(&cp, 0, sizeof(ReplicationSlotOnDisk));
 
-	sprintf(tmppath, "%s/state.tmp", dir);
-	sprintf(path, "%s/state", dir);
+	snprintf(tmppath, sizeof(tmppath), "%s/state.tmp", dir);
+	snprintf(path, sizeof(path), "%s/state", dir);
 
 	fd = OpenTransientFile(tmppath, O_CREAT | O_EXCL | O_WRONLY | PG_BINARY);
 	if (fd < 0)
@@ -1585,4 +1605,36 @@ RestoreSlotFromDisk(const char *name)
 		ereport(FATAL,
 				(errmsg("too many replication slots active before shutdown"),
 				 errhint("Increase max_replication_slots and try again.")));
+}
+
+/*
+ * Permanently drop replication slot identified by the passed in name.
+ */
+void
+ReplicationSlotDropIfExists(const char *name)
+{
+	bool exists = false;
+	int i;
+
+	/*
+	 * There exists a race condition if multiple callers check the existence of
+	 * replication slot at the same time. Then we may incorrectly try to drop
+	 * the same slot twice.  Currently this is not an issue as this function is
+	 * only called once at startup from StartupXLOG.
+	 */
+	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
+	for (i = 0; i < max_replication_slots; i++)
+	{
+		ReplicationSlot *s = &ReplicationSlotCtl->replication_slots[i];
+
+		if (s->in_use && strcmp(name, NameStr(s->data.name)) == 0)
+		{
+			exists = true;
+			break;
+		}
+	}
+	LWLockRelease(ReplicationSlotControlLock);
+
+	if (exists)
+		ReplicationSlotDrop(name, true);
 }

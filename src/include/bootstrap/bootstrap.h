@@ -14,6 +14,7 @@
 #ifndef BOOTSTRAP_H
 #define BOOTSTRAP_H
 
+#include "catalog/index.h"
 #include "nodes/execnodes.h"
 
 
@@ -33,8 +34,6 @@ extern int	numattr;
 
 
 extern void AuxiliaryProcessMain(int argc, char *argv[]) pg_attribute_noreturn();
-
-extern void err_out(void);
 
 extern void closerel(char *name);
 extern void boot_openrel(char *name);

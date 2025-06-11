@@ -51,6 +51,14 @@ from generate_series(0,10000) as i;
 
 vacuum analyze gist_tbl;
 
+-- this query doesn't work with index scan on Greenplum, check it before setting GUCs
+select p from
+  (values (box(point(0,0), point(0.5,0.5))),
+          (box(point(0.5,0.5), point(0.75,0.75))),
+          (box(point(0.8,0.8), point(1.0,1.0)))) as v(bb)
+cross join lateral
+  (select p from gist_tbl where p <@ bb order by p <-> bb[0] limit 2) ss;
+
 set enable_seqscan=off;
 set enable_bitmapscan=off;
 set enable_indexonlyscan=on;
@@ -151,7 +159,8 @@ select count(*) from gist_tbl;
 -- This case isn't supported, but it should at least EXPLAIN correctly.
 explain (verbose, costs off)
 select p from gist_tbl order by circle(p,1) <-> point(0,0) limit 1;
-select p from gist_tbl order by circle(p,1) <-> point(0,0) limit 1;
+-- GPDB_12_12_MERGE_FIXME, ORCA surprisingly supports this, but the ORDER BY is executed on the segments
+-- select p from gist_tbl order by circle(p,1) <-> point(0,0) limit 1;
 
 -- Clean up
 reset enable_seqscan;

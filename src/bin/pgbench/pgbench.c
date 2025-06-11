@@ -220,8 +220,11 @@ bool		is_connect;			/* establish connection for each transaction */
 bool		report_per_command; /* report per-command latencies */
 int			main_pid;			/* main process id used in log filename */
 
+int			use_unique_key=1;	/* indexes will be primary key if set, otherwise non-unique indexes */
+
 char	   *pghost = "";
 char	   *pgport = "";
+char	   *storage_clause = "appendonly=false";
 char	   *login = NULL;
 char	   *dbName;
 char	   *logfile_prefix = NULL;
@@ -608,6 +611,7 @@ usage(void)
 		   "  %s [OPTION]... [DBNAME]\n"
 		   "\nInitialization options:\n"
 		   "  -i, --initialize         invokes initialization mode\n"
+		   "  -x STRING    append this string to the storage clause e.g. 'appendonly=true, orientation=column'\n"
 		   "  -I, --init-steps=[dtgvpf]+ (default \"dtgvp\")\n"
 		   "                           run selected initialization steps\n"
 		   "  -F, --fillfactor=NUM     set fill factor\n"
@@ -615,6 +619,8 @@ usage(void)
 		   "  -q, --quiet              quiet logging (one message each 5 seconds)\n"
 		   "  -s, --scale=NUM          scaling factor\n"
 		   "  --foreign-keys           create foreign key constraints between tables\n"
+		   "  --use-unique-keys        make the indexes that are created non-unique indexes\n"
+		   "                           (default: unique)\n"
 		   "  --index-tablespace=TABLESPACE\n"
 		   "                           create indexes in the specified tablespace\n"
 		   "  --tablespace=TABLESPACE  create tables in the specified tablespace\n"
@@ -659,7 +665,7 @@ usage(void)
 		   "  -V, --version            output version information, then exit\n"
 		   "  -?, --help               show this help, then exit\n"
 		   "\n"
-		   "Report bugs to <pgsql-bugs@lists.postgresql.org>.\n",
+		   "Report bugs to <bugs@greenplum.org>.\n",
 		   progname, progname);
 }
 
@@ -3639,6 +3645,7 @@ initCreateTables(PGconn *con)
 		const char *smcols;		/* column decls if accountIDs are 32 bits */
 		const char *bigcols;	/* column decls if accountIDs are 64 bits */
 		int			declare_fillfactor;
+		char	   *distributed_col;
 	};
 	static const struct ddlinfo DDLs[] = {
 		{
@@ -3646,24 +3653,28 @@ initCreateTables(PGconn *con)
 			"tid int,bid int,aid    int,delta int,mtime timestamp,filler char(22)",
 			"tid int,bid int,aid bigint,delta int,mtime timestamp,filler char(22)",
 			0
+			, "bid"
 		},
 		{
 			"pgbench_tellers",
 			"tid int not null,bid int,tbalance int,filler char(84)",
 			"tid int not null,bid int,tbalance int,filler char(84)",
-			1
+			1,
+			"tid"
 		},
 		{
 			"pgbench_accounts",
 			"aid    int not null,bid int,abalance int,filler char(84)",
 			"aid bigint not null,bid int,abalance int,filler char(84)",
 			1
+			, "aid"
 		},
 		{
 			"pgbench_branches",
 			"bid int not null,bbalance int,filler char(88)",
 			"bid int not null,bbalance int,filler char(88)",
 			1
+			, "bid"
 		}
 	};
 	int			i;
@@ -3681,7 +3692,12 @@ initCreateTables(PGconn *con)
 		opts[0] = '\0';
 		if (ddl->declare_fillfactor)
 			snprintf(opts + strlen(opts), sizeof(opts) - strlen(opts),
-					 " with (fillfactor=%d)", fillfactor);
+					 " with (fillfactor=%d, %s)",
+					 fillfactor, storage_clause);
+		else
+			snprintf(opts + strlen(opts), sizeof(opts) - strlen(opts),
+					 " with (%s)",
+					 storage_clause);
 		if (tablespace != NULL)
 		{
 			char	   *escape_tablespace;
@@ -3692,6 +3708,9 @@ initCreateTables(PGconn *con)
 					 " tablespace %s", escape_tablespace);
 			PQfreemem(escape_tablespace);
 		}
+		snprintf(opts + strlen(opts), sizeof(opts) - strlen(opts),
+				 " distributed by (%s)",
+				 ddl->distributed_col);
 
 		cols = (scale >= SCALE_32BIT_THRESHOLD) ? ddl->bigcols : ddl->smcols;
 
@@ -3865,6 +3884,13 @@ initCreatePKeys(PGconn *con)
 		"alter table pgbench_tellers add primary key (tid)",
 		"alter table pgbench_accounts add primary key (aid)"
 	};
+	static const char *const NON_UNIQUE_INDEX_DDLINDEXes[] = {
+		"CREATE INDEX branch_idx ON pgbench_branches (bid) ",
+		"CREATE INDEX teller_idx ON pgbench_tellers (tid) ",
+		"CREATE INDEX account_idx ON pgbench_accounts (aid) "
+	};
+	StaticAssertStmt(lengthof(DDLINDEXes) == lengthof(NON_UNIQUE_INDEX_DDLINDEXes),
+					 "NON_UNIQUE_INDEX_DDLINDEXes must have same size as DDLINDEXes");
 	int			i;
 
 	fprintf(stderr, "creating primary keys...\n");
@@ -3872,7 +3898,10 @@ initCreatePKeys(PGconn *con)
 	{
 		char		buffer[256];
 
-		strlcpy(buffer, DDLINDEXes[i], sizeof(buffer));
+		if (use_unique_key)
+			strlcpy(buffer, DDLINDEXes[i], sizeof(buffer));
+		else
+			strlcpy(buffer, NON_UNIQUE_INDEX_DDLINDEXes[i], sizeof(buffer));
 
 		if (index_tablespace != NULL)
 		{
@@ -5104,6 +5133,7 @@ main(int argc, char **argv)
 		{"log-prefix", required_argument, NULL, 7},
 		{"foreign-keys", no_argument, NULL, 8},
 		{"random-seed", required_argument, NULL, 9},
+		{"use-unique-keys", no_argument, &use_unique_key, 1},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -5176,7 +5206,7 @@ main(int argc, char **argv)
 		exit(1);
 	}
 
-	while ((c = getopt_long(argc, argv, "iI:h:nvp:dqb:SNc:j:Crs:t:T:U:lf:D:F:M:P:R:L:", long_options, &optindex)) != -1)
+	while ((c = getopt_long(argc, argv, "iI:h:nvp:dqb:SNc:j:Crs:t:T:U:lf:D:F:M:P:R:L:x:", long_options, &optindex)) != -1)
 	{
 		char	   *script;
 
@@ -5184,6 +5214,9 @@ main(int argc, char **argv)
 		{
 			case 'i':
 				is_init_mode = true;
+				break;
+			case 'x':
+				storage_clause = optarg;
 				break;
 			case 'I':
 				if (initialize_steps)

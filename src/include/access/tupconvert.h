@@ -54,4 +54,6 @@ extern Bitmapset *execute_attr_map_cols(Bitmapset *inbitmap, TupleConversionMap 
 
 extern void free_conversion_map(TupleConversionMap *map);
 
+extern AttrNumber attrMap(TupleConversionMap *map, AttrNumber attno);
+
 #endif							/* TUPCONVERT_H */

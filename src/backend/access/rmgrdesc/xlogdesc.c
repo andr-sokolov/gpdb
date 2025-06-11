@@ -21,6 +21,9 @@
 #include "utils/guc.h"
 #include "utils/timestamp.h"
 
+#include "access/twophase_xlog.h"
+#include "cdb/cdbpublic.h"
+
 /*
  * GUC support
  */
@@ -33,6 +36,39 @@ const struct config_enum_entry wal_level_options[] = {
 	{NULL, 0, false}
 };
 
+
+/*
+ * This is used also in the redo function, but must be defined here so that it
+ * can also be used in xlog_desc.
+ */
+void
+UnpackCheckPointRecord(XLogReaderState *record, CheckpointExtendedRecord *ckptExtended)
+{
+	char *current_record_ptr;
+	int remainderLen;
+
+	if (XLogRecGetDataLen(record) == sizeof(CheckPoint))
+	{
+		/* Special (for bootstrap, xlog switch, maybe others) */
+		ckptExtended->dtxCheckpoint = NULL;
+		ckptExtended->dtxCheckpointLen = 0;
+		return;
+	}
+
+	/* Normal checkpoint Record */
+	Assert(XLogRecGetDataLen(record) > sizeof(CheckPoint));
+
+	current_record_ptr = ((char*)XLogRecGetData(record)) + sizeof(CheckPoint);
+	remainderLen = XLogRecGetDataLen(record) - sizeof(CheckPoint);
+
+	/* Start of distributed transaction information */
+	ckptExtended->dtxCheckpoint = (TMGXACT_CHECKPOINT *)current_record_ptr;
+	ckptExtended->dtxCheckpointLen =
+		TMGXACT_CHECKPOINT_BYTES((ckptExtended->dtxCheckpoint)->committedCount);
+
+	Assert(remainderLen == ckptExtended->dtxCheckpointLen);
+}
+
 void
 xlog_desc(StringInfo buf, XLogReaderState *record)
 {
@@ -44,8 +80,10 @@ xlog_desc(StringInfo buf, XLogReaderState *record)
 	{
 		CheckPoint *checkpoint = (CheckPoint *) rec;
 
+		CheckpointExtendedRecord ckptExtended;
+
 		appendStringInfo(buf, "redo %X/%X; "
-						 "tli %u; prev tli %u; fpw %s; xid %u:%u; oid %u; multi %u; offset %u; "
+						 "tli %u; prev tli %u; fpw %s; xid %u:%u; gxid "UINT64_FORMAT"; oid %u; relfilenode %u; multi %u; offset %u; "
 						 "oldest xid %u in DB %u; oldest multi %u in DB %u; "
 						 "oldest/newest commit timestamp xid: %u/%u; "
 						 "oldest running xid %u; %s",
@@ -55,7 +93,9 @@ xlog_desc(StringInfo buf, XLogReaderState *record)
 						 checkpoint->fullPageWrites ? "true" : "false",
 						 EpochFromFullTransactionId(checkpoint->nextFullXid),
 						 XidFromFullTransactionId(checkpoint->nextFullXid),
+						 checkpoint->nextGxid,
 						 checkpoint->nextOid,
+						 checkpoint->nextRelfilenode,
 						 checkpoint->nextMulti,
 						 checkpoint->nextMultiOffset,
 						 checkpoint->oldestXid,
@@ -66,6 +106,17 @@ xlog_desc(StringInfo buf, XLogReaderState *record)
 						 checkpoint->newestCommitTsXid,
 						 checkpoint->oldestActiveXid,
 						 (info == XLOG_CHECKPOINT_SHUTDOWN) ? "shutdown" : "online");
+
+		UnpackCheckPointRecord(record, &ckptExtended);
+
+		if (ckptExtended.dtxCheckpointLen > 0)
+		{
+			appendStringInfo(buf,
+				 ", checkpoint record data length = %u, DTX committed count %d, DTX data length %u",
+							 XLogRecGetDataLen(record),
+							 ckptExtended.dtxCheckpoint->committedCount,
+							 ckptExtended.dtxCheckpointLen);
+		}
 	}
 	else if (info == XLOG_NEXTOID)
 	{
@@ -73,6 +124,20 @@ xlog_desc(StringInfo buf, XLogReaderState *record)
 
 		memcpy(&nextOid, rec, sizeof(Oid));
 		appendStringInfo(buf, "%u", nextOid);
+	}
+	else if (info == XLOG_NEXTGXID)
+	{
+		DistributedTransactionId nextGxid;
+
+		nextGxid = *((DistributedTransactionId *) rec);
+		appendStringInfo(buf, UINT64_FORMAT, nextGxid);
+	}
+	else if (info == XLOG_NEXTRELFILENODE)
+	{
+		Oid			nextRelfilenode;
+
+		memcpy(&nextRelfilenode, rec, sizeof(Oid));
+		appendStringInfo(buf, "%u", nextRelfilenode);
 	}
 	else if (info == XLOG_RESTORE_POINT)
 	{
@@ -170,6 +235,12 @@ xlog_identify(uint8 info)
 			break;
 		case XLOG_NEXTOID:
 			id = "NEXTOID";
+			break;
+		case XLOG_NEXTGXID:
+			id = "NEXTGXID";
+			break;
+		case XLOG_NEXTRELFILENODE:
+			id = "NEXTRELFILENODE";
 			break;
 		case XLOG_SWITCH:
 			id = "SWITCH";

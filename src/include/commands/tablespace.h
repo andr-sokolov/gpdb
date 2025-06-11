@@ -18,6 +18,7 @@
 #include "catalog/objectaddress.h"
 #include "lib/stringinfo.h"
 #include "nodes/parsenodes.h"
+#include "storage/dbdirnode.h"
 
 extern bool allow_in_place_tablespaces;
 
@@ -34,6 +35,7 @@ typedef struct xl_tblspc_create_rec
 typedef struct xl_tblspc_drop_rec
 {
 	Oid			ts_id;
+	char		ts_path[1];		/* VARIABLE LENGTH STRING */
 } xl_tblspc_drop_rec;
 
 typedef struct TableSpaceOpts
@@ -50,6 +52,7 @@ extern ObjectAddress RenameTableSpace(const char *oldname, const char *newname);
 extern Oid	AlterTableSpaceOptions(AlterTableSpaceOptionsStmt *stmt);
 
 extern void TablespaceCreateDbspace(Oid spcNode, Oid dbNode, bool isRedo);
+extern void UnlinkTablespaceDirectory(Oid tablepace_oid_to_unlink, bool isRedo);
 
 extern Oid	GetDefaultTablespace(char relpersistence, bool partitioned);
 
