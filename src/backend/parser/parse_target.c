@@ -27,6 +27,7 @@
 #include "parser/parse_relation.h"
 #include "parser/parse_target.h"
 #include "parser/parse_type.h"
+#include "parser/parse_cte.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -326,8 +327,10 @@ markTargetListOrigin(ParseState *pstate, TargetEntry *tle,
 				markTargetListOrigin(pstate, tle, aliasvar, netlevelsup);
 			}
 			break;
+		case RTE_TABLEFUNCTION:
 		case RTE_FUNCTION:
 		case RTE_VALUES:
+		case RTE_VOID:
 			/* not a simple relation, leave it unmarked */
 			break;
 		case RTE_CTE:
@@ -997,7 +1000,9 @@ ExpandColumnRefStar(ParseState *pstate, ColumnRef *cref,
 		 * Since the grammar only accepts bare '*' at top level of SELECT, we
 		 * need not handle the make_target_entry==false case here.
 		 */
-		Assert(make_target_entry);
+		if (!make_target_entry)
+			elog(ERROR, "invalid use of *");
+
 		return ExpandAllTables(pstate, cref->location);
 	}
 	else
@@ -1481,6 +1486,7 @@ expandRecordVariable(ParseState *pstate, Var *var, int levelsup)
 				return expandRecordVariable(pstate, (Var *) expr, netlevelsup);
 			/* else fall through to inspect the expression */
 			break;
+		case RTE_TABLEFUNCTION:
 		case RTE_FUNCTION:
 
 			/*
@@ -1526,6 +1532,9 @@ expandRecordVariable(ParseState *pstate, Var *var, int levelsup)
 				/* else fall through to inspect the expression */
 			}
 			break;
+		case RTE_VOID:
+	            Insist(0);
+        	    break;
 	}
 
 	/*
@@ -1701,11 +1710,14 @@ FigureColnameInternal(Node *node, char **name)
 						}
 					}
 					break;
+
 					/* As with other operator-like nodes, these have no names */
 				case ALL_SUBLINK:
 				case ANY_SUBLINK:
 				case ROWCOMPARE_SUBLINK:
 				case CTE_SUBLINK:
+				case INITPLAN_FUNC_SUBLINK:
+				case NOT_EXISTS_SUBLINK:
 					break;
 			}
 			break;
@@ -1774,6 +1786,9 @@ FigureColnameInternal(Node *node, char **name)
 			break;
 		case T_XmlSerialize:
 			*name = "xmlserialize";
+			return 2;
+		case T_GroupingFunc:
+			*name = "grouping";
 			return 2;
 		default:
 			break;

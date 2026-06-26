@@ -20,12 +20,16 @@
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/objectaccess.h"
+#include "catalog/oid_dispatch.h"
 #include "catalog/pg_foreign_data_wrapper.h"
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_foreign_table.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_user_mapping.h"
+#include "cdb/cdbdisp_query.h"
+#include "cdb/cdbdispatchresult.h"
+#include "cdb/cdbvars.h"
 #include "commands/defrem.h"
 #include "foreign/foreign.h"
 #include "miscadmin.h"
@@ -168,9 +172,16 @@ transformGenericOptions(Oid catalogId,
 
 	result = optionListToArray(resultOptions);
 
+	/*
+	 * Check and separate out the mpp_execute option, fdwvalidator doesn't have
+	 * to handle it. USER MAPPING doesn't have the mpp_execute option.
+	 */
+	if (catalogId != UserMappingRelationId)
+		SeparateOutMppExecute(&resultOptions);
+
 	if (OidIsValid(fdwvalidator))
 	{
-		Datum		valarg = result;
+		Datum valarg = optionListToArray(resultOptions);
 
 		/*
 		 * Pass a null options list as an empty array, so that validators
@@ -662,6 +673,14 @@ CreateForeignDataWrapper(CreateFdwStmt *stmt)
 	/* Post creation hook for new foreign data wrapper */
 	InvokeObjectPostCreateHook(ForeignDataWrapperRelationId, fdwId, 0);
 
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_WITH_SNAPSHOT | DF_CANCEL_ON_ERROR | DF_NEED_TWO_PHASE,
+									GetAssignedOidsForDispatch(),
+									NULL);
+	}
+
 	heap_close(rel, RowExclusiveLock);
 
 	return fdwId;
@@ -826,6 +845,13 @@ AlterForeignDataWrapper(AlterFdwStmt *stmt)
 		}
 	}
 
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_WITH_SNAPSHOT | DF_CANCEL_ON_ERROR | DF_NEED_TWO_PHASE,
+									GetAssignedOidsForDispatch(),
+									NULL);
+	}
 	InvokeObjectPostAlterHook(ForeignDataWrapperRelationId, fdwId, 0);
 
 	heap_close(rel, RowExclusiveLock);
@@ -965,6 +991,14 @@ CreateForeignServer(CreateForeignServerStmt *stmt)
 	/* Post creation hook for new foreign server */
 	InvokeObjectPostCreateHook(ForeignServerRelationId, srvId, 0);
 
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_WITH_SNAPSHOT | DF_CANCEL_ON_ERROR | DF_NEED_TWO_PHASE,
+									GetAssignedOidsForDispatch(),
+									NULL);
+	}
+
 	heap_close(rel, RowExclusiveLock);
 
 	return srvId;
@@ -1061,6 +1095,14 @@ AlterForeignServer(AlterForeignServerStmt *stmt)
 	InvokeObjectPostAlterHook(ForeignServerRelationId, srvId, 0);
 
 	heap_freetuple(tp);
+
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_WITH_SNAPSHOT | DF_CANCEL_ON_ERROR | DF_NEED_TWO_PHASE,
+									GetAssignedOidsForDispatch(),
+									NULL);
+	}
 
 	heap_close(rel, RowExclusiveLock);
 
@@ -1215,6 +1257,14 @@ CreateUserMapping(CreateUserMappingStmt *stmt)
 	/* Post creation hook for new user mapping */
 	InvokeObjectPostCreateHook(UserMappingRelationId, umId, 0);
 
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_WITH_SNAPSHOT | DF_CANCEL_ON_ERROR | DF_NEED_TWO_PHASE,
+									GetAssignedOidsForDispatch(),
+									NULL);
+	}
+
 	heap_close(rel, RowExclusiveLock);
 
 	return umId;
@@ -1303,6 +1353,14 @@ AlterUserMapping(AlterUserMappingStmt *stmt)
 
 	heap_freetuple(tp);
 
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_WITH_SNAPSHOT | DF_CANCEL_ON_ERROR | DF_NEED_TWO_PHASE,
+									GetAssignedOidsForDispatch(),
+									NULL);
+	}
+
 	heap_close(rel, RowExclusiveLock);
 
 	return umId;
@@ -1375,6 +1433,13 @@ RemoveUserMapping(DropUserMappingStmt *stmt)
 
 	performDeletion(&object, DROP_CASCADE, 0);
 
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_WITH_SNAPSHOT | DF_CANCEL_ON_ERROR | DF_NEED_TWO_PHASE,
+									GetAssignedOidsForDispatch(),
+									NULL);
+	}
 	return umId;
 }
 

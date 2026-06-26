@@ -16,6 +16,7 @@
 #include "postgres.h"
 
 #include "catalog/pg_proc.h"
+#include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
@@ -26,7 +27,12 @@
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
+#include "nodes/makefuncs.h"
 
+#include "catalog/pg_operator.h"
+#include "optimizer/paths.h"
+
+static const bool kUseFnEvaluationForPredicates = true;
 
 /*
  * Proof attempts involving large arrays in ScalarArrayOpExpr nodes are
@@ -100,6 +106,8 @@ static bool btree_predicate_proof(Expr *predicate, Node *clause,
 static Oid	get_btree_test_op(Oid pred_op, Oid clause_op, bool refute_it);
 static void InvalidateOprProofCacheCallBack(Datum arg, int cacheid, uint32 hashvalue);
 
+
+static bool simple_equality_predicate_refuted(Node *clause, Node *predicate);
 
 /*
  * predicate_implied_by
@@ -205,7 +213,12 @@ predicate_refuted_by(List *predicate_list, List *restrictinfo_list)
 		r = (Node *) restrictinfo_list;
 
 	/* And away we go ... */
-	return predicate_refuted_by_recurse(r, p);
+	if ( predicate_refuted_by_recurse(r, p))
+        return true;
+
+    if ( ! kUseFnEvaluationForPredicates )
+        return false;
+    return simple_equality_predicate_refuted((Node*)restrictinfo_list, (Node*)predicate_list);
 }
 
 /*----------
@@ -481,6 +494,8 @@ predicate_refuted_by_recurse(Node *clause, Node *predicate)
 	PredClass	pclass;
 	Node	   *not_arg;
 	bool		result;
+
+	CHECK_FOR_INTERRUPTS();
 
 	/* skip through RestrictInfo */
 	Assert(clause != NULL);
@@ -1152,6 +1167,170 @@ predicate_refuted_by_simple_clause(Expr *predicate, Node *clause)
 	return btree_predicate_proof(predicate, clause, true);
 }
 
+/**
+ * If n is a List, then return an AND tree of the nodes of the list
+ * Otherwise return n.
+ */
+static Node *
+convertToExplicitAndsShallowly( Node *n)
+{
+    if ( IsA(n, List))
+    {
+        ListCell *cell;
+        List *list = (List*)n;
+        Node *result = NULL;
+
+        Assert(list_length(list) != 0 );
+
+        foreach( cell, list )
+        {
+            Node *value = (Node*) lfirst(cell);
+            if ( result == NULL)
+            {
+                result = value;
+            }
+            else
+            {
+                result = (Node *) makeBoolExpr(AND_EXPR, list_make2(result, value), -1 /* parse location */);
+            }
+        }
+        return result;
+    }
+    else return n;
+}
+
+/**
+ * Check to see if the predicate is expr=constant or constant=expr. In that case, try to evaluate the clause
+ *   by replacing every occurrence of expr with the constant.  If the clause can then be reduced to FALSE, we
+ *   conclude that the expression is refuted
+ *
+ * Returns true only if evaluation is possible AND expression is refuted based on evaluation results
+ *
+ * MPP-18979:
+ * This mechanism cannot be used to prove implication. One example expression is
+ * "F(x)=1 and x=2", where F(x) is an immutable function that returns 1 for any input x.
+ * In this case, replacing x with 2 produces F(2)=1 and 2=2. Although evaluating the resulting
+ * expression gives TRUE, we cannot conclude that (x=2) is implied by the whole expression.
+ *
+ */
+static bool
+simple_equality_predicate_refuted(Node *clause, Node *predicate)
+{
+	OpExpr *predicateExpr;
+	Node *leftPredicateOp, *rightPredicateOp;
+    Node *constExprInPredicate, *varExprInPredicate;
+	List *list;
+
+    /* BEGIN inspecting the predicate: this only works for a simple equality predicate */
+    if ( nodeTag(predicate) != T_List )
+        return false;
+
+    if ( clause == predicate )
+        return false; /* don't both doing for self-refutation ... let normal behavior handle that */
+
+    list = (List *) predicate;
+    if ( list_length(list) != 1 )
+        return false;
+
+    predicate = linitial(list);
+	if ( ! is_opclause(predicate))
+		return false;
+
+	predicateExpr = (OpExpr*) predicate;
+	leftPredicateOp = get_leftop((Expr*)predicate);
+	rightPredicateOp = get_rightop((Expr*)predicate);
+	if (!leftPredicateOp || !rightPredicateOp)
+		return false;
+
+	/* check if it's equality operation */
+	if ( ! is_builtin_true_equality_between_same_type(predicateExpr->opno))
+		return false;
+
+	/* check if one operand is a constant */
+	if ( IsA(rightPredicateOp, Const))
+	{
+		varExprInPredicate = leftPredicateOp;
+		constExprInPredicate = rightPredicateOp;
+	}
+	else if ( IsA(leftPredicateOp, Const))
+	{
+		constExprInPredicate = leftPredicateOp;
+		varExprInPredicate = rightPredicateOp;
+	}
+	else
+	{
+	    return false;
+	}
+
+    if ( IsA(varExprInPredicate, RelabelType))
+    {
+        RelabelType *rt = (RelabelType*) varExprInPredicate;
+        varExprInPredicate = (Node*) rt->arg;
+    }
+
+    if ( ! IsA(varExprInPredicate, Var))
+    {
+        /* for now, this code is targeting predicates used in value partitions ...
+         *   so don't apply it for other expressions.  This check can probably
+         *   simply be removed and some test cases built. */
+        return false;
+    }
+
+    /* DONE inspecting the predicate */
+
+	/* clause may have non-immutable functions...don't eval if that's the case:
+	 *
+	 * Note that since we are replacing elements of the clause that match
+	 *   varExprInPredicate, there is no need to also check varExprInPredicate
+	 *   for mutable functions (note that this is only relevant when the
+	 *   earlier check for varExprInPredicate being a Var is removed.
+	 */
+	if ( contain_mutable_functions(clause))
+		return false;
+
+	/* now do the evaluation */
+	{
+		Node *newClause, *reducedExpression;
+		ReplaceExpressionMutatorReplacement replacement;
+		bool				result = false;
+		MemoryContext 		old_context;
+		MemoryContext		tmp_context;
+
+		replacement.replaceThis = varExprInPredicate;
+		replacement.withThis = constExprInPredicate;
+        replacement.numReplacementsDone = 0;
+
+		tmp_context = AllocSetContextCreate(CurrentMemoryContext,
+											"Predtest",
+											ALLOCSET_DEFAULT_MINSIZE,
+											ALLOCSET_DEFAULT_INITSIZE,
+											ALLOCSET_DEFAULT_MAXSIZE);
+
+		old_context = MemoryContextSwitchTo(tmp_context);
+
+		newClause = replace_expression_mutator(clause, &replacement);
+
+        if ( replacement.numReplacementsDone > 0)
+        {
+            newClause = convertToExplicitAndsShallowly(newClause);
+            reducedExpression = eval_const_expressions(NULL, newClause);
+
+            if ( IsA(reducedExpression, Const ))
+            {
+                Const *c = (Const *) reducedExpression;
+                if ( c->consttype == BOOLOID &&
+                     ! c->constisnull )
+                {
+                	result = (DatumGetBool(c->constvalue) == false);
+                }
+            }
+        }
+
+		MemoryContextSwitchTo(old_context);
+		MemoryContextDelete(tmp_context);
+        return result;
+	}
+}
 
 /*
  * If clause asserts the non-truth of a subclause, return that subclause;
@@ -1750,4 +1929,129 @@ InvalidateOprProofCacheCallBack(Datum arg, int cacheid, uint32 hashvalue)
 		hentry->have_implic = false;
 		hentry->have_refute = false;
 	}
+}
+
+/**
+ * Process an AND clause -- this can do a INTERSECTION between sets learned from child clauses
+ */
+static PossibleValueSet
+ProcessAndClauseForPossibleValues( PredIterInfoData *clauseInfo, Node *clause, Node *variable)
+{
+	PossibleValueSet result;
+
+	InitPossibleValueSetData(&result);
+
+	iterate_begin(child, clause, *clauseInfo)
+	{
+		PossibleValueSet childPossible = DeterminePossibleValueSet( child, variable );
+		if ( childPossible.isAnyValuePossible)
+		{
+			/* any value possible, this AND member does not add any information */
+			DeletePossibleValueSetData( &childPossible);
+		}
+		else
+		{
+			/* a particular set so this AND member can refine our estimate */
+			if ( result.isAnyValuePossible )
+			{
+				/* current result was not informative so just take the child */
+				result = childPossible;
+			}
+			else
+			{
+				/* result.set AND childPossible.set: do intersection inside result */
+				RemoveUnmatchingValues( &result, &childPossible );
+				DeletePossibleValueSetData( &childPossible);
+			}
+		}
+	}
+	iterate_end(*clauseInfo);
+
+	return result;
+}
+
+/**
+ * Process an OR clause -- this can do a UNION between sets learned from child clauses
+ */
+static PossibleValueSet
+ProcessOrClauseForPossibleValues( PredIterInfoData *clauseInfo, Node *clause, Node *variable)
+{
+	PossibleValueSet result;
+	InitPossibleValueSetData(&result);
+
+	iterate_begin(child, clause, *clauseInfo)
+	{
+		PossibleValueSet childPossible = DeterminePossibleValueSet( child, variable );
+		if ( childPossible.isAnyValuePossible)
+		{
+			/* any value is possible for the entire AND */
+			DeletePossibleValueSetData( &childPossible );
+			DeletePossibleValueSetData( &result );
+
+			/* it can't improve once a part of the OR accepts all, so just quit */
+			result.isAnyValuePossible = true;
+			break;
+		}
+
+		if ( result.isAnyValuePossible )
+		{
+			/* first one in loop so just take it */
+			result = childPossible;
+		}
+		else
+		{
+			/* result.set OR childPossible.set --> do union into result */
+			AddUnmatchingValues( &result, &childPossible );
+			DeletePossibleValueSetData( &childPossible);
+		}
+	}
+	iterate_end(*clauseInfo);
+
+	return result;
+}
+
+
+/**
+ *
+ * Get the possible values of variable, as determined by the given qualification clause
+ *
+ * Note that only variables whose type is greenplumDbHashtable will return an actual finite set of values.  All others
+ *    will go to the default behavior -- return that any value is possible
+ *
+ * Note that if there are two variables to check, you must call this twice.  This then means that
+ *    if the two variables are dependent you won't learn of that -- you only know that the set of
+ *    possible values is within the cross-product of the two variables' sets
+ */
+PossibleValueSet
+DeterminePossibleValueSet(Node *clause, Node *variable)
+{
+	PredIterInfoData clauseInfo;
+	PossibleValueSet result;
+
+	if ( clause == NULL )
+	{
+		InitPossibleValueSetData(&result);
+		return result;
+	}
+
+	switch (predicate_classify(clause, &clauseInfo))
+	{
+		case CLASS_AND:
+			return ProcessAndClauseForPossibleValues(&clauseInfo, clause, variable);
+		case CLASS_OR:
+			return ProcessOrClauseForPossibleValues(&clauseInfo, clause, variable);
+		case CLASS_ATOM:
+			if (TryProcessExprForPossibleValues(clause, variable, &result))
+			{
+				return result;
+			}
+			/* can't infer anything, so return that any value is possible */
+			InitPossibleValueSetData(&result);
+			return result;
+	}
+
+
+	/* can't get here */
+	elog(ERROR, "predicate_classify returned a bad value");
+	return result;
 }

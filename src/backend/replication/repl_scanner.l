@@ -85,6 +85,7 @@ FAST			{ return K_FAST; }
 IDENTIFY_SYSTEM		{ return K_IDENTIFY_SYSTEM; }
 LABEL			{ return K_LABEL; }
 NOWAIT			{ return K_NOWAIT; }
+EXCLUDE			{ return K_EXCLUDE; }
 PROGRESS			{ return K_PROGRESS; }
 MAX_RATE		{ return K_MAX_RATE; }
 WAL			{ return K_WAL; }

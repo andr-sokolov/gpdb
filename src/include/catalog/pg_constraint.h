@@ -22,6 +22,7 @@
 #include "catalog/genbki.h"
 #include "catalog/dependency.h"
 #include "nodes/pg_list.h"
+#include "access/attnum.h"
 
 /* ----------------
  *		pg_constraint definition.  cpp turns this into
@@ -141,6 +142,12 @@ CATALOG(pg_constraint,2606)
 #endif
 } FormData_pg_constraint;
 
+/* GPDB added foreign key definitions for gpcheckcat. */
+FOREIGN_KEY(connamespace REFERENCES pg_namespace(oid));
+FOREIGN_KEY(conrelid REFERENCES pg_class(oid));
+FOREIGN_KEY(contypid REFERENCES pg_type(oid));
+FOREIGN_KEY(confrelid REFERENCES pg_class(oid));
+
 /* ----------------
  *		Form_pg_constraint corresponds to a pointer to a tuple with
  *		the format of pg_constraint relation.
@@ -245,11 +252,21 @@ extern char *ChooseConstraintName(const char *name1, const char *name2,
 					 const char *label, Oid namespaceid,
 					 List *others);
 
+extern char * GetConstraintNameByOid(Oid constraintId);
+
 extern void AlterConstraintNamespaces(Oid ownerId, Oid oldNspId,
 					  Oid newNspId, bool isType, ObjectAddresses *objsMoved);
+extern void ConstraintSetParentConstraint(Oid childConstrId,
+							  Oid parentConstrId);
+/**
+ * Identify primary key column from foreign key column.
+ */
+extern bool ConstraintGetPrimaryKeyOf(Oid relid, AttrNumber attno, 
+					Oid *pkrelid, AttrNumber *pkattno);
 extern void get_constraint_relation_oids(Oid constraint_oid, Oid *conrelid, Oid *confrelid);
 extern Oid	get_relation_constraint_oid(Oid relid, const char *conname, bool missing_ok);
 extern Oid	get_domain_constraint_oid(Oid typid, const char *conname, bool missing_ok);
+extern Oid	get_relation_idx_constraint_oid(Oid relationId, Oid indexId);
 
 extern bool check_functional_grouping(Oid relid,
 						  Index varno, Index varlevelsup,

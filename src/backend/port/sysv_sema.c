@@ -27,6 +27,7 @@
 #include "miscadmin.h"
 #include "storage/ipc.h"
 #include "storage/pg_sema.h"
+#include "utils/guc.h"
 
 
 #ifndef HAVE_UNION_SEMUN
@@ -423,7 +424,34 @@ PGSemaphoreLock(PGSemaphore sema, bool interruptOK)
 	} while (errStatus < 0 && errno == EINTR);
 
 	if (errStatus < 0)
-		elog(FATAL, "semop(id=%d) failed: %m", sema->semId);
+		elog(FATAL, "semop(id=%d,num=%d) failed: %m", sema->semId, sema->semNum);
+}
+
+/*
+ * PGSemaphoreLockInterruptable
+ *
+ * Lock a semaphore (decrement count), blocking if count would be < 0.
+ * Return true if the lock obtained or false if an interrupt occurred.
+ */
+bool
+PGSemaphoreLockInterruptable(PGSemaphore sema)
+{
+	int			errStatus;
+	struct sembuf sops;
+
+	sops.sem_op = -1;			/* decrement */
+	sops.sem_flg = 0;
+	sops.sem_num = sema->semNum;
+
+	errStatus = semop(sema->semId, &sops, 1);
+	if (errStatus < 0)
+	{
+		if (errno == EINTR)
+			return false;
+		elog(FATAL, "semop(id=%d,num=%d) failed: %m", sema->semId, sema->semNum);
+	}
+
+	return true;
 }
 
 /*
@@ -453,7 +481,7 @@ PGSemaphoreUnlock(PGSemaphore sema)
 	} while (errStatus < 0 && errno == EINTR);
 
 	if (errStatus < 0)
-		elog(FATAL, "semop(id=%d) failed: %m", sema->semId);
+		elog(FATAL, "semop(id=%d,num=%d) failed: %m", sema->semId, sema->semNum);
 }
 
 /*
@@ -493,7 +521,7 @@ PGSemaphoreTryLock(PGSemaphore sema)
 			return false;		/* failed to lock it */
 #endif
 		/* Otherwise we got trouble */
-		elog(FATAL, "semop(id=%d) failed: %m", sema->semId);
+		elog(FATAL, "semop(id=%d,num=%d) failed: %m", sema->semId, sema->semNum);
 	}
 
 	return true;

@@ -65,12 +65,17 @@
 
 #include "postgres.h"
 
+#ifdef MPROTECT_BUFFERS
+#include <unistd.h>
+#endif
+
 #include "access/transam.h"
 #include "miscadmin.h"
 #include "storage/lwlock.h"
 #include "storage/pg_shmem.h"
 #include "storage/shmem.h"
 #include "storage/spin.h"
+#include <unistd.h>
 
 
 /* shared memory global variables */
@@ -86,6 +91,7 @@ slock_t    *ShmemLock;			/* spinlock for shared memory and LWLock
 
 static HTAB *ShmemIndex = NULL; /* primary index hashtable for shmem */
 
+static int ShmemSystemPageSize = 0;   /* system's page size */
 
 /*
  *	InitShmemAccess() --- set up basic pointers to shared memory.
@@ -115,6 +121,18 @@ InitShmemAllocation(void)
 
 	Assert(shmhdr != NULL);
 
+#ifdef WIN32
+    ShmemSystemPageSize = 4096;  /* Need a way to get this on Win32 */
+#else
+	ShmemSystemPageSize = sysconf(_SC_PAGESIZE);
+#endif
+	if ( ShmemSystemPageSize <= 1 ||
+		(ShmemSystemPageSize & ( ShmemSystemPageSize - 1)))  // checks for power of 2
+	{
+		ereport(ERROR,
+			(errcode(ERRCODE_INTERNAL_ERROR),
+			errmsg("invalid page size %d; must be a power of two and not an error", ShmemSystemPageSize)));
+	}
 	/*
 	 * If spinlocks are disabled, initialize emulation layer.  We have to do
 	 * the space allocation the hard way, since obviously ShmemAlloc can't be
@@ -184,9 +202,15 @@ ShmemAlloc(Size size)
 
 	newStart = shmemseghdr->freeoffset;
 
-	/* extra alignment for large requests, since they are probably buffers */
+	/*
+	 * Extra alignment for large requests, since they are probably buffers.
+	 * This is also needed for mprotect based shared buffer debugging
+	 * (-DMPROTECT_BUFFERS).
+	 */
 	if (size >= BLCKSZ)
-		newStart = BUFFERALIGN(newStart);
+	{
+		newStart =  TYPEALIGN(ShmemSystemPageSize, newStart);
+	}
 
 	newFree = newStart + size;
 	if (newFree <= shmemseghdr->totalsize)

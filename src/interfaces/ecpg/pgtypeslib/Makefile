@@ -17,6 +17,11 @@ NAME= pgtypes
 SO_MAJOR_VERSION= 3
 SO_MINOR_VERSION= 5
 
+# The frontend doesn't need everything that's in LIBS, some are backend only
+LIBS := $(filter-out -lresolv -lbz2, $(LIBS))
+# This program isn't interactive, so doesn't need these
+LIBS := $(filter-out -lreadline -ledit -ltermcap -lncurses -lcurses -lcurl -lssl -lcrypto -lz, $(LIBS))
+
 override CPPFLAGS := -I../include -I$(top_srcdir)/src/interfaces/ecpg/include \
 	-I$(top_srcdir)/src/include/utils -I$(libpq_srcdir) -DFRONTEND $(CPPFLAGS)
 override CFLAGS += $(PTHREAD_CFLAGS)
