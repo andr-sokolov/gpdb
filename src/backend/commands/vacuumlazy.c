@@ -42,6 +42,7 @@
 #include "access/heapam_xlog.h"
 #include "access/htup_details.h"
 #include "access/multixact.h"
+#include "access/nbtree.h"
 #include "access/transam.h"
 #include "access/visibilitymap.h"
 #include "catalog/catalog.h"
@@ -61,6 +62,10 @@
 #include "utils/timestamp.h"
 #include "utils/tqual.h"
 
+#include "catalog/pg_namespace.h"
+#include "cdb/cdbvars.h"
+#include "storage/smgr.h"
+#include "utils/snapmgr.h"
 
 /*
  * Space/time tradeoff parameters: do these need to be user-tunable?
@@ -204,6 +209,10 @@ lazy_vacuum_rel(Relation onerel, VacuumStmt *vacstmt,
 	else
 		elevel = DEBUG2;
 
+	if (Gp_role == GP_ROLE_DISPATCH)
+		elevel = DEBUG2; /* vacuum and analyze messages aren't interesting from the QD */
+
+	/* Update xid limits for heap relations. */
 	vac_strategy = bstrategy;
 
 	vacuum_set_xid_limits(onerel,
@@ -315,7 +324,8 @@ lazy_vacuum_rel(Relation onerel, VacuumStmt *vacstmt,
 						vacrelstats->hasindex,
 						new_frozen_xid,
 						new_min_multi,
-						false);
+						false,
+						true /* isvacuum */);
 
 	/* report results to the stats collector, too */
 	new_live_tuples = new_rel_tuples - vacrelstats->new_dead_tuples;
@@ -326,6 +336,19 @@ lazy_vacuum_rel(Relation onerel, VacuumStmt *vacstmt,
 						 onerel->rd_rel->relisshared,
 						 new_live_tuples,
 						 vacrelstats->new_dead_tuples);
+
+	if (gp_indexcheck_vacuum == INDEX_CHECK_ALL ||
+		(gp_indexcheck_vacuum == INDEX_CHECK_SYSTEM &&
+		 PG_CATALOG_NAMESPACE == RelationGetNamespace(onerel)))
+	{
+		int			i;
+
+		for (i = 0; i < nindexes; i++)
+		{
+			if (Irel[i]->rd_rel->relam == BTREE_AM_OID)
+				_bt_validate_vacuum(Irel[i], onerel, OldestXmin);
+		}
+	}
 
 	/* and log the action if appropriate */
 	if (IsAutoVacuumWorkerProcess() && Log_autovacuum_min_duration >= 0)
@@ -801,11 +824,13 @@ lazy_scan_heap(Relation onerel, LVRelStats *vacrelstats,
 
 			tuple.t_data = (HeapTupleHeader) PageGetItem(page, itemid);
 			tuple.t_len = ItemIdGetLength(itemid);
+#if 0
 			tuple.t_tableOid = RelationGetRelid(onerel);
+#endif
 
 			tupgone = false;
 
-			switch (HeapTupleSatisfiesVacuum(&tuple, OldestXmin, buf))
+			switch (HeapTupleSatisfiesVacuum(onerel, &tuple, OldestXmin, buf))
 			{
 				case HEAPTUPLE_DEAD:
 
@@ -1059,6 +1084,9 @@ lazy_scan_heap(Relation onerel, LVRelStats *vacrelstats,
 		 */
 		if (vacrelstats->num_dead_tuples == prev_dead_count)
 			RecordPageWithFreeSpace(onerel, blkno, freespace);
+
+		if (RelationNeedsWAL(onerel))
+			wait_to_avoid_large_repl_lag();
 	}
 
 	pfree(frozen);
@@ -1397,7 +1425,8 @@ lazy_cleanup_index(Relation indrel,
 							false,
 							InvalidTransactionId,
 							InvalidMultiXactId,
-							false);
+							false,
+							true /* isvacuum */);
 
 	ereport(elevel,
 			(errmsg("index \"%s\" now contains %.0f row versions in %u pages",
@@ -1811,9 +1840,11 @@ heap_page_is_all_visible(Relation rel, Buffer buf, TransactionId *visibility_cut
 
 		tuple.t_data = (HeapTupleHeader) PageGetItem(page, itemid);
 		tuple.t_len = ItemIdGetLength(itemid);
+#if 0
 		tuple.t_tableOid = RelationGetRelid(rel);
+#endif
 
-		switch (HeapTupleSatisfiesVacuum(&tuple, OldestXmin, buf))
+		switch (HeapTupleSatisfiesVacuum(rel, &tuple, OldestXmin, buf))
 		{
 			case HEAPTUPLE_LIVE:
 				{

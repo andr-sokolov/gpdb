@@ -3,6 +3,8 @@
  * buffile.c
  *	  Management of large buffered files, primarily temporary files.
  *
+ * Portions Copyright (c) 2007-2008, Greenplum inc
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -31,45 +33,62 @@
  * BufFile also supports temporary files that exceed the OS file size limit
  * (by opening multiple fd.c temporary files).  This is an essential feature
  * for sorts and hashjoins on large amounts of data.
+ *
+ * GPDB:
+ *
+ * The purpose of BufFiles is the same in GPDB as in PostgreSQL, but the
+ * implementation has been changed somewhat:
+ *
+ * - PostgreSQL breaks the files into 1 GB segments. We don't do that in
+ *   GPDB. The 'fileno' argument in BufFileSeek/tell is unused.
+ *
+ * - There is an additional concept of "work files", and tracking their
+ *   sizes by the "workfile manager". Work file is another name for
+ *   a temporary file, but we track their sizes in shared memory, and
+ *   enforce additional limits. Buffile code (and fd.c) has been modified
+ *   to for the tracking.
+ *
+ * - The buffer management works slightly differently. It's not visible
+ *   to callers, but ought to perform better.
+ *
+ * - We support compressing the files, with some limitations. See
+ *   BufFilePledgeSequential().
+ *
  *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
 
+#ifdef HAVE_LIBZSTD
+#include <zstd.h>
+#endif
+
+#include "commands/tablespace.h"
 #include "executor/instrument.h"
 #include "storage/fd.h"
 #include "storage/buffile.h"
 #include "storage/buf_internals.h"
 #include "utils/resowner.h"
 
-/*
- * We break BufFiles into gigabyte-sized segments, regardless of RELSEG_SIZE.
- * The reason is that we'd like large temporary BufFiles to be spread across
- * multiple tablespaces when available.
- */
-#define MAX_PHYSICAL_FILESIZE	0x40000000
-#define BUFFILE_SEG_SIZE		(MAX_PHYSICAL_FILESIZE / BLCKSZ)
+#include "cdb/cdbvars.h"
+#include "storage/gp_compress.h"
+#include "utils/memutils.h"
+#include "utils/workfile_mgr.h"
 
 /*
- * This data structure represents a buffered file that consists of one or
- * more physical files (each accessed through a virtual file descriptor
+ * This data structure represents a buffered file that consists of one
+ * physical file (accessed through a virtual file descriptor
  * managed by fd.c).
  */
 struct BufFile
 {
-	int			numFiles;		/* number of physical files in set */
-	/* all files except the last have length exactly MAX_PHYSICAL_FILESIZE */
-	File	   *files;			/* palloc'd array with numFiles entries */
-	off_t	   *offsets;		/* palloc'd array with numFiles entries */
-
-	/*
-	 * offsets[i] is the current seek position of files[i].  We use this to
-	 * avoid making redundant FileSeek calls.
-	 */
+	File		file;			/* palloc'd file */
 
 	bool		isTemp;			/* can only add files if this is TRUE */
-	bool		isInterXact;	/* keep open over transactions? */
 	bool		dirty;			/* does buffer need to be written? */
+
+	int64		offset;			/* offset part of current pos */
+	int64		pos;			/* next read/write position in buffer */
 
 	/*
 	 * resowner is the ResourceOwner to use for underlying temp files.  (We
@@ -78,82 +97,137 @@ struct BufFile
 	 */
 	ResourceOwner resowner;
 
-	/*
-	 * "current pos" is position of start of buffer within the logical file.
-	 * Position as seen by user of BufFile is (curFile, curOffset + pos).
-	 */
-	int			curFile;		/* file index (0..n) part of current pos */
-	off_t		curOffset;		/* offset part of current pos */
-	int			pos;			/* next read/write position in buffer */
 	int			nbytes;			/* total # of valid bytes in buffer */
-	PGAlignedBlock buffer;
+	int64		maxoffset;		/* maximum offset that this file has reached, for disk usage */
+
+	char        *buffer;        /* GPDB: PG upstream uses PGAlignedBlock */
+
+	/*
+	 * Current stage, if this is a sequential BufFile. A sequential BufFile
+	 * can be written to once, and read once after that. Without compression,
+	 * there is no real difference between sequential and random access
+	 * buffiles, but we enforce the limitations anyway, to uncover possible
+	 * bugs in sequential BufFile usage earlier.
+	 */
+	enum
+	{
+		BFS_RANDOM_ACCESS = 0,
+		BFS_SEQUENTIAL_WRITING,
+		BFS_SEQUENTIAL_READING,
+		BFS_COMPRESSED_WRITING,
+		BFS_COMPRESSED_READING
+	} state;
+
+	/* ZStandard compression support */
+#ifdef HAVE_LIBZSTD
+	zstd_context *zstd_context;	/* ZStandard library handles. */
+
+	/*
+	 * During compression, tracks of the original, uncompressed size. (maxoffset
+	 * trackes the compressed size.
+	 */
+	size_t		uncompressed_bytes;
+
+	/* This holds holds compressed input, during decompression. */
+	ZSTD_inBuffer compressed_buffer;
+	bool		decompression_finished;
+#endif
 };
 
 static BufFile *makeBufFile(File firstfile);
-static void extendBufFile(BufFile *file);
-static void BufFileLoadBuffer(BufFile *file);
-static void BufFileDumpBuffer(BufFile *file);
-static int	BufFileFlush(BufFile *file);
+static void BufFileUpdateSize(BufFile *buffile);
+
+static void BufFileStartCompression(BufFile *file);
+static void BufFileDumpCompressedBuffer(BufFile *file, const void *buffer, Size nbytes);
+static void BufFileEndCompression(BufFile *file);
+static int BufFileLoadCompressedBuffer(BufFile *file, void *buffer, size_t bufsize);
 
 
 /*
  * Create a BufFile given the first underlying physical file.
- * NOTE: caller must set isTemp and isInterXact if appropriate.
+ * NOTE: caller must set isTemp if appropriate.
  */
 static BufFile *
 makeBufFile(File firstfile)
 {
-	BufFile    *file = (BufFile *) palloc(sizeof(BufFile));
+	BufFile	   *file = (BufFile *) palloc0(sizeof(BufFile));
 
-	file->numFiles = 1;
-	file->files = (File *) palloc(sizeof(File));
-	file->files[0] = firstfile;
-	file->offsets = (off_t *) palloc(sizeof(off_t));
-	file->offsets[0] = 0L;
+	file->file = firstfile;
+
 	file->isTemp = false;
-	file->isInterXact = false;
 	file->dirty = false;
+	/*
+	 * "current pos" is a position of start of buffer within the logical file.
+	 * Position as seen by user of Buffile is (offset+pos).
+	 * */
+	file->offset = 0L;
 	file->resowner = CurrentResourceOwner;
-	file->curFile = 0;
-	file->curOffset = 0L;
 	file->pos = 0;
 	file->nbytes = 0;
+	file->maxoffset = 0L;
+	file->buffer = palloc(BLCKSZ);
 
 	return file;
 }
 
+
 /*
- * Add another component temp file.
+ * Create a BufFile for a new temporary file.
+ *
+ * Adds the pgsql_tmp/ prefix to the file path before creating.
+ *
+ * Note: if interXact is true, the caller had better be calling us in a
+ * memory context that will survive across transaction boundaries.
+ *
+ * A unique filename will be chosen.
  */
-static void
-extendBufFile(BufFile *file)
+BufFile *
+BufFileCreateTemp(char *operation_name, bool interXact)
 {
-	File		pfile;
-	ResourceOwner oldowner;
+	workfile_set *work_set;
 
-	/* Be sure to associate the file with the BufFile's resource owner */
-	oldowner = CurrentResourceOwner;
-	CurrentResourceOwner = file->resowner;
+	work_set = workfile_mgr_create_set(operation_name, NULL, false /* hold pin */);
 
-	Assert(file->isTemp);
-	pfile = OpenTemporaryFile(file->isInterXact);
-	Assert(pfile >= 0);
-
-	CurrentResourceOwner = oldowner;
-
-	file->files = (File *) repalloc(file->files,
-									(file->numFiles + 1) * sizeof(File));
-	file->offsets = (off_t *) repalloc(file->offsets,
-									   (file->numFiles + 1) * sizeof(off_t));
-	file->files[file->numFiles] = pfile;
-	file->offsets[file->numFiles] = 0L;
-	file->numFiles++;
+	return BufFileCreateTempInSet(work_set, interXact);
 }
 
+
+BufFile *
+BufFileCreateTempInSet(workfile_set *work_set, bool interXact)
+{
+	BufFile	   *file;
+	File		pfile;
+	char		filePrefix[MAXPGPATH];
+
+	snprintf(filePrefix, MAXPGPATH, "_%s_", work_set->prefix);
+
+	/*
+	 * Ensure that temp tablespaces are set up for OpenTemporaryFile to use.
+	 * Possibly the caller will have done this already, but it seems useful to
+	 * double-check here.  Failure to do this at all would result in the temp
+	 * files always getting placed in the default tablespace, which is a
+	 * pretty hard-to-detect bug.  Callers may prefer to do it earlier if they
+	 * want to be sure that any required catalog access is done in some other
+	 * resource context.
+	 */
+	PrepareTempTablespaces();
+	pfile = OpenTemporaryFile(interXact, filePrefix);
+	Assert(pfile >= 0);
+
+	file = makeBufFile(pfile);
+	file->isTemp = true;
+
+	FileSetIsWorkfile(file->file);
+	RegisterFileWithSet(file->file, work_set);
+
+	return file;
+}
+
+
 /*
- * Create a BufFile for a new temporary file (which will expand to become
- * multiple temporary files if more than MAX_PHYSICAL_FILESIZE bytes are
- * written to it).
+ * Create a BufFile for a new file.
+ *
+ * Adds the pgsql_tmp/ prefix to the file path before creating.
  *
  * If interXact is true, the temp file will not be automatically deleted
  * at end of transaction.
@@ -161,37 +235,89 @@ extendBufFile(BufFile *file)
  * Note: if interXact is true, the caller had better be calling us in a
  * memory context, and with a resource owner, that will survive across
  * transaction boundaries.
+ *
+ * This variant creates the file with the exact given name. The caller
+ * must ensure that it's unique. If 'work_set' is given, the file is
+ * associated with that workfile set. Otherwise, it is not tracked
+ * by the workfile manager.
  */
 BufFile *
-BufFileCreateTemp(bool interXact)
+BufFileCreateNamedTemp(const char *fileName, bool interXact, workfile_set *work_set)
 {
-	BufFile    *file;
 	File		pfile;
+	BufFile	   *file;
 
-	pfile = OpenTemporaryFile(interXact);
+	/*
+	 * Ensure that temp tablespaces are set up for OpenNamedTemporaryFile to use.
+	 * Possibly the caller will have done this already, but it seems useful to
+	 * double-check here.  Failure to do this at all would result in the temp
+	 * files always getting placed in the default tablespace, which is a
+	 * pretty hard-to-detect bug.  Callers may prefer to do it earlier if they
+	 * want to be sure that any required catalog access is done in some other
+	 * resource context.
+	 */
+	PrepareTempTablespaces();
+
+	pfile = OpenNamedTemporaryFile(fileName,
+								   true, /* create */
+								   true, /* delOnClose */
+								   interXact);
 	Assert(pfile >= 0);
 
 	file = makeBufFile(pfile);
 	file->isTemp = true;
-	file->isInterXact = interXact;
+
+	if (work_set)
+	{
+		FileSetIsWorkfile(file->file);
+		RegisterFileWithSet(file->file, work_set);
+	}
 
 	return file;
 }
 
-#ifdef NOT_USED
 /*
- * Create a BufFile and attach it to an already-opened virtual File.
+ * Opens an existing file as BufFile
  *
- * This is comparable to fdopen() in stdio.  This is the only way at present
- * to attach a BufFile to a non-temporary file.  Note that BufFiles created
- * in this way CANNOT be expanded into multiple files.
+ * Adds the pgsql_tmp/ prefix to the file path before opening.
  */
 BufFile *
-BufFileCreate(File file)
+BufFileOpenNamedTemp(const char *fileName, bool interXact)
 {
-	return makeBufFile(file);
+	File		pfile;
+	BufFile	   *file;
+
+	/*
+	 * Ensure that temp tablespaces are set up for OpenNamedTemporaryFile to use.
+	 * Possibly the caller will have done this already, but it seems useful to
+	 * double-check here.  Failure to do this at all would result in the temp
+	 * files always getting placed in the default tablespace, which is a
+	 * pretty hard-to-detect bug.  Callers may prefer to do it earlier if they
+	 * want to be sure that any required catalog access is done in some other
+	 * resource context.
+	 */
+	PrepareTempTablespaces();
+	pfile = OpenNamedTemporaryFile(fileName,
+								   false,	/* create */
+								   false,	/* delOnClose */
+								   interXact);
+	/*
+	 * If we are trying to open an existing file and it failed,
+	 * signal this to the caller.
+	 */
+	if (pfile <= 0)
+		return NULL;
+
+	Assert(pfile >= 0);
+
+	file = makeBufFile(pfile);
+	file->isTemp = false;
+
+	/* Open existing file, initialize its size */
+	file->maxoffset = FileDiskSize(file->file);
+
+	return file;
 }
-#endif
 
 /*
  * Close a BufFile
@@ -201,17 +327,37 @@ BufFileCreate(File file)
 void
 BufFileClose(BufFile *file)
 {
-	int			i;
-
 	/* flush any unwritten data */
-	BufFileFlush(file);
-	/* close the underlying file(s) (with delete if it's a temp file) */
-	for (i = 0; i < file->numFiles; i++)
-		FileClose(file->files[i]);
+	if (!file->isTemp)
+	{
+		/* This can thrown an exception */
+		BufFileFlush(file);
+	}
+
+	FileClose(file->file);
+
 	/* release the buffer space */
-	pfree(file->files);
-	pfree(file->offsets);
+	if (file->buffer)
+		pfree(file->buffer);
+
+	/* release zstd handles */
+#ifdef HAVE_LIBZSTD
+	if (file->zstd_context)
+		zstd_free_context(file->zstd_context);
+#endif
+
 	pfree(file);
+}
+
+/*
+ * BufFileSetIsTempFile
+ *
+ * Set the file of BufFile is temp file or not
+ */
+void 
+BufFileSetIsTempFile(BufFile *file, bool isTempFile)
+{
+	FileSetIsTempFile(file->file, isTempFile);
 }
 
 /*
@@ -221,46 +367,33 @@ BufFileClose(BufFile *file)
  * At call, must have dirty = false, pos and nbytes = 0.
  * On exit, nbytes is number of bytes loaded.
  */
-static void
-BufFileLoadBuffer(BufFile *file)
+static int
+BufFileLoadBuffer(BufFile *file, void* buffer, size_t bufsize)
 {
-	File		thisfile;
-
-	/*
-	 * Advance to next component file if necessary and possible.
-	 *
-	 * This path can only be taken if there is more than one component, so it
-	 * won't interfere with reading a non-temp file that is over
-	 * MAX_PHYSICAL_FILESIZE.
-	 */
-	if (file->curOffset >= MAX_PHYSICAL_FILESIZE &&
-		file->curFile + 1 < file->numFiles)
-	{
-		file->curFile++;
-		file->curOffset = 0L;
-	}
+	int			nb;
 
 	/*
 	 * May need to reposition physical file.
 	 */
-	thisfile = file->files[file->curFile];
-	if (file->curOffset != file->offsets[file->curFile])
+	if (FileSeek(file->file, file->offset, SEEK_SET) != file->offset)
 	{
-		if (FileSeek(thisfile, file->curOffset, SEEK_SET) != file->curOffset)
-			return;				/* seek failed, read nothing */
-		file->offsets[file->curFile] = file->curOffset;
+		elog(ERROR, "could not seek in temporary file: %m");
 	}
 
 	/*
 	 * Read whatever we can get, up to a full bufferload.
 	 */
-	file->nbytes = FileRead(thisfile, file->buffer.data, sizeof(file->buffer));
-	if (file->nbytes < 0)
-		file->nbytes = 0;
-	file->offsets[file->curFile] += file->nbytes;
+	nb = FileRead(file->file, buffer, (int)bufsize);
+	if (nb < 0)
+	{
+		elog(ERROR, "could not read from temporary file: %m");
+	}
+
 	/* we choose not to advance curOffset here */
 
 	pgBufferUsage.temp_blks_read++;
+
+	return nb;
 }
 
 /*
@@ -271,76 +404,33 @@ BufFileLoadBuffer(BufFile *file)
  * On exit, dirty is cleared if successful write, and curOffset is advanced.
  */
 static void
-BufFileDumpBuffer(BufFile *file)
+BufFileDumpBuffer(BufFile *file, const void* buffer, Size nbytes)
 {
-	int			wpos = 0;
-	int			bytestowrite;
-	File		thisfile;
+	size_t wpos = 0;
+	size_t bytestowrite;
+	int wrote = 0;
 
 	/*
-	 * Unlike BufFileLoadBuffer, we must dump the whole buffer even if it
-	 * crosses a component-file boundary; so we need a loop.
+	 * Unlike BufFileLoadBuffer, we must dump the whole buffer.
 	 */
-	while (wpos < file->nbytes)
+	while (wpos < nbytes)
 	{
-		/*
-		 * Advance to next component file if necessary and possible.
-		 */
-		if (file->curOffset >= MAX_PHYSICAL_FILESIZE && file->isTemp)
+		bytestowrite = nbytes - wpos;
+
+		if (FileSeek(file->file, file->offset, SEEK_SET) != file->offset)
 		{
-			while (file->curFile + 1 >= file->numFiles)
-				extendBufFile(file);
-			file->curFile++;
-			file->curOffset = 0L;
+			elog(ERROR, "could not seek in temporary file: %m");
 		}
 
-		/*
-		 * Enforce per-file size limit only for temp files, else just try to
-		 * write as much as asked...
-		 */
-		bytestowrite = file->nbytes - wpos;
-		if (file->isTemp)
-		{
-			off_t		availbytes = MAX_PHYSICAL_FILESIZE - file->curOffset;
-
-			if ((off_t) bytestowrite > availbytes)
-				bytestowrite = (int) availbytes;
-		}
-
-		/*
-		 * May need to reposition physical file.
-		 */
-		thisfile = file->files[file->curFile];
-		if (file->curOffset != file->offsets[file->curFile])
-		{
-			if (FileSeek(thisfile, file->curOffset, SEEK_SET) != file->curOffset)
-				return;			/* seek failed, give up */
-			file->offsets[file->curFile] = file->curOffset;
-		}
-		bytestowrite = FileWrite(thisfile, file->buffer.data + wpos, bytestowrite);
-		if (bytestowrite <= 0)
-			return;				/* failed to write */
-		file->offsets[file->curFile] += bytestowrite;
-		file->curOffset += bytestowrite;
-		wpos += bytestowrite;
+		wrote = FileWrite(file->file, (char *)buffer + wpos, (int)bytestowrite);
+		if (wrote != bytestowrite)
+			elog(ERROR, "could not write %d bytes to temporary file: %m", (int) bytestowrite);
+		file->offset += wrote;
+		wpos += wrote;
 
 		pgBufferUsage.temp_blks_written++;
 	}
 	file->dirty = false;
-
-	/*
-	 * At this point, curOffset has been advanced to the end of the buffer,
-	 * ie, its original value + nbytes.  We need to make it point to the
-	 * logical file position, ie, original value + pos, in case that is less
-	 * (as could happen due to a small backwards seek in a dirty buffer!)
-	 */
-	file->curOffset -= (file->nbytes - file->pos);
-	if (file->curOffset < 0)	/* handle possible segment crossing */
-	{
-		file->curFile--;
-		Assert(file->curFile >= 0);
-		file->curOffset += MAX_PHYSICAL_FILESIZE;
-	}
 
 	/*
 	 * Now we can set the buffer empty without changing the logical position
@@ -360,32 +450,72 @@ BufFileRead(BufFile *file, void *ptr, size_t size)
 	size_t		nread = 0;
 	size_t		nthistime;
 
-	if (file->dirty)
+	switch (file->state)
 	{
-		if (BufFileFlush(file) != 0)
-			return 0;			/* could not flush... */
-		Assert(!file->dirty);
+		case BFS_RANDOM_ACCESS:
+		case BFS_SEQUENTIAL_READING:
+			break;
+
+		case BFS_SEQUENTIAL_WRITING:
+		case BFS_COMPRESSED_WRITING:
+			elog(ERROR, "cannot read from sequential BufFile before rewinding to start");
+			break;
+
+		case BFS_COMPRESSED_READING:
+			return BufFileLoadCompressedBuffer(file, ptr, size);
 	}
+
+	if (file->dirty)
+		BufFileFlush(file);
 
 	while (size > 0)
 	{
 		if (file->pos >= file->nbytes)
 		{
-			/* Try to load more data into buffer. */
-			file->curOffset += file->pos;
+			Assert(file->pos == file->nbytes);
+
+			file->offset += file->pos;
 			file->pos = 0;
 			file->nbytes = 0;
-			BufFileLoadBuffer(file);
-			if (file->nbytes <= 0)
-				break;			/* no more data available */
+
+			/*
+			 * Read full blocks directly into caller's buffer.
+			 */
+			while (size >= BLCKSZ)
+			{
+				size_t nwant;
+
+				nwant = size - size % BLCKSZ;
+
+				nthistime = BufFileLoadBuffer(file, ptr, nwant);
+				file->offset += nthistime;
+				ptr = (char *) ptr + nthistime;
+				size -= nthistime;
+				nread += nthistime;
+
+				if (size == 0 || nthistime == 0)
+				{
+					return nread;
+				}
+			}
+
+			/* Try to load more data into buffer. */
+			file->nbytes = BufFileLoadBuffer(file, file->buffer, BLCKSZ);
+			if (file->nbytes == 0)
+			{
+				break; /* no more data available */
+			}
 		}
 
 		nthistime = file->nbytes - file->pos;
 		if (nthistime > size)
-			nthistime = size;
+		{
+			nthistime = (int) size;
+		}
+
 		Assert(nthistime > 0);
 
-		memcpy(ptr, file->buffer.data + file->pos, nthistime);
+		memcpy(ptr, file->buffer + file->pos, nthistime);
 
 		file->pos += nthistime;
 		ptr = (void *) ((char *) ptr + nthistime);
@@ -397,33 +527,112 @@ BufFileRead(BufFile *file, void *ptr, size_t size)
 }
 
 /*
+ * BufFileReadFromBuffer
+ *
+ * This function provides a faster implementation of Read which applies
+ * when the data is already in the underlying buffer.
+ * In that case, it returns a pointer to the data in the buffer
+ * If the data is not in the buffer, returns NULL and the caller must
+ * call the regular BufFileRead with a destination buffer.
+ */
+void *
+BufFileReadFromBuffer(BufFile *file, size_t size)
+{
+	void	   *result = NULL;
+
+	switch (file->state)
+	{
+		case BFS_RANDOM_ACCESS:
+		case BFS_SEQUENTIAL_READING:
+			break;
+
+		case BFS_SEQUENTIAL_WRITING:
+		case BFS_COMPRESSED_WRITING:
+			elog(ERROR, "cannot read from sequential BufFile before rewinding to start");
+			return NULL;
+
+		case BFS_COMPRESSED_READING:
+			return NULL;
+	}
+
+	if (file->dirty)
+		BufFileFlush(file);
+
+	if (file->pos + size < file->nbytes)
+	{
+		result = file->buffer + file->pos;
+		file->pos += size;
+	}
+
+	return result;
+}
+
+/*
  * BufFileWrite
  *
  * Like fwrite() except we assume 1-byte element size.
  */
 size_t
-BufFileWrite(BufFile *file, void *ptr, size_t size)
+BufFileWrite(BufFile *file, const void *ptr, size_t size)
 {
 	size_t		nwritten = 0;
 	size_t		nthistime;
 
+	switch (file->state)
+	{
+		case BFS_RANDOM_ACCESS:
+		case BFS_SEQUENTIAL_WRITING:
+			break;
+
+		case BFS_COMPRESSED_WRITING:
+			BufFileDumpCompressedBuffer(file, ptr, size);
+			return size;
+
+		case BFS_SEQUENTIAL_READING:
+		case BFS_COMPRESSED_READING:
+			elog(ERROR, "cannot write to sequential BufFile after reading");
+	}
+
 	while (size > 0)
 	{
-		if (file->pos >= BLCKSZ)
+		if ((size_t) file->pos >= BLCKSZ)
 		{
+			Assert((size_t)file->pos == BLCKSZ);
+
 			/* Buffer full, dump it out */
 			if (file->dirty)
 			{
-				BufFileDumpBuffer(file);
-				if (file->dirty)
-					break;		/* I/O error */
+				/* This can throw an exception, but it correctly updates the size when that happens */
+				BufFileDumpBuffer(file, file->buffer, file->nbytes);
 			}
 			else
 			{
 				/* Hmm, went directly from reading to writing? */
-				file->curOffset += file->pos;
+				file->offset += file->pos;
 				file->pos = 0;
 				file->nbytes = 0;
+			}
+		}
+
+		/*
+		 * Write full blocks directly from caller's buffer.
+		 */
+		if (size >= BLCKSZ && file->pos == 0)
+		{
+			nthistime = size - size % BLCKSZ;
+
+			/* This can throw an exception, but it correctly updates the size when that happens */
+			BufFileDumpBuffer(file, ptr, nthistime);
+
+			ptr = (void *) ((char *) ptr + nthistime);
+			size -= nthistime;
+			nwritten += nthistime;
+
+			BufFileUpdateSize(file);
+
+			if (size == 0)
+			{
+				return nwritten;
 			}
 		}
 
@@ -432,10 +641,10 @@ BufFileWrite(BufFile *file, void *ptr, size_t size)
 			nthistime = size;
 		Assert(nthistime > 0);
 
-		memcpy(file->buffer.data + file->pos, ptr, nthistime);
+		memcpy(file->buffer + file->pos, ptr, nthistime);
 
 		file->dirty = true;
-		file->pos += nthistime;
+		file->pos += (int) nthistime;
 		if (file->nbytes < file->pos)
 			file->nbytes = file->pos;
 		ptr = (void *) ((char *) ptr + nthistime);
@@ -443,6 +652,7 @@ BufFileWrite(BufFile *file, void *ptr, size_t size)
 		nwritten += nthistime;
 	}
 
+	BufFileUpdateSize(file);
 	return nwritten;
 }
 
@@ -451,17 +661,41 @@ BufFileWrite(BufFile *file, void *ptr, size_t size)
  *
  * Like fflush()
  */
-static int
+void
 BufFileFlush(BufFile *file)
 {
-	if (file->dirty)
+	switch (file->state)
 	{
-		BufFileDumpBuffer(file);
-		if (file->dirty)
-			return EOF;
+		case BFS_RANDOM_ACCESS:
+		case BFS_SEQUENTIAL_WRITING:
+			break;
+
+		case BFS_COMPRESSED_WRITING:
+			BufFileEndCompression(file);
+			break;
+
+		case BFS_SEQUENTIAL_READING:
+		case BFS_COMPRESSED_READING:
+			/* no-op. */
+			return;
 	}
 
-	return 0;
+	if (file->dirty)
+	{
+		int nbytes = file->nbytes;
+		int pos = file->pos;
+
+		BufFileDumpBuffer(file, file->buffer, nbytes);
+
+		/*
+		 * At this point, curOffset has been advanced to the end of the buffer,
+		 * ie, its original value + nbytes.  We need to make it point to the
+		 * logical file position, ie, original value + pos, in case that is less
+		 * (as could happen due to a small backwards seek in a dirty buffer!)
+		 */
+		file->offset -= (nbytes - pos);
+		BufFileUpdateSize(file);
+	}
 }
 
 /*
@@ -477,27 +711,51 @@ BufFileFlush(BufFile *file)
 int
 BufFileSeek(BufFile *file, int fileno, off_t offset, int whence)
 {
-	int			newFile;
-	off_t		newOffset;
+	int64 newOffset;
+
+	switch (file->state)
+	{
+		case BFS_RANDOM_ACCESS:
+			break;
+
+		case BFS_SEQUENTIAL_WRITING:
+			/*
+			 * We have been writing. The uncompressed sequential mode is the
+			 * same as uncompressed, but we check that the caller doesn't try
+			 * to do random access after pledging sequential mode.
+			 */
+			if (fileno != 0 || offset != 0 || whence != SEEK_SET)
+				elog(ERROR, "invalid seek in sequential BufFile");
+			break;
+
+		case BFS_COMPRESSED_WRITING:
+			/* We have been writing. Flush the last data, and switch to reading mode */
+			if (fileno != 0 || offset != 0 || whence != SEEK_SET)
+				elog(ERROR, "invalid seek in sequential BufFile");
+			BufFileEndCompression(file);
+			file->offset = 0;
+			file->pos = 0;
+			file->nbytes = 0;
+			return 0;
+
+		case BFS_COMPRESSED_READING:
+		case BFS_SEQUENTIAL_READING:
+			elog(ERROR, "cannot seek in sequential BufFile");
+	}
+
+	/* GPDB doesn't support multiple files */
+	Assert(fileno == 0);
 
 	switch (whence)
 	{
 		case SEEK_SET:
-			if (fileno < 0)
-				return EOF;
-			newFile = fileno;
 			newOffset = offset;
 			break;
-		case SEEK_CUR:
 
-			/*
-			 * Relative seek considers only the signed offset, ignoring
-			 * fileno. Note that large offsets (> 1 gig) risk overflow in this
-			 * add, unless we have 64-bit off_t.
-			 */
-			newFile = file->curFile;
-			newOffset = (file->curOffset + file->pos) + offset;
+		case SEEK_CUR:
+			newOffset = (file->offset + file->pos) + offset;
 			break;
+
 #ifdef NOT_USED
 		case SEEK_END:
 			/* could be implemented, not needed currently */
@@ -507,15 +765,15 @@ BufFileSeek(BufFile *file, int fileno, off_t offset, int whence)
 			elog(ERROR, "invalid whence: %d", whence);
 			return EOF;
 	}
-	while (newOffset < 0)
+
+	if (newOffset < 0)
 	{
-		if (--newFile < 0)
-			return EOF;
-		newOffset += MAX_PHYSICAL_FILESIZE;
+		newOffset = file->offset - newOffset;
+		return EOF;
 	}
-	if (newFile == file->curFile &&
-		newOffset >= file->curOffset &&
-		newOffset <= file->curOffset + file->nbytes)
+
+	if (newOffset >= file->offset &&
+		newOffset <= file->offset + file->nbytes)
 	{
 		/*
 		 * Seek is to a point within existing buffer; we can just adjust
@@ -523,48 +781,32 @@ BufFileSeek(BufFile *file, int fileno, off_t offset, int whence)
 		 * whether reading or writing, but buffer remains dirty if we were
 		 * writing.
 		 */
-		file->pos = (int) (newOffset - file->curOffset);
+		file->pos = (newOffset - file->offset);
+		BufFileUpdateSize(file);
 		return 0;
 	}
 	/* Otherwise, must reposition buffer, so flush any dirty data */
-	if (BufFileFlush(file) != 0)
-		return EOF;
+	BufFileFlush(file);
 
-	/*
-	 * At this point and no sooner, check for seek past last segment. The
-	 * above flush could have created a new segment, so checking sooner would
-	 * not work (at least not with this code).
-	 */
-	if (file->isTemp)
-	{
-		/* convert seek to "start of next seg" to "end of last seg" */
-		if (newFile == file->numFiles && newOffset == 0)
-		{
-			newFile--;
-			newOffset = MAX_PHYSICAL_FILESIZE;
-		}
-		while (newOffset > MAX_PHYSICAL_FILESIZE)
-		{
-			if (++newFile >= file->numFiles)
-				return EOF;
-			newOffset -= MAX_PHYSICAL_FILESIZE;
-		}
-	}
-	if (newFile >= file->numFiles)
-		return EOF;
 	/* Seek is OK! */
-	file->curFile = newFile;
-	file->curOffset = newOffset;
+	file->offset = newOffset;
 	file->pos = 0;
 	file->nbytes = 0;
+	BufFileUpdateSize(file);
 	return 0;
 }
 
 void
 BufFileTell(BufFile *file, int *fileno, off_t *offset)
 {
-	*fileno = file->curFile;
-	*offset = file->curOffset + file->pos;
+	if (file->state != BFS_RANDOM_ACCESS)
+		elog(ERROR, "cannot tell current position in sequential BufFile");
+
+	if (fileno != NULL)
+	{
+		*fileno = 0;
+	}
+	*offset = file->offset + file->pos;
 }
 
 /*
@@ -579,28 +821,390 @@ BufFileTell(BufFile *file, int *fileno, off_t *offset)
  * impossible seek is attempted.
  */
 int
-BufFileSeekBlock(BufFile *file, long blknum)
+BufFileSeekBlock(BufFile *file, int64 blknum)
 {
-	return BufFileSeek(file,
-					   (int) (blknum / BUFFILE_SEG_SIZE),
-					   (off_t) (blknum % BUFFILE_SEG_SIZE) * BLCKSZ,
-					   SEEK_SET);
+	return BufFileSeek(file, 0 /* fileno */, blknum * BLCKSZ, SEEK_SET);
 }
 
-#ifdef NOT_USED
 /*
- * BufFileTellBlock --- block-oriented tell
+ * BufFileUpdateSize
  *
- * Any fractional part of a block in the current seek position is ignored.
+ * Updates the total disk size of a BufFile after a write
+ *
+ * Some of the data might still be in the buffer and not on disk, but we count
+ * it here regardless
  */
-long
-BufFileTellBlock(BufFile *file)
+static void
+BufFileUpdateSize(BufFile *buffile)
 {
-	long		blknum;
+	Assert(NULL != buffile);
 
-	blknum = (file->curOffset + file->pos) / BLCKSZ;
-	blknum += file->curFile * BUFFILE_SEG_SIZE;
-	return blknum;
+	if (buffile->offset + buffile->pos > buffile->maxoffset)
+	{
+		buffile->maxoffset = buffile->offset + buffile->pos;
+	}
 }
 
+/*
+ * Returns the size of this file according to current accounting.
+ *
+ * For a compressed BufFile, this returns the uncompressed size!
+ */
+int64
+BufFileGetSize(BufFile *buffile)
+{
+	Assert(NULL != buffile);
+
+	switch (buffile->state)
+	{
+		case BFS_RANDOM_ACCESS:
+		case BFS_SEQUENTIAL_WRITING:
+		case BFS_SEQUENTIAL_READING:
+			break;
+		case BFS_COMPRESSED_WRITING:
+		case BFS_COMPRESSED_READING:
+#ifdef HAVE_LIBZSTD
+			return buffile->uncompressed_bytes;
+#else
+			Assert(false);
+			break;
 #endif
+	}
+
+	BufFileUpdateSize(buffile);
+	return buffile->maxoffset;
+}
+
+const char *
+BufFileGetFilename(BufFile *buffile)
+{
+	return FileGetFilename(buffile->file);
+}
+
+void
+BufFileSuspend(BufFile *buffile)
+{
+	switch (buffile->state)
+	{
+		case BFS_RANDOM_ACCESS:
+		case BFS_SEQUENTIAL_WRITING:
+			break;
+		case BFS_COMPRESSED_WRITING:
+			return BufFileEndCompression(buffile);
+
+		case BFS_SEQUENTIAL_READING:
+		case BFS_COMPRESSED_READING:
+			elog(ERROR, "cannot suspend a sequential BufFile after reading");
+	}
+
+	BufFileFlush(buffile);
+	pfree(buffile->buffer);
+	buffile->buffer = NULL;
+	buffile->nbytes = 0;
+}
+
+void
+BufFileResume(BufFile *buffile)
+{
+	switch (buffile->state)
+	{
+		case BFS_RANDOM_ACCESS:
+		case BFS_SEQUENTIAL_READING:
+			break;
+
+		case BFS_COMPRESSED_READING:
+			/* no buffer needed */
+			return;
+
+		case BFS_SEQUENTIAL_WRITING:
+		case BFS_COMPRESSED_WRITING:
+			elog(ERROR, "cannot resume a sequential BufFile that is still writing");
+			break;
+	}
+
+	Assert(buffile->buffer == NULL);
+	buffile->buffer = palloc(BLCKSZ);
+
+	BufFileSeek(buffile, 0, 0, SEEK_SET);
+}
+
+
+/*
+ * ZStandard Compression support
+ */
+
+bool gp_workfile_compression;		/* GUC */
+
+/*
+ * BufFilePledgeSequential
+ *
+ * Promise that the caller will only do sequential I/O on the given file.
+ * This allows the BufFile to be compressed, if 'gp_workfile_compression=on'.
+ *
+ * A sequential file is used in two stages:
+ *
+ * 0. Create file with BufFileCreateTemp().
+ * 1. Write all data, using BufFileWrite()
+ * 2. Rewind to beginning, with BufFileSeek(file, 0, 0, SEEK_SET).
+ * 3. Read as much as you want with BufFileRead()
+ * 4. BufFileClose()
+ *
+ * Trying to do arbitrary seeks
+ *
+ * A sequential file that is to be passed between processes, using
+ * BufFileCreateNamedTemp/BufFileOpenNamedTemp(), can also be used in
+ * sequential mode. If the file was pledged as sequential when creating
+ * it, the reading side must also pledge sequential access after calling
+ * BufFileOpenNamedTemp(). Otherwise, the reader might try to read a
+ * compressed file as uncompressed. (As of this writing, none of the callers
+ * that use buffiles across processes pledge sequential access, though.)
+ */
+void
+BufFilePledgeSequential(BufFile *buffile)
+{
+	if (buffile->maxoffset != 0)
+		elog(ERROR, "cannot pledge sequential access to a temporary file after writing it");
+
+	if (gp_workfile_compression)
+		BufFileStartCompression(buffile);
+}
+
+/*
+ * The rest of the code is only needed when compression support is compiled in.
+ */
+#ifdef HAVE_LIBZSTD
+
+#define BUFFILE_ZSTD_COMPRESSION_LEVEL 1
+
+/*
+ * Temporary buffer used during compresion. It's used only within the
+ * functions, so we can allocate this once and reuse it for all files.
+ */
+static char *compression_buffer;
+
+/*
+ * Initialize the compressor.
+ */
+static void
+BufFileStartCompression(BufFile *file)
+{
+	ResourceOwner oldowner;
+	size_t ret;
+
+	/*
+	 * When working with compressed files, we rely on libzstd's buffer,
+	 * and the BufFile's own buffer is unused. It's a bit silly that we
+	 * allocate it in makeBufFile(), just to free it here again, but it
+	 * doesn't seem worth the trouble to avoid that either.
+	 */
+	if (file->buffer)
+	{
+		pfree(file->buffer);
+		file->buffer = NULL;
+	}
+
+	if (compression_buffer == NULL)
+		compression_buffer = MemoryContextAlloc(TopMemoryContext, BLCKSZ);
+
+	/*
+	 * Make sure the zstd handle is kept in the same resource owner as
+	 * the underlying file. In the typical use, when BufFileCompressOK is
+	 * called immediately after opening the file, this wouldn't be
+	 * necessary, but better safe than sorry.
+	 */
+	oldowner = CurrentResourceOwner;
+	CurrentResourceOwner = file->resowner;
+
+	file->zstd_context = zstd_alloc_context();
+	file->zstd_context->cctx = ZSTD_createCStream();
+	if (!file->zstd_context->cctx)
+		elog(ERROR, "out of memory");
+	ret = ZSTD_initCStream(file->zstd_context->cctx, BUFFILE_ZSTD_COMPRESSION_LEVEL);
+	if (ZSTD_isError(ret))
+		elog(ERROR, "failed to initialize zstd stream: %s", ZSTD_getErrorName(ret));
+
+	CurrentResourceOwner = oldowner;
+
+	file->state = BFS_COMPRESSED_WRITING;
+}
+
+static void
+BufFileDumpCompressedBuffer(BufFile *file, const void *buffer, Size nbytes)
+{
+	ZSTD_inBuffer input;
+
+	file->uncompressed_bytes += nbytes;
+
+	/*
+	 * Call ZSTD_compressStream() until all the input has been consumed.
+	 */
+	input.src = buffer;
+	input.size = nbytes;
+	input.pos = 0;
+	while (input.pos < input.size)
+	{
+		ZSTD_outBuffer output;
+		size_t		ret;
+
+		output.dst = compression_buffer;
+		output.size = BLCKSZ;
+		output.pos = 0;
+
+		ret = ZSTD_compressStream(file->zstd_context->cctx, &output, &input);
+		if (ZSTD_isError(ret))
+			elog(ERROR, "%s", ZSTD_getErrorName(ret));
+
+		if (output.pos > 0)
+		{
+			int			wrote;
+
+			wrote = FileWrite(file->file, output.dst, output.pos);
+			if (wrote != output.pos)
+				elog(ERROR, "could not write %d bytes to compressed temporary file: %m", (int) output.pos);
+			file->maxoffset += wrote;
+		}
+	}
+}
+
+/*
+ * End compression stage. Rewind and prepare the BufFile for decompression.
+ */
+static void
+BufFileEndCompression(BufFile *file)
+{
+	ZSTD_outBuffer output;
+	size_t		ret;
+	int			wrote;
+
+	Assert(file->state == BFS_COMPRESSED_WRITING);
+
+	do {
+		output.dst = compression_buffer;
+		output.size = BLCKSZ;
+		output.pos = 0;
+
+		ret = ZSTD_endStream(file->zstd_context->cctx, &output);
+		if (ZSTD_isError(ret))
+			elog(ERROR, "%s", ZSTD_getErrorName(ret));
+
+		wrote = FileWrite(file->file, output.dst, output.pos);
+		if (wrote != output.pos)
+			elog(ERROR, "could not write %d bytes to compressed temporary file: %m", (int) output.pos);
+		file->maxoffset += wrote;
+	} while (ret > 0);
+
+	ZSTD_freeCCtx(file->zstd_context->cctx);
+	file->zstd_context->cctx = NULL;
+
+	elog(DEBUG1, "BufFile compressed from %ld to %ld bytes",
+		 file->uncompressed_bytes, file->maxoffset);
+
+	/* Done writing. Initialize for reading */
+	file->zstd_context->dctx = ZSTD_createDStream();
+	if (!file->zstd_context->dctx)
+		elog(ERROR, "out of memory");
+	ret = ZSTD_initDStream(file->zstd_context->dctx);
+	if (ZSTD_isError(ret))
+		elog(ERROR, "failed to initialize zstd dstream: %s", ZSTD_getErrorName(ret));
+
+	file->compressed_buffer.src = palloc(BLCKSZ);
+	file->compressed_buffer.size = 0;
+	file->compressed_buffer.pos = 0;
+	file->offset = 0;
+	file->state = BFS_COMPRESSED_READING;
+
+	if (FileSeek(file->file, 0, SEEK_SET) != 0)
+		elog(ERROR, "could not seek in temporary file: %m");
+}
+
+static int
+BufFileLoadCompressedBuffer(BufFile *file, void *buffer, size_t bufsize)
+{
+	ZSTD_outBuffer output;
+	size_t		ret;
+	bool		eof = false;
+
+	if (file->decompression_finished)
+		return 0;
+
+	/* Initialize Zstd output buffer. */
+	output.dst = buffer;
+	output.size = bufsize;
+	output.pos = 0;
+
+	do
+	{
+		/* No more compressed input? Load some. */
+		if (file->compressed_buffer.pos == file->compressed_buffer.size)
+		{
+			int			nb;
+
+			nb = FileRead(file->file, (char *) file->compressed_buffer.src, BLCKSZ);
+			if (nb < 0)
+			{
+				elog(ERROR, "could not read from temporary file: %m");
+			}
+			file->compressed_buffer.size = nb;
+			file->compressed_buffer.pos = 0;
+
+			if (nb == 0)
+				eof = true;
+		}
+
+		/* Decompress, and check result */
+		ret = ZSTD_decompressStream(file->zstd_context->dctx, &output, &file->compressed_buffer);
+		if (ZSTD_isError(ret))
+			elog(ERROR, "zstd decompression failed: %s", ZSTD_getErrorName(ret));
+
+		if (ret == 0)
+		{
+			/* End of compressed data. */
+			Assert (file->compressed_buffer.pos == file->compressed_buffer.size);
+			file->decompression_finished = true;
+			break;
+		}
+
+		if (ret > 0 && eof && output.pos < output.size)
+		{
+			/*
+			 * We ran out of compressed input, but Zstd expects more. File was
+			 * truncated on disk after we wrote it?
+			 */
+			elog(ERROR, "unexpected end of compressed temporary file");
+		}
+	}
+	while (output.pos < output.size);
+
+	return output.pos;
+}
+#else		/* HAVE_ZSTD */
+
+/*
+ * Dummy versions of the compression functions, when the server is built
+ * without libzstd. gp_workfile_compression cannot be enabled without
+ * libzstd - there's a GUC assign hook to check that - so these should
+ * never be called. They exists just to avoid having so many #ifdefs in
+ * the code.
+ */
+static void
+BufFileStartCompression(BufFile *file)
+{
+	elog(ERROR, "zstandard compression not supported by this build");
+}
+static void
+BufFileDumpCompressedBuffer(BufFile *file, const void *buffer, Size nbytes)
+{
+	elog(ERROR, "zstandard compression not supported by this build");
+}
+static void
+BufFileEndCompression(BufFile *file)
+{
+	elog(ERROR, "zstandard compression not supported by this build");
+}
+static int
+BufFileLoadCompressedBuffer(BufFile *file, void *buffer, size_t bufsize)
+{
+	elog(ERROR, "zstandard compression not supported by this build");
+}
+
+#endif		/* HAVE_ZSTD */

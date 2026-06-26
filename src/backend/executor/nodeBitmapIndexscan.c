@@ -21,11 +21,16 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
+#include "cdb/cdbvars.h"
+#include "cdb/cdbpartition.h"
 #include "executor/execdebug.h"
 #include "executor/nodeBitmapIndexscan.h"
 #include "executor/nodeIndexscan.h"
 #include "miscadmin.h"
 #include "utils/memutils.h"
+#include "utils/lsyscache.h"
+#include "nodes/tidbitmap.h"
 
 
 /* ----------------------------------------------------------------
@@ -89,6 +94,9 @@ MultiExecBitmapIndexScan(BitmapIndexScanState *node)
 		nTuples += (double) index_getbitmap(scandesc, tbm);
 
 		CHECK_FOR_INTERRUPTS();
+
+		if (QueryFinishPending)
+			break;
 
 		doscan = ExecIndexAdvanceArrayKeys(node->biss_ArrayKeys,
 										   node->biss_NumArrayKeys);
@@ -233,7 +241,7 @@ ExecInitBitmapIndexScan(BitmapIndexScan *node, EState *estate, int eflags)
 	 */
 
 	indexstate->ss.ss_currentRelation = NULL;
-	indexstate->ss.ss_currentScanDesc = NULL;
+	//indexstate->ss.ss_currentScanDesc = NULL;
 
 	/*
 	 * If we are just doing EXPLAIN (ie, aren't going to run the plan), stop

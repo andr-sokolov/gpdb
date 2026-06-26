@@ -30,15 +30,32 @@ typedef enum
 	PVC_RECURSE_PLACEHOLDERS	/* recurse into PlaceHolderVar arguments */
 } PVCPlaceHolderBehavior;
 
+typedef bool (*Cdb_walk_vars_callback_Aggref)(Aggref *aggref, void *context, int sublevelsup);
+typedef bool (*Cdb_walk_vars_callback_Var)(Var *var, void *context, int sublevelsup);
+typedef bool (*Cdb_walk_vars_callback_CurrentOf)(CurrentOfExpr *expr, void *context, int sublevelsup);
+typedef bool (*Cdb_walk_vars_callback_placeholdervar)(PlaceHolderVar *expr, void *context, int sublevelsup);
+bool        cdb_walk_vars(Node                         *node,
+                          Cdb_walk_vars_callback_Var    callback_var,
+                          Cdb_walk_vars_callback_Aggref callback_aggref,
+                          Cdb_walk_vars_callback_CurrentOf callback_currentof,
+						  Cdb_walk_vars_callback_placeholdervar callback_placeholdervar,
+                          void                         *context,
+                          int                           levelsup);
+
 extern Relids pull_varnos(Node *node);
 extern Relids pull_varnos_of_level(Node *node, int levelsup);
+extern Relids pull_upper_varnos(Node *node);
+
 extern void pull_varattnos(Node *node, Index varno, Bitmapset **varattnos);
 extern List *pull_vars_of_level(Node *node, int levelsup);
+extern bool contain_ctid_var_reference(Scan *scan);
 extern bool contain_var_clause(Node *node);
 extern bool contain_vars_of_level(Node *node, int levelsup);
+extern bool contain_vars_of_level_or_above(Node *node, int levelsup);
 extern int	locate_var_of_level(Node *node, int levelsup);
 extern List *pull_var_clause(Node *node, PVCAggregateBehavior aggbehavior,
 				PVCPlaceHolderBehavior phbehavior);
 extern Node *flatten_join_alias_vars(PlannerInfo *root, Node *node);
+bool contain_vars_of_level_or_above_cbPlaceHolderVar(PlaceHolderVar *placeholdervar, void *unused, int sublevelsup);
 
 #endif   /* VAR_H */

@@ -7,6 +7,8 @@
  *	  and join trees.
  *
  *
+ * Portions Copyright (c) 2005-2009, Greenplum inc
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -19,6 +21,8 @@
 
 #include "access/attnum.h"
 #include "nodes/pg_list.h"
+#include "nodes/params.h"  /* For ParamListInfoData */
+#include "cdb/cdbpathlocus.h" /* For CdbLocusType */
 
 
 /* ----------------------------------------------------------------
@@ -98,7 +102,29 @@ typedef struct IntoClause
 	char	   *tableSpaceName; /* table space to use, or NULL */
 	Node	   *viewQuery;		/* materialized view's SELECT query */
 	bool		skipData;		/* true for WITH NO DATA */
+	Node       *distributedBy;  /* GPDB: columns to distribubte the data on. */
 } IntoClause;
+
+typedef struct CopyIntoClause
+{
+	NodeTag		type;
+
+	List	   *attlist;		/* List of column names (as Strings), or NIL
+								 * for all columns */
+	bool		is_program;		/* is 'filename' a program to popen? */
+	char	   *filename;		/* filename, or NULL for STDIN/STDOUT */
+	List	   *options;		/* List of DefElem nodes */
+	List	   *ao_segnos;		/* AO segno map */
+} CopyIntoClause;
+
+typedef struct RefreshClause
+{
+	NodeTag		type;
+
+	bool		concurrent;		/* allow concurrent access? */
+	bool		skipData;
+	RangeVar   *relation;		/* relation to insert into */
+} RefreshClause;
 
 
 /* ----------------------------------------------------------------
@@ -208,6 +234,7 @@ typedef enum ParamKind
 {
 	PARAM_EXTERN,
 	PARAM_EXEC,
+	PARAM_EXEC_REMOTE, /* MPP ???? */
 	PARAM_SUBLINK
 } ParamKind;
 
@@ -221,6 +248,22 @@ typedef struct Param
 	Oid			paramcollid;	/* OID of collation, or InvalidOid if none */
 	int			location;		/* token location, or -1 if unknown */
 } Param;
+
+/* AggStage enumeration indicates how the executor should handle an
+ * Aggref node.
+ */
+typedef enum AggStage
+{
+	AGGSTAGE_NORMAL = 0,
+	AGGSTAGE_PARTIAL, /* First (lower, earlier) stage of 2-stage aggregation. */
+	AGGSTAGE_INTERMEDIATE, /* The intermediate stage between AGGSTAGE_PARTIAL and
+							* AGGSTAGE_FINAL that handles the higher aggregation
+							* level in a (partial) ROLLUP grouping extension
+							* query.
+							*/
+	AGGSTAGE_FINAL /* Second (upper, later) stage of 2-stage aggregation. */
+} AggStage;
+
 
 /*
  * Aggref
@@ -261,11 +304,72 @@ typedef struct Aggref
 								 * combined into an array last argument */
 	char		aggkind;		/* aggregate kind (see pg_aggregate.h) */
 	Index		agglevelsup;	/* > 0 if agg belongs to outer query */
+	AggStage	aggstage;		/* MPP: 2-stage? If so, which stage */
 	int			location;		/* token location, or -1 if unknown */
 } Aggref;
 
+
 /*
- * WindowFunc
+ * Grouping: describe the hidden GROUPING column for grouping extensions.
+ *
+ * Defined for making it easily to distinguish this column with others.
+ *
+ * Used with GroupingFunc to distinguish 'null' values that are created
+ * through grouping with those that are in the raw data. See also GroupingFunc
+ * for more details.
+ */
+typedef struct Grouping
+{
+	Expr        xpr;
+} Grouping;
+
+/*
+ * GroupId -
+ *    representation of the hidden GROUP_ID column for grouping extensions.
+ *
+ * Defined to make it easy to distinguish this column from others.
+ *
+ * This is used to determine whether output tuples are coming from
+ * duplicate grouping sets. For example, a table
+ *
+ *    test (a integer, b integer)
+ *
+ * has two rows:
+ *
+ *       (1,2), (1,2).
+ *
+ * Consider a rollup clause "rollup(a),a", which contains a grouping
+ * set (a) twice. Therefore, the query
+ *
+ *    select a,sum(b),group_id() from test group by rollup(a),a;
+ *
+ * returns two rows:
+ *
+ *    1,4,0
+ *    1,4,1
+ *
+ * The GROUP_ID value 0 indicates this tuple is from the grouping set (a).
+ * The value 1 indicates this tuple is from the first duplicate grouping set of
+ * (a).
+ *
+ * This query can be also re-written to the following:
+ *
+ *    select a,avg(b),0 from test group by a
+ *      union all
+ *    select a,avg(b),1 from test group by a;
+ */
+typedef struct GroupId
+{
+	Expr      xpr;
+} GroupId;
+
+/*
+ * WindowFunc: describes a window function call
+ *
+ * In a query tree, a WindowFunc corresponds to a SQL window function
+ * call.  In a plan tree, a WindowRef is an expression the corresponds
+ * to some or all of the calculation of the window function result.
+ *
  */
 typedef struct WindowFunc
 {
@@ -279,8 +383,10 @@ typedef struct WindowFunc
 	Index		winref;			/* index of associated WindowClause */
 	bool		winstar;		/* TRUE if argument list was really '*' */
 	bool		winagg;			/* is function a simple aggregate? */
+	bool		windistinct;	/* TRUE if it's agg(DISTINCT ...) */
 	int			location;		/* token location, or -1 if unknown */
 } WindowFunc;
+
 
 /* ----------------
  *	ArrayRef: describes an array subscripting operation
@@ -366,6 +472,7 @@ typedef struct FuncExpr
 	Oid			inputcollid;	/* OID of collation that function should use */
 	List	   *args;			/* arguments to the function */
 	int			location;		/* token location, or -1 if unknown */
+	bool        is_tablefunc;   /* Is a TableFunction reference */
 } FuncExpr;
 
 /*
@@ -479,6 +586,20 @@ typedef struct BoolExpr
 } BoolExpr;
 
 /*
+ * TableValueExpr - a "TABLE( <subquery> )" expression indicating a subquery
+ * expression that is passed as a value to a function.
+ *
+ * This is <table value constructor by query> within the SQL Standard
+ */
+typedef struct TableValueExpr
+{
+	NodeTag     type;
+	Node       *subquery;
+	int         location;
+} TableValueExpr;
+
+
+/*
  * SubLink
  *
  * A SubLink represents a subselect appearing in an expression, and in some
@@ -491,6 +612,13 @@ typedef struct BoolExpr
  *	EXPR_SUBLINK		(SELECT with single targetlist item ...)
  *	ARRAY_SUBLINK		ARRAY(SELECT with single targetlist item ...)
  *	CTE_SUBLINK			WITH query (never actually part of an expression)
+ *	INITPLAN_FUNC_SUBLINK	for function run as initplan.
+ * For query like (create table t as select * from f()), QD is used to run
+ * CTAS, hence f() could only be run on entryDB(or QEs). But entryDB could not
+ * do the dispatch work. So if f() contains DDLs, the above query would fail.
+ * We introduce this new INITPLAN_FUNC_SUBLINK to make f() run as initplan
+ * and store intermidiate result into tuplestore. CTAS will fetch tuples from
+ * this tuplestore.
  * For ALL, ANY, and ROWCOMPARE, the lefthand is a list of expressions of the
  * same length as the subselect's targetlist.  ROWCOMPARE will *always* have
  * a list with more than one entry; if the subselect has just one target
@@ -529,7 +657,9 @@ typedef enum SubLinkType
 	ROWCOMPARE_SUBLINK,
 	EXPR_SUBLINK,
 	ARRAY_SUBLINK,
-	CTE_SUBLINK					/* for SubPlans only */
+	CTE_SUBLINK,				/* for SubPlans only */
+	INITPLAN_FUNC_SUBLINK,		/* for function run as initplan */
+	NOT_EXISTS_SUBLINK /* GPORCA uses NOT_EXIST_SUBLINK to implement correlated left anti semijoin. */
 } SubLinkType;
 
 
@@ -589,6 +719,9 @@ typedef struct SubPlan
 	/* The combining operators, transformed to an executable expression: */
 	Node	   *testexpr;		/* OpExpr or RowCompareExpr expression tree */
 	List	   *paramIds;		/* IDs of Params embedded in the above */
+
+    int         qDispSliceId;   /* CDB: slice# of initplan's root slice, or 0 */
+
 	/* Identification of the Plan tree to use: */
 	int			plan_id;		/* Index (from 1) in PlannedStmt.subplans */
 	/* Identification of the SubPlan for EXPLAIN and debugging purposes: */
@@ -604,15 +737,22 @@ typedef struct SubPlan
 	bool		unknownEqFalse; /* TRUE if it's okay to return FALSE when the
 								 * spec result is UNKNOWN; this allows much
 								 * simpler handling of null values */
+	bool		is_initplan;	/* CDB: Is the subplan implemented as an
+								 * initplan? */
+	bool		is_multirow;	/* CDB: May the subplan return more than
+								 * one row? */
+	bool		is_parallelized; /* Has subplan been processed to be executed in parallel setting */
 	/* Information for passing params into and out of the subselect: */
 	/* setParam and parParam are lists of integers (param IDs) */
 	List	   *setParam;		/* initplan subqueries have to set these
 								 * Params for parent plan */
 	List	   *parParam;		/* indices of input Params from parent plan */
 	List	   *args;			/* exprs to pass as parParam values */
+	List	   *extParam;		/* indices of input Params from ancestor plan */
 	/* Estimated execution costs: */
 	Cost		startup_cost;	/* one-time setup cost */
 	Cost		per_call_cost;	/* cost for each subplan evaluation */
+	bool		initPlanParallel; /* CDB: Init plan is parallelled */
 } SubPlan;
 
 /*
@@ -1129,16 +1269,23 @@ typedef struct SetToDefault
  * correctly during planning.  We can assume however that its "levelsup" is
  * always zero, due to the syntactic constraints on where it can appear.
  *
- * The referenced cursor can be represented either as a hardwired string
- * or as a reference to a run-time parameter of type REFCURSOR.  The latter
- * case is for the convenience of plpgsql.
+ * CURRENT OF is a bit like a stable function, in that it must be evaluated
+ * once during constant folding to give the QEs a consistent view of the query.
+ * To accomplish this, during constant folding, we evaluate the CURRENT OF
+ * expression into constant values of gp_segment_id, ctid, and tableoid; then,
+ * we bind these constant values into the CurrentOfExpr here for consumption
+ * by the QEs.
  */
 typedef struct CurrentOfExpr
 {
 	Expr		xpr;
-	Index		cvarno;			/* RT index of target relation */
 	char	   *cursor_name;	/* name of referenced cursor, or NULL */
 	int			cursor_param;	/* refcursor parameter number, or 0 */
+	/* for planning */
+	Index		cvarno;			/* RT index of target relation */
+	/* for validation */
+	Oid			target_relid;	/* OID of original target relation,
+								 * before any inheritance expansion */
 } CurrentOfExpr;
 
 /*--------------------
@@ -1304,5 +1451,167 @@ typedef struct FromExpr
 	List	   *fromlist;		/* List of join subtrees */
 	Node	   *quals;			/* qualifiers on join, if any */
 } FromExpr;
+
+
+typedef enum Movement
+{
+	MOVEMENT_NONE,			/* No motion required. */
+	MOVEMENT_FOCUS,			/* Fixed motion to a single segment. */
+	MOVEMENT_BROADCAST,		/* Broadcast motion. */
+	MOVEMENT_REPARTITION,	/* Hash motion */
+	MOVEMENT_LIM_RESTRUCT,	/* Restructure a Limit node into three stages */
+	MOVEMENT_EXPLICIT		/* Move tuples to the segments specified in the segid column */
+} Movement;
+
+/*----------
+ * Flow - describes a tuple flow in a parallelized plan
+ *
+ * This node type is a MPP extension.
+ *
+ * Plan nodes contain a reference to a Flow that characterizes the output
+ * tuple flow of the node.  In addition, the node contains fields used for
+ * parallelizing specification.
+ *----------
+ */
+typedef struct Flow
+{
+	NodeTag		type;			/* T_Flow */
+	FlowType	flotype;		/* Type of flow produced by the plan. */
+
+	/* What motion (including none) should be applied to this Plan's output. */
+	Movement	req_move;
+
+	/* Locus type (optimizer flow characterization).
+	 */
+	CdbLocusType	locustype;
+
+	/* If flotype is FLOW_SINGLETON, then this is the segment (-1 for entry)
+	 * on which tuples occur.  If req_move is MOVEMENT_FOCUS, then this is
+	 * the desired segment for the resulting singleton flow.
+	 */
+	int			segindex;		/* Segment index of singleton flow. */
+	int         numsegments;
+
+	/* If req_move is MOVEMENT_REPARTITION, these express the desired
+     * partitioning for a hash motion.  Else if flotype is FLOW_PARTITIONED,
+     * this is the partitioning key.  Otherwise NIL.
+	 * otherwise, they are NIL. */
+	List       *hashExprs;			/* list of hash expressions */
+	List	   *hashOpfamilies;
+
+	/* If req_move is MOVEMENT_EXPLICIT, this contains the index of the segid column
+	 * to use in the motion	 */
+	AttrNumber segidColIdx;
+
+    /* The original Flow ptr is saved here upon setting req_move. */
+    struct Flow    *flow_before_req_move;
+
+} Flow;
+
+typedef enum GroupingType
+{
+	GROUPINGTYPE_ROLLUP,         /* ROLLUP grouping extension */
+	GROUPINGTYPE_CUBE,           /* CUBE grouping extension */
+	GROUPINGTYPE_GROUPING_SETS   /* GROUPING SETS grouping extension */
+} GroupingType;
+
+
+/*
+ * DMLActionExpr
+ *
+ * Represents the expression which introduces the action in a SplitUpdate statement
+ */
+typedef struct DMLActionExpr
+{
+	Expr        xpr;
+} DMLActionExpr;
+
+/*
+ * PartSelectedExpr
+ *
+ * Returns true, if the PartitionSelector has selected this partition.
+ */
+typedef struct PartSelectedExpr
+{
+	Expr		xpr;
+	int			dynamicScanId;
+	Oid			partOid;
+} PartSelectedExpr;
+
+/*
+ * PartDefaultExpr
+ * Represents the expression which determines whether this a part is a default part
+ */
+typedef struct PartDefaultExpr
+{
+	Expr		xpr;
+	int 		level;			/* partitioning level */
+} PartDefaultExpr;
+
+/*
+ * PartBoundExpr
+ * Represents the expression which holds a part boundary in a PartitionSelector operator
+ */
+typedef struct PartBoundExpr
+{
+	Expr		xpr;
+	int 		level;			/* partitioning level */
+	Oid 		boundType;		/* the return type of this boundary - same as part key */
+	bool 		isLowerBound;	/* lower (min) or upper (max) bound */
+} PartBoundExpr;
+
+/*
+ * PartBoundInclusionExpr
+ * Represents the expression which determines whether a part boundary is inclusive or not
+ * in a PartitionSelector operator
+ */
+typedef struct PartBoundInclusionExpr
+{
+	Expr		xpr;
+	int			level;			/* partitioning level */
+	bool		isLowerBound;	/* lower (min) or upper (max) bound */
+} PartBoundInclusionExpr;
+
+/*
+ * PartBoundOpenExpr
+ * Represents the expression which determines whether a part boundary is open (unbounded) or not
+ * in a PartitionSelector operator
+ */
+typedef struct PartBoundOpenExpr
+{
+	Expr		xpr;
+	int		level;			/* partitioning level */
+	bool		isLowerBound;	/* lower (min) or upper (max) bound */
+} PartBoundOpenExpr;
+
+/*
+ * PartListRuleExpr
+ * Represents the expression that converts the current rule for
+ * level "level" to a list of constants. It only appears in
+ * levelExpressions (which is non-equality predicates) for
+ * the partition selector.
+ */
+typedef struct PartListRuleExpr
+{
+	Expr		xpr;
+	int			level;			/* partitioning level */
+	Oid 		resulttype;		/* the result type of expr - array type of part key */
+	Oid 		elementtype; 	/* the element type of partition list values */
+} PartListRuleExpr;
+
+/*
+ * PartListNullTestExpr
+ *
+ * Represents whether the list values of a partition for the specified level
+ * contains NULL or not, if nulltesttype is IS_NULL.
+ *
+ * NOTE: This expr only works for list partition.
+ */
+typedef struct PartListNullTestExpr
+{
+	Expr		xpr;
+	int			level;			/* partitioning level */
+	NullTestType nulltesttype;	/* IS NULL, IS NOT NULL */
+} PartListNullTestExpr;
 
 #endif   /* PRIMNODES_H */

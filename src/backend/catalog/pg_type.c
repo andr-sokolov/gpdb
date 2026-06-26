@@ -21,10 +21,12 @@
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/objectaccess.h"
+#include "catalog/oid_dispatch.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
+#include "catalog/pg_type_encoding.h"
 #include "catalog/pg_type_fn.h"
 #include "commands/typecmds.h"
 #include "miscadmin.h"
@@ -36,8 +38,40 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
-/* Potentially set by contrib/pg_upgrade_support functions */
-Oid			binary_upgrade_next_pg_type_oid = InvalidOid;
+#include "cdb/cdbvars.h"
+
+/*
+ * Record a type's default encoding clause in the catalog.
+ */
+void
+add_type_encoding(Oid typid, Datum typoptions)
+{
+	Relation	pg_type_encoding_desc;
+	TupleDesc	tupDesc;
+	Datum		 values[Natts_pg_type_encoding];
+	bool		 nulls[Natts_pg_type_encoding];
+	HeapTuple	 tuple;
+
+	/*
+	 * open pg_type
+	 */
+	pg_type_encoding_desc = heap_open(TypeEncodingRelationId, RowExclusiveLock);
+	tupDesc = pg_type_encoding_desc->rd_att;
+
+	MemSet(nulls, false, sizeof(nulls));
+	
+	values[Anum_pg_type_encoding_typid - 1] = ObjectIdGetDatum(typid);
+	values[Anum_pg_type_encoding_typoptions - 1] = typoptions;
+
+	tuple = heap_form_tuple(tupDesc, values, nulls);
+
+	/* Insert tuple into the relation */
+	simple_heap_insert(pg_type_encoding_desc, tuple);
+
+	CatalogUpdateIndexes(pg_type_encoding_desc, tuple);
+
+	heap_close(pg_type_encoding_desc, RowExclusiveLock);
+}
 
 /* ----------------------------------------------------------------
  *		TypeShellMake
@@ -126,13 +160,6 @@ TypeShellMake(const char *typeName, Oid typeNamespace, Oid ownerId)
 	 */
 	tup = heap_form_tuple(tupDesc, values, nulls);
 
-	/* Use binary-upgrade override for pg_type.oid, if supplied. */
-	if (IsBinaryUpgrade && OidIsValid(binary_upgrade_next_pg_type_oid))
-	{
-		HeapTupleSetOid(tup, binary_upgrade_next_pg_type_oid);
-		binary_upgrade_next_pg_type_oid = InvalidOid;
-	}
-
 	/*
 	 * insert the tuple in the relation and get the tuple's oid.
 	 */
@@ -176,7 +203,7 @@ TypeShellMake(const char *typeName, Oid typeNamespace, Oid ownerId)
  * ----------------------------------------------------------------
  */
 Oid
-TypeCreate(Oid newTypeOid,
+TypeCreateWithOptions(Oid newTypeOid,
 		   const char *typeName,
 		   Oid typeNamespace,
 		   Oid relationOid,		/* only for relation rowtypes */
@@ -206,7 +233,8 @@ TypeCreate(Oid newTypeOid,
 		   int32 typeMod,
 		   int32 typNDims,		/* Array dimensions for baseType */
 		   bool typeNotNull,
-		   Oid typeCollation)
+		   Oid typeCollation,
+		   Datum typoptions)
 {
 	Relation	pg_type_desc;
 	Oid			typeObjectId;
@@ -417,8 +445,9 @@ TypeCreate(Oid newTypeOid,
 			aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_TYPE, typeName);
 
 		/* trouble if caller wanted to force the OID */
-		if (OidIsValid(newTypeOid))
-			elog(ERROR, "cannot assign new OID to existing shell type");
+		if (OidIsValid(newTypeOid) &&
+			newTypeOid != HeapTupleHeaderGetOid((tup)->t_data))
+			elog(ERROR, "cannot assign new OID to existing shell type %u", HeapTupleHeaderGetOid((tup)->t_data));
 
 		/*
 		 * Okay to update existing shell type tuple
@@ -444,12 +473,6 @@ TypeCreate(Oid newTypeOid,
 		/* Force the OID if requested by caller */
 		if (OidIsValid(newTypeOid))
 			HeapTupleSetOid(tup, newTypeOid);
-		/* Use binary-upgrade override for pg_type.oid, if supplied. */
-		else if (IsBinaryUpgrade && OidIsValid(binary_upgrade_next_pg_type_oid))
-		{
-			HeapTupleSetOid(tup, binary_upgrade_next_pg_type_oid);
-			binary_upgrade_next_pg_type_oid = InvalidOid;
-		}
 		/* else allow system to assign oid */
 
 		typeObjectId = simple_heap_insert(pg_type_desc, tup);
@@ -477,11 +500,82 @@ TypeCreate(Oid newTypeOid,
 	InvokeObjectPostCreateHook(TypeRelationId, typeObjectId, 0);
 
 	/*
-	 * finish up
+	 * finish up with pg_type
 	 */
 	heap_close(pg_type_desc, RowExclusiveLock);
 
+	/* now pg_type_encoding */
+	if (DatumGetPointer(typoptions) != NULL)
+		add_type_encoding(typeObjectId, typoptions);
+
 	return typeObjectId;
+}
+
+Oid
+TypeCreate(Oid newTypeOid,
+		   const char *typeName,
+		   Oid typeNamespace,
+		   Oid relationOid,
+		   char relationKind,
+		   Oid ownerId,
+		   int16 internalSize,
+		   char typeType,
+		   char typeCategory,
+		   bool typePreferred,
+		   char typDelim,
+		   Oid inputProcedure,
+		   Oid outputProcedure,
+		   Oid receiveProcedure,
+		   Oid sendProcedure,
+		   Oid typmodinProcedure,
+		   Oid typmodoutProcedure,
+		   Oid analyzeProcedure,
+		   Oid elementType,
+		   bool isImplicitArray,
+		   Oid arrayType,
+		   Oid baseType,
+		   const char *defaultTypeValue,
+		   char *defaultTypeBin,
+		   bool passedByValue,
+		   char alignment,
+		   char storage,
+		   int32 typeMod,
+		   int32 typNDims,
+		   bool typeNotNull,
+		   Oid typeCollation)
+{
+	return TypeCreateWithOptions(newTypeOid,
+		   typeName,
+		   typeNamespace,
+		   relationOid,
+		   relationKind,
+		   ownerId,
+		   internalSize,
+		   typeType,
+		   typeCategory,
+		   typePreferred,
+		   typDelim,
+		   inputProcedure,
+		   outputProcedure,
+		   receiveProcedure,
+		   sendProcedure,
+		   typmodinProcedure,
+		   typmodoutProcedure,
+		   analyzeProcedure,
+		   elementType,
+		   isImplicitArray,
+		   arrayType,
+		   baseType,
+		   defaultTypeValue,
+		   defaultTypeBin,
+		   passedByValue,
+		   alignment,
+		   storage,
+		   typeMod,
+		   typNDims,
+		   typeNotNull,
+		   typeCollation,
+		   (Datum) 0);
 }
 
 /*

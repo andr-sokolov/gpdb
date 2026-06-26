@@ -455,10 +455,11 @@ extern SplitedPageLayout *gistSplit(Relation r, Page page, IndexTuple *itup,
 		  int len, GISTSTATE *giststate);
 
 /* gistxlog.c */
-extern void gist_redo(XLogRecPtr lsn, XLogRecord *record);
-extern void gist_desc(StringInfo buf, uint8 xl_info, char *rec);
+extern void gist_redo(XLogRecPtr beginLoc, XLogRecPtr lsn, XLogRecord *record);
+extern void gist_desc(StringInfo buf, XLogRecord *record);
 extern void gist_xlog_startup(void);
 extern void gist_xlog_cleanup(void);
+extern void gist_mask(char *pagedata, BlockNumber blkno);
 
 extern XLogRecPtr gistXLogUpdate(RelFileNode node, Buffer buffer,
 			   OffsetNumber *todelete, int ntodelete,

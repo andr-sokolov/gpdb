@@ -14,8 +14,14 @@
 #define TUPTOASTER_H
 
 #include "access/htup_details.h"
+#include "access/memtup.h"
 #include "utils/relcache.h"
 #include "storage/lock.h"
+
+#ifndef VARSIZE_TO_SHORT
+#define VARSIZE_TO_SHORT(PTR)   ((char)(VARSIZE(PTR)-VARHDRSZ+VARHDRSZ_SHORT) | 0x80)
+#define VARSIZE_TO_SHORT_D(D)   VARSIZE_TO_SHORT(DatumGetPointer(D))
+#endif 
 
 /*
  * This enables de-toasting of index entries.  Needed until VACUUM is
@@ -126,6 +132,8 @@ do { \
 	memcpy(&(toast_pointer), VARDATA_EXTERNAL(attre), sizeof(toast_pointer)); \
 } while (0)
 
+#define SET_VARSIZE_C(PTR)			(((varattrib_1b *) (PTR))->va_header |= 0x40)
+
 /* ----------
  * toast_insert_or_update -
  *
@@ -133,8 +141,14 @@ do { \
  * ----------
  */
 extern HeapTuple toast_insert_or_update(Relation rel,
-					   HeapTuple newtup, HeapTuple oldtup,
-					   int options);
+					   HeapTuple newtup, HeapTuple oldtup, 
+					   int toast_tuple_target,
+					   bool isFrozen, int options);
+
+extern MemTuple toast_insert_or_update_memtup(Relation rel,
+							  MemTuple newtup, MemTuple oldtup, 
+							  MemTupleBinding *pbind, int toast_tuple_target,
+							  bool isFrozen, int options);
 
 /* ----------
  * toast_delete -
@@ -142,7 +156,7 @@ extern HeapTuple toast_insert_or_update(Relation rel,
  *	Called by heap_delete().
  * ----------
  */
-extern void toast_delete(Relation rel, HeapTuple oldtup);
+extern void toast_delete(Relation rel, GenericTuple oldtup, MemTupleBinding *pbind);
 
 /* ----------
  * heap_tuple_fetch_attr() -
@@ -153,6 +167,22 @@ extern void toast_delete(Relation rel, HeapTuple oldtup);
  * ----------
  */
 extern struct varlena *heap_tuple_fetch_attr(struct varlena * attr);
+
+/* ----------
+ * varattrib_untoast_ptr_len
+ * 
+ *		Fast path to get the pointer and length, avoid palloc if possible.
+ * ----------
+ */
+extern void varattrib_untoast_ptr_len(Datum d, char **datastart, int *len, void **tofree);
+
+/* ----------
+ * varattrib_untoast_len
+ *
+ *		Fast path to get the length, avoid palloc if possible.
+ * ----------
+ */
+extern int varattrib_untoast_len(Datum d);
 
 /* ----------
  * heap_tuple_untoast_attr() -

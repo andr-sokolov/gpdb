@@ -90,7 +90,9 @@
 #include "storage/latch.h"
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
+#include "storage/procarray.h"
 #include "storage/procsignal.h"
+#include "storage/sinval.h"
 #include "storage/sinvaladt.h"
 #include "tcop/tcopprot.h"
 #include "utils/fmgroids.h"
@@ -104,7 +106,7 @@
 #include "utils/timestamp.h"
 #include "utils/tqual.h"
 
-
+#include "cdb/cdbvars.h"
 /*
  * GUC parameters
  */
@@ -122,7 +124,7 @@ int			autovacuum_multixact_freeze_max_age;
 int			autovacuum_vac_cost_delay;
 int			autovacuum_vac_cost_limit;
 
-int			Log_autovacuum_min_duration = -1;
+int			Log_autovacuum_min_duration = 0;
 
 /* how long to keep pgstat data in the launcher, in milliseconds */
 #define STATS_READ_DELAY 1000
@@ -584,6 +586,19 @@ AutoVacLauncherMain(int argc, char *argv[])
 	SetConfigOption("default_transaction_isolation", "read committed",
 					PGC_SUSET, PGC_S_OVERRIDE);
 
+
+/*
+ * In GPDB, we only want an autovacuum worker to start once we know
+ * there is a database to vacuum. Therefore, we never want emergency mode
+ * to start a worker immediately.
+ *
+ * Note: when the emergency mode is running it is possible to continuously
+ * start an autovacuum worker. Within the worker, the PMSIGNAL_START_AUTOVAC_LAUNCHER
+ * signal is sent when a database is found that is old enough to be vacuumed. If
+ * the database chosen is connectable, the launcher will never select it and the
+ * worker will continue to signal for a new launcher.
+ */
+#if 0
 	/*
 	 * In emergency mode, just start a worker (unless shutdown was requested)
 	 * and go away.
@@ -594,6 +609,7 @@ AutoVacLauncherMain(int argc, char *argv[])
 			do_start_worker();
 		proc_exit(0);			/* done */
 	}
+#endif
 
 	AutoVacuumShmem->av_launcherpid = MyProcPid;
 
@@ -1518,6 +1534,10 @@ AutoVacWorkerMain(int argc, char *argv[])
 	IsUnderPostmaster = true;
 	am_autovacuum_worker = true;
 
+	/* MPP-4990: Autovacuum always runs as utility-mode */
+	Gp_role = GP_ROLE_UTILITY;
+	Gp_session_role = GP_ROLE_UTILITY;
+
 	/* reset MyProcPid */
 	MyProcPid = getpid();
 
@@ -1711,7 +1731,7 @@ AutoVacWorkerMain(int argc, char *argv[])
 		InitPostgres(NULL, dbid, NULL, dbname);
 		SetProcessingMode(NormalProcessing);
 		set_ps_display(dbname, false);
-		ereport(DEBUG1,
+		ereport(LOG,
 				(errmsg("autovacuum: processing database \"%s\"", dbname)));
 
 		if (PostAuthDelay)
@@ -1927,6 +1947,16 @@ get_database_list(void)
 		 */
 		oldcxt = MemoryContextSwitchTo(resultcxt);
 
+		/*
+		 * In GPDB, autovacuum is currently disabled, except for the
+		 * anti-wraparound vacuum of template0 (and any other databases
+		 * with !datallowconn). The administrator is expected to do all
+		 * VACUUMing manually, except for template0, which you cannot
+		 * VACUUM manually because you cannot connect to it.
+		 */
+		if (pgdatabase->datallowconn)
+			continue;
+
 		avdb = (avw_dbase *) palloc(sizeof(avw_dbase));
 
 		avdb->adw_datid = HeapTupleGetOid(tup);
@@ -2113,6 +2143,15 @@ do_autovacuum(void)
 			int			backendID;
 			PGPROC	   *proc;
 
+			/*
+			 * GPDB_91_MERGE_FIXME: Autovacuum operates only on template0
+			 * database in Greenplum.  We expect no temp tables in template0.
+			 * Whenever we allow autovacuum to operate on user databases, we
+			 * must deal with the logic to detect other backend's temp tables
+			 * below.
+			 */
+			Assert(false);
+			
 			backendID = GetTempNamespaceBackendId(classForm->relnamespace);
 
 			/*
@@ -2458,8 +2497,8 @@ do_autovacuum(void)
 		did_vacuum = true;
 
 		/* the PGXACT flags are reset at the next end of transaction */
-
 		/* be tidy */
+
 deleted:
 		if (tab->at_datname != NULL)
 			pfree(tab->at_datname);
@@ -2906,6 +2945,13 @@ autovacuum_do_vac_analyze(autovac_table *tab,
 	MemSet(&vacstmt, 0, sizeof(vacstmt));
 	MemSet(&rangevar, 0, sizeof(rangevar));
 
+	/*
+	 * In GPDB, vacuumStatement_Relation() is called to vacuum relation,
+	 * which will copy VacuumStmt as its first operation.
+	 * We need a valid NodeTag to make copyObject() work correctly.
+	 */
+	rangevar.type = T_RangeVar;
+
 	rangevar.schemaname = tab->at_nspname;
 	rangevar.relname = tab->at_relname;
 	rangevar.location = -1;
@@ -2924,6 +2970,7 @@ autovacuum_do_vac_analyze(autovac_table *tab,
 	/* we pass the OID, but might need this anyway for an error message */
 	vacstmt.relation = &rangevar;
 	vacstmt.va_cols = NIL;
+	vacstmt.auto_stats = false;
 
 	/* Let pgstat know what we're doing */
 	autovac_report_activity(tab);

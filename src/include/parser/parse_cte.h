@@ -17,6 +17,7 @@
 #include "parser/parse_node.h"
 
 extern List *transformWithClause(ParseState *pstate, WithClause *withClause);
+extern CommonTableExpr *GetCTEForRTE(ParseState *pstate, RangeTblEntry *rte, int rtelevelsup);
 
 extern void analyzeCTETargetList(ParseState *pstate, CommonTableExpr *cte,
 					 List *tlist);

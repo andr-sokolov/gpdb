@@ -18,9 +18,9 @@
  *		ExecSeqNext				retrieve next tuple in sequential order.
  *		ExecInitSeqScan			creates and initializes a seqscan node.
  *		ExecEndSeqScan			releases any storage allocated.
- *		ExecReScanSeqScan		rescans the relation
  *		ExecSeqMarkPos			marks scan position
  *		ExecSeqRestrPos			restores scan position
+ *		ExecReScanSeqScan		rescans the relation
  */
 #include "postgres.h"
 
@@ -29,7 +29,7 @@
 #include "executor/nodeSeqscan.h"
 #include "utils/rel.h"
 
-static void InitScanRelation(SeqScanState *node, EState *estate, int eflags);
+static void InitScanRelation(SeqScanState *node, EState *estate, int eflags, Relation currentRelation);
 static TupleTableSlot *SeqNext(SeqScanState *node);
 
 /* ----------------------------------------------------------------
@@ -47,22 +47,22 @@ static TupleTableSlot *
 SeqNext(SeqScanState *node)
 {
 	HeapTuple	tuple;
-	HeapScanDesc scandesc;
 	EState	   *estate;
 	ScanDirection direction;
 	TupleTableSlot *slot;
+	HeapScanDesc scandesc;
 
 	/*
 	 * get information from the estate and scan state
 	 */
-	scandesc = node->ss_currentScanDesc;
-	estate = node->ps.state;
+	estate = node->ss.ps.state;
 	direction = estate->es_direction;
-	slot = node->ss_ScanTupleSlot;
-
+	slot = node->ss.ss_ScanTupleSlot;
+	scandesc = node->ss_currentScanDesc_heap;
 	/*
 	 * get the next tuple from the table
 	 */
+
 	tuple = heap_getnext(scandesc, direction);
 
 	/*
@@ -74,11 +74,11 @@ SeqNext(SeqScanState *node)
 	 * refcount will not be dropped until the tuple table slot is cleared.
 	 */
 	if (tuple)
-		ExecStoreTuple(tuple,	/* tuple to store */
-					   slot,	/* slot to store in */
-					   scandesc->rs_cbuf,		/* buffer associated with this
-												 * tuple */
-					   false);	/* don't pfree this pointer */
+		ExecStoreHeapTuple(tuple,	/* tuple to store */
+						   slot,	/* slot to store in */
+						   scandesc->rs_cbuf,		/* buffer associated with this
+													 * tuple */
+						   false);	/* don't pfree this pointer */
 	else
 		ExecClearTuple(slot);
 
@@ -122,30 +122,16 @@ ExecSeqScan(SeqScanState *node)
  * ----------------------------------------------------------------
  */
 static void
-InitScanRelation(SeqScanState *node, EState *estate, int eflags)
+InitScanRelation(SeqScanState *node, EState *estate, int eflags, Relation currentRelation)
 {
-	Relation	currentRelation;
-	HeapScanDesc currentScanDesc;
-
-	/*
-	 * get the relation object id from the relid'th entry in the range table,
-	 * open that relation and acquire appropriate lock on it.
-	 */
-	currentRelation = ExecOpenScanRelation(estate,
-									  ((SeqScan *) node->ps.plan)->scanrelid,
-										   eflags);
-
-	/* initialize a heapscan */
-	currentScanDesc = heap_beginscan(currentRelation,
-									 estate->es_snapshot,
-									 0,
-									 NULL);
-
-	node->ss_currentRelation = currentRelation;
-	node->ss_currentScanDesc = currentScanDesc;
+	node->ss_currentScanDesc_heap = heap_beginscan(currentRelation,
+												   estate->es_snapshot,
+												   0,
+												   NULL);
+	node->ss.ss_currentRelation = currentRelation;
 
 	/* and report the scan tuple slot's rowtype */
-	ExecAssignScanType(node, RelationGetDescr(currentRelation));
+	ExecAssignScanType(&node->ss, RelationGetDescr(currentRelation));
 }
 
 
@@ -156,7 +142,23 @@ InitScanRelation(SeqScanState *node, EState *estate, int eflags)
 SeqScanState *
 ExecInitSeqScan(SeqScan *node, EState *estate, int eflags)
 {
-	SeqScanState *scanstate;
+	Relation	currentRelation;
+
+	/*
+	 * get the relation object id from the relid'th entry in the range table,
+	 * open that relation and acquire appropriate lock on it.
+	 */
+	currentRelation = ExecOpenScanRelation(estate, node->scanrelid, eflags);
+
+	return ExecInitSeqScanForPartition(node, estate, eflags, currentRelation);
+}
+
+SeqScanState *
+ExecInitSeqScanForPartition(SeqScan *node, EState *estate, int eflags,
+							Relation currentRelation)
+{
+	SeqScanState *seqscanstate;
+	ScanState *scanstate;
 
 	/*
 	 * Once upon a time it was possible to have an outerPlan of a SeqScan, but
@@ -168,7 +170,8 @@ ExecInitSeqScan(SeqScan *node, EState *estate, int eflags)
 	/*
 	 * create state structure
 	 */
-	scanstate = makeNode(SeqScanState);
+	seqscanstate = makeNode(SeqScanState);
+	scanstate = (ScanState *) seqscanstate;
 	scanstate->ps.plan = (Plan *) node;
 	scanstate->ps.state = estate;
 
@@ -198,9 +201,7 @@ ExecInitSeqScan(SeqScan *node, EState *estate, int eflags)
 	/*
 	 * initialize scan relation
 	 */
-	InitScanRelation(scanstate, estate, eflags);
-
-	scanstate->ps.ps_TupFromTlist = false;
+	InitScanRelation(seqscanstate, estate, eflags, currentRelation);
 
 	/*
 	 * Initialize result tuple type and projection info.
@@ -208,7 +209,7 @@ ExecInitSeqScan(SeqScan *node, EState *estate, int eflags)
 	ExecAssignResultTypeFromTL(&scanstate->ps);
 	ExecAssignScanProjectionInfo(scanstate);
 
-	return scanstate;
+	return seqscanstate;
 }
 
 /* ----------------------------------------------------------------
@@ -221,29 +222,31 @@ void
 ExecEndSeqScan(SeqScanState *node)
 {
 	Relation	relation;
-	HeapScanDesc scanDesc;
 
 	/*
 	 * get information from node
 	 */
-	relation = node->ss_currentRelation;
-	scanDesc = node->ss_currentScanDesc;
+	relation = node->ss.ss_currentRelation;
 
 	/*
 	 * Free the exprcontext
 	 */
-	ExecFreeExprContext(&node->ps);
+	ExecFreeExprContext(&node->ss.ps);
 
 	/*
 	 * clean out the tuple table
 	 */
-	ExecClearTuple(node->ps.ps_ResultTupleSlot);
-	ExecClearTuple(node->ss_ScanTupleSlot);
+	ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
+	ExecClearTuple(node->ss.ss_ScanTupleSlot);
 
 	/*
 	 * close heap scan
 	 */
-	heap_endscan(scanDesc);
+	if (node->ss_currentScanDesc_heap)
+	{
+		heap_endscan(node->ss_currentScanDesc_heap);
+		node->ss_currentScanDesc_heap = NULL;
+	}
 
 	/*
 	 * close the heap relation.
@@ -265,48 +268,16 @@ ExecEndSeqScan(SeqScanState *node)
 void
 ExecReScanSeqScan(SeqScanState *node)
 {
-	HeapScanDesc scan;
+	if (node->ss_currentScanDesc_heap)
+	{
+		HeapScanDesc scan;
 
-	scan = node->ss_currentScanDesc;
+		scan = node->ss_currentScanDesc_heap;
 
-	heap_rescan(scan,			/* scan desc */
-				NULL);			/* new scan keys */
-
+		heap_rescan(scan,			/* scan desc */
+					NULL);			/* new scan keys */
+	}
+	else
+		elog(ERROR, "rescan called without scandesc");
 	ExecScanReScan((ScanState *) node);
-}
-
-/* ----------------------------------------------------------------
- *		ExecSeqMarkPos(node)
- *
- *		Marks scan position.
- * ----------------------------------------------------------------
- */
-void
-ExecSeqMarkPos(SeqScanState *node)
-{
-	HeapScanDesc scan = node->ss_currentScanDesc;
-
-	heap_markpos(scan);
-}
-
-/* ----------------------------------------------------------------
- *		ExecSeqRestrPos
- *
- *		Restores scan position.
- * ----------------------------------------------------------------
- */
-void
-ExecSeqRestrPos(SeqScanState *node)
-{
-	HeapScanDesc scan = node->ss_currentScanDesc;
-
-	/*
-	 * Clear any reference to the previously returned tuple.  This is needed
-	 * because the slot is simply pointing at scan->rs_cbuf, which
-	 * heap_restrpos will change; we'd have an internally inconsistent slot if
-	 * we didn't do this.
-	 */
-	ExecClearTuple(node->ss_ScanTupleSlot);
-
-	heap_restrpos(scan);
 }

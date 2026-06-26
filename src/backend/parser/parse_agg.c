@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * parse_agg.c
- *	  handle aggregates and window functions in parser
+ *	  handle aggregates in parser
  *
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -20,6 +20,7 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/tlist.h"
+#include "optimizer/walkers.h"
 #include "parser/parse_agg.h"
 #include "parser/parse_clause.h"
 #include "parser/parse_coerce.h"
@@ -28,6 +29,8 @@
 #include "rewrite/rewriteManip.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+
+#include "optimizer/walkers.h"
 
 
 typedef struct
@@ -49,6 +52,11 @@ typedef struct
 	bool		in_agg_direct_args;
 } check_ungrouped_columns_context;
 
+typedef struct
+{
+	int sublevels_up;
+} checkHasGroupExtFuncs_context;
+
 static int check_agg_arguments(ParseState *pstate,
 					List *directargs,
 					List *args,
@@ -60,6 +68,8 @@ static void check_ungrouped_columns(Node *node, ParseState *pstate, Query *qry,
 						List **func_grouped_rels);
 static bool check_ungrouped_columns_walker(Node *node,
 							   check_ungrouped_columns_context *context);
+static List* get_groupclause_exprs(Node *grpcl, List *targetList);
+static Node *make_agg_arg(Oid argtype, Oid argcollation);
 
 
 /*
@@ -333,6 +343,12 @@ transformAggregateCall(ParseState *pstate, Aggref *agg,
 		case EXPR_KIND_TRIGGER_WHEN:
 			err = _("aggregate functions are not allowed in trigger WHEN conditions");
 			break;
+		case EXPR_KIND_PARTITION_EXPRESSION:
+			err = _("aggregate functions are not allowed in partition key expression");
+
+		case EXPR_KIND_SCATTER_BY:
+			/* okay */
+			break;
 
 			/*
 			 * There is intentionally no default: case here, so that the
@@ -549,6 +565,7 @@ transformWindowFuncCall(ParseState *pstate, WindowFunc *wfunc,
 {
 	const char *err;
 	bool		errkind;
+	char	   *name;
 
 	/*
 	 * A window function call can't contain another one (but aggs are OK). XXX
@@ -662,6 +679,13 @@ transformWindowFuncCall(ParseState *pstate, WindowFunc *wfunc,
 		case EXPR_KIND_TRIGGER_WHEN:
 			err = _("window functions are not allowed in trigger WHEN conditions");
 			break;
+		case EXPR_KIND_PARTITION_EXPRESSION:
+			err = _("window functions are not allowed in partition key expression");
+			break;
+
+		case EXPR_KIND_SCATTER_BY:
+			/* okay */
+			break;
 
 			/*
 			 * There is intentionally no default: case here, so that the
@@ -692,20 +716,35 @@ transformWindowFuncCall(ParseState *pstate, WindowFunc *wfunc,
 	 */
 	if (windef->name)
 	{
-		Index		winref = 0;
-		ListCell   *lc;
+		name = windef->name;
 
 		Assert(windef->refname == NULL &&
 			   windef->partitionClause == NIL &&
 			   windef->orderClause == NIL &&
 			   windef->frameOptions == FRAMEOPTION_DEFAULTS);
+	}
+	else if (windef->refname &&
+			 !windef->partitionClause &&
+			 !windef->orderClause &&
+			 (windef->frameOptions & FRAMEOPTION_NONDEFAULT) == 0)
+	{
+		/* This is "agg() OVER (w)" */
+		name = windef->refname;
+	}
+	else
+		name = NULL;
+
+	if (name)
+	{
+		Index		winref = 0;
+		ListCell   *lc;
 
 		foreach(lc, pstate->p_windowdefs)
 		{
 			WindowDef  *refwin = (WindowDef *) lfirst(lc);
 
 			winref++;
-			if (refwin->name && strcmp(refwin->name, windef->name) == 0)
+			if (refwin->name && strcmp(refwin->name, name) == 0)
 			{
 				wfunc->winref = winref;
 				break;
@@ -714,7 +753,7 @@ transformWindowFuncCall(ParseState *pstate, WindowFunc *wfunc,
 		if (lc == NULL)			/* didn't find it? */
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_OBJECT),
-					 errmsg("window \"%s\" does not exist", windef->name),
+					 errmsg("window \"%s\" does not exist", name),
 					 parser_errposition(pstate, windef->location)));
 	}
 	else
@@ -803,13 +842,28 @@ parseCheckAggregates(ParseState *pstate, Query *qry)
 	 */
 	foreach(l, qry->groupClause)
 	{
-		SortGroupClause *grpcl = (SortGroupClause *) lfirst(l);
-		Node	   *expr;
+		Node	   *grpcl = lfirst(l);
+		List	   *exprs;
+		ListCell   *l2;
 
-		expr = get_sortgroupclause_expr(grpcl, qry->targetList);
-		if (expr == NULL)
-			continue;			/* probably cannot happen */
-		groupClauses = lcons(expr, groupClauses);
+		if (grpcl == NULL)
+			continue;
+
+		Assert(IsA(grpcl, SortGroupClause) || IsA(grpcl, GroupingClause));
+
+		exprs = get_groupclause_exprs(grpcl, qry->targetList);
+
+		foreach(l2, exprs)
+		{
+			Node	   *expr = (Node *) lfirst(l2);
+
+			// FIXME: Should this go into check_agg_arguments now?
+			if (checkExprHasGroupExtFuncs(expr))
+				ereport(ERROR,
+						(errcode(ERRCODE_GROUPING_ERROR),
+						 errmsg("grouping() or group_id() not allowed in GROUP BY clause")));
+			groupClauses = lcons(expr, groupClauses);
+		}
 	}
 
 	/*
@@ -991,7 +1045,7 @@ check_ungrouped_columns_walker(Node *node,
 	{
 		Var		   *var = (Var *) node;
 		RangeTblEntry *rte;
-		char	   *attname;
+		const char *attname;
 
 		if (var->varlevelsup != context->sublevels_up)
 			return false;		/* it's not local to my query, ignore */
@@ -1207,9 +1261,11 @@ build_aggregate_fnexprs(Oid *agg_input_types,
 						Oid transfn_oid,
 						Oid invtransfn_oid,
 						Oid finalfn_oid,
+						Oid combinefn_oid,
 						Expr **transfnexpr,
 						Expr **invtransfnexpr,
-						Expr **finalfnexpr)
+						Expr **finalfnexpr,
+						Expr **combinefnexpr)
 {
 	Param	   *argp;
 	List	   *args;
@@ -1277,39 +1333,232 @@ build_aggregate_fnexprs(Oid *agg_input_types,
 	if (!OidIsValid(finalfn_oid))
 	{
 		*finalfnexpr = NULL;
-		return;
+	}
+	else
+	{
+		/*
+		 * Build expr tree for final function
+		 */
+		argp = makeNode(Param);
+		argp->paramkind = PARAM_EXEC;
+		argp->paramid = -1;
+		argp->paramtype = agg_state_type;
+		argp->paramtypmod = -1;
+		argp->location = -1;
+		args = list_make1(argp);
+
+		/* finalfn may take additional args, which match agg's input types */
+		for (i = 0; i < num_finalfn_inputs - 1; i++)
+		{
+			argp = makeNode(Param);
+			argp->paramkind = PARAM_EXEC;
+			argp->paramid = -1;
+			argp->paramtype = agg_input_types[i];
+			argp->paramtypmod = -1;
+			argp->paramcollid = agg_input_collation;
+			argp->location = -1;
+			args = lappend(args, argp);
+		}
+
+		*finalfnexpr = (Expr *) makeFuncExpr(finalfn_oid,
+											 agg_result_type,
+											 args,
+											 InvalidOid,
+											 agg_input_collation,
+											 COERCE_EXPLICIT_CALL);
+		/* finalfn is currently never treated as variadic */
 	}
 
-	/*
-	 * Build expr tree for final function
-	 */
-	argp = makeNode(Param);
-	argp->paramkind = PARAM_EXEC;
-	argp->paramid = -1;
-	argp->paramtype = agg_state_type;
-	argp->paramtypmod = -1;
-	argp->paramcollid = agg_input_collation;
-	argp->location = -1;
-	args = list_make1(argp);
-
-	/* finalfn may take additional args, which match agg's input types */
-	for (i = 0; i < num_finalfn_inputs - 1; i++)
+	/* combine function */
+	if (OidIsValid(combinefn_oid))
 	{
 		argp = makeNode(Param);
 		argp->paramkind = PARAM_EXEC;
 		argp->paramid = -1;
-		argp->paramtype = agg_input_types[i];
+		argp->paramtype = agg_state_type;
 		argp->paramtypmod = -1;
-		argp->paramcollid = agg_input_collation;
 		argp->location = -1;
-		args = lappend(args, argp);
+		args = list_make1(argp);
+
+		/* XXX: is agg_state_type correct here? */
+		*combinefnexpr = (Expr *) makeFuncExpr(combinefn_oid,
+											   agg_state_type,
+											   args,
+											   InvalidOid,
+											   agg_input_collation,
+											   COERCE_EXPLICIT_CALL);
+	}
+}
+
+/*
+ * Like build_aggregate_transfn_expr, but creates an expression tree for the
+ * serialization function of an aggregate.
+ */
+void
+build_aggregate_serialfn_expr(Oid serialfn_oid,
+							  Expr **serialfnexpr)
+{
+	List	   *args;
+	FuncExpr   *fexpr;
+
+	/* serialfn always takes INTERNAL and returns BYTEA */
+	args = list_make1(make_agg_arg(INTERNALOID, InvalidOid));
+
+	fexpr = makeFuncExpr(serialfn_oid,
+						 BYTEAOID,
+						 args,
+						 InvalidOid,
+						 InvalidOid,
+						 COERCE_EXPLICIT_CALL);
+	*serialfnexpr = (Expr *) fexpr;
+}
+
+/*
+ * Like build_aggregate_transfn_expr, but creates an expression tree for the
+ * deserialization function of an aggregate.
+ */
+void
+build_aggregate_deserialfn_expr(Oid deserialfn_oid,
+								Expr **deserialfnexpr)
+{
+	List	   *args;
+	FuncExpr   *fexpr;
+
+	/* deserialfn always takes BYTEA, INTERNAL and returns INTERNAL */
+	args = list_make2(make_agg_arg(BYTEAOID, InvalidOid),
+					  make_agg_arg(INTERNALOID, InvalidOid));
+
+	fexpr = makeFuncExpr(deserialfn_oid,
+						 INTERNALOID,
+						 args,
+						 InvalidOid,
+						 InvalidOid,
+						 COERCE_EXPLICIT_CALL);
+	*deserialfnexpr = (Expr *) fexpr;
+}
+
+
+/*
+ * Convenience function to build dummy argument expressions for aggregates.
+ *
+ * We really only care that an aggregate support function can discover its
+ * actual argument types at runtime using get_fn_expr_argtype(), so it's okay
+ * to use Param nodes that don't correspond to any real Param.
+ */
+static Node *
+make_agg_arg(Oid argtype, Oid argcollation)
+{
+	Param	   *argp = makeNode(Param);
+
+	argp->paramkind = PARAM_EXEC;
+	argp->paramid = -1;
+	argp->paramtype = argtype;
+	argp->paramtypmod = -1;
+	argp->paramcollid = argcollation;
+	argp->location = -1;
+	return (Node *) argp;
+}
+
+/*
+ * get_groupclause_exprs -
+ *     Return a list of expressions appeared in a given GroupClause or
+ *     GroupingClause.
+ */
+List*
+get_groupclause_exprs(Node *grpcl, List *targetList)
+{
+	List *result = NIL;
+
+	if ( !grpcl )
+		return result;
+
+	Assert(IsA(grpcl, SortGroupClause) ||
+		   IsA(grpcl, GroupingClause) ||
+		   IsA(grpcl, List));
+
+	if (IsA(grpcl, SortGroupClause))
+	{
+		Node *node = get_sortgroupclause_expr((SortGroupClause *) grpcl, targetList);
+		result = lappend(result, node);
 	}
 
-	*finalfnexpr = (Expr *) makeFuncExpr(finalfn_oid,
-										 agg_result_type,
-										 args,
-										 InvalidOid,
-										 agg_input_collation,
-										 COERCE_EXPLICIT_CALL);
-	/* finalfn is currently never treated as variadic */
+	else if (IsA(grpcl, GroupingClause))
+	{
+		ListCell* l;
+		GroupingClause *gc = (GroupingClause*)grpcl;
+
+		foreach(l, gc->groupsets)
+		{
+			result = list_concat(result,
+								 get_groupclause_exprs((Node*)lfirst(l), targetList));
+		}
+	}
+
+	else
+	{
+		List *exprs = (List *)grpcl;
+		ListCell *lc;
+
+		foreach (lc, exprs)
+		{
+			result = list_concat(result, get_groupclause_exprs((Node *)lfirst(lc),
+															   targetList));
+		}
+	}
+
+	return result;
+}
+
+static bool
+checkExprHasGroupExtFuncs_walker(Node *node, checkHasGroupExtFuncs_context *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, GroupingFunc) || IsA(node, GroupId))
+	{
+		/* XXX do GroupingFunc or GroupId need 'levelsup'? */
+		return true;		/* abort the tree traversal and return true */
+	}
+	if (IsA(node, Query))
+	{
+		/* Recurse into subselects */
+		bool		result;
+
+		context->sublevels_up++;
+		result = query_tree_walker((Query *) node,
+								   checkExprHasGroupExtFuncs_walker,
+								   (void *) context, 0);
+		context->sublevels_up--;
+		return result;
+	}
+	return expression_tree_walker(node, checkExprHasGroupExtFuncs_walker,
+								  (void *) context);
+}
+
+/*
+ * checkExprHasGroupExtFuncs -
+ *  Check if an expression contains a grouping() or group_id() call.
+ *
+ *
+ * The objective of this routine is to detect whether there are window functions
+ * belonging to the initial query level. Window functions belonging to
+ * subqueries or outer queries do NOT cause a true result.  We must recurse into
+ * subqueries to detect outer-reference window functions that logically belong
+ * to the initial query level.
+ *
+ * Compare this function to checkExprHasAggs().
+ */
+bool
+checkExprHasGroupExtFuncs(Node *node)
+{
+	checkHasGroupExtFuncs_context context;
+	context.sublevels_up = 0;
+
+	/*
+	 * Must be prepared to start with a Query or a bare expression tree; if
+	 * it's a Query, we don't want to increment sublevels_up.
+	 */
+	return query_or_expression_tree_walker(node,
+										   checkExprHasGroupExtFuncs_walker,
+										   (void *) &context, 0);
 }

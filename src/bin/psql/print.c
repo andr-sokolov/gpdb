@@ -229,6 +229,9 @@ format_numeric_locale(const char *my_str)
 	/* assert we didn't underestimate new_len (an overestimate is OK) */
 	Assert(strlen(new_str) <= new_len);
 
+	/* copy the rest (fractional digits and/or exponent, and \0 terminator) */
+	strcpy(&new_str[new_str_pos], &my_str[i]);
+
 	return new_str;
 }
 

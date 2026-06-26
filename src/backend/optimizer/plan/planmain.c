@@ -26,6 +26,13 @@
 #include "optimizer/placeholder.h"
 #include "optimizer/planmain.h"
 
+#include "catalog/pg_proc.h"
+#include "cdb/cdbpath.h"        /* cdbpath_rows() */
+#include "cdb/cdbutil.h"
+#include "cdb/cdbvars.h"
+#include "optimizer/cost.h"
+
+static Bitmapset *distcols_in_groupclause(List *gc, Bitmapset *bms);
 
 /*
  * query_planner
@@ -67,12 +74,14 @@ query_planner(PlannerInfo *root, List *tlist,
 	 */
 	if (parse->jointree->fromlist == NIL)
 	{
+		Path	   *result_path;
+
 		/* We need a dummy joinrel to describe the empty set of baserels */
 		final_rel = build_empty_join_rel(root);
 
 		/* The only path for it is a trivial Result path */
-		add_path(final_rel, (Path *)
-				 create_result_path((List *) parse->jointree->quals));
+		result_path = (Path *) create_result_path((List *) parse->jointree->quals);
+		add_path(final_rel, result_path);
 
 		/* Select cheapest path (pretty easy in this case...) */
 		set_cheapest(final_rel);
@@ -83,6 +92,21 @@ query_planner(PlannerInfo *root, List *tlist,
 		 */
 		root->canon_pathkeys = NIL;
 		(*qp_callback) (root, qp_extra);
+
+		if (Gp_role == GP_ROLE_DISPATCH)
+		{
+			char		exec_location;
+
+			exec_location = check_execute_on_functions((Node *) parse->targetList);
+
+			if (exec_location == PROEXECLOCATION_MASTER || exec_location == PROEXECLOCATION_INITPLAN)
+				CdbPathLocus_MakeEntry(&result_path->locus);
+			else if (exec_location == PROEXECLOCATION_ALL_SEGMENTS)
+				CdbPathLocus_MakeStrewn(&result_path->locus,
+										getgpsegmentCount());
+		}
+		else
+			CdbPathLocus_MakeEntry(&result_path->locus);
 
 		return final_rel;
 	}
@@ -150,6 +174,12 @@ query_planner(PlannerInfo *root, List *tlist,
 	 * mergings of classes.)
 	 */
 	reconsider_outer_join_clauses(root);
+
+	/**
+	 * Use the list of equijoined keys to transfer quals between relations.  For example,
+	 *   A=B AND f(A) implies A=B AND f(A) and f(B), under some restrictions on f.
+	 */
+	generate_implied_quals(root);
 
 	/*
 	 * If we formed any equivalence classes, generate additional restriction
@@ -239,6 +269,129 @@ query_planner(PlannerInfo *root, List *tlist,
 	if (!final_rel || !final_rel->cheapest_total_path ||
 		final_rel->cheapest_total_path->param_info != NULL)
 		elog(ERROR, "failed to construct the join relation");
+	Insist(final_rel->cheapest_startup_path);
 
 	return final_rel;
+}
+
+/*
+ * distcols_in_groupclause -
+ *     Return all distinct tleSortGroupRef values in a GROUP BY clause.
+ *
+ * If this is a GROUPING_SET, this function is called recursively to
+ * find the tleSortGroupRef values for underlying grouping columns.
+ */
+static Bitmapset *
+distcols_in_groupclause(List *gc, Bitmapset *bms)
+{
+	ListCell *l;
+
+	foreach(l, gc)
+	{
+		Node *node = lfirst(l);
+
+		if (node == NULL)
+			continue;
+
+		Assert(IsA(node, SortGroupClause) ||
+			   IsA(node, List) ||
+			   IsA(node, GroupingClause));
+
+		if (IsA(node, SortGroupClause))
+		{
+			bms = bms_add_member(bms, ((SortGroupClause *) node)->tleSortGroupRef);
+		}
+
+		else if (IsA(node, List))
+		{
+			bms = distcols_in_groupclause((List *)node, bms);
+		}
+
+		else if (IsA(node, GroupingClause))
+		{
+			List *groupsets = ((GroupingClause *)node)->groupsets;
+			bms = distcols_in_groupclause(groupsets, bms);
+		}
+	}
+
+	return bms;
+}
+
+/*
+ * num_distcols_in_grouplist -
+ *      Return number of distinct columns/expressions that appeared in
+ *      a list of GroupClauses or GroupingClauses.
+ */
+int
+num_distcols_in_grouplist(List *gc)
+{
+	Bitmapset *bms = NULL;
+	int num_cols;
+
+	bms = distcols_in_groupclause(gc, bms);
+
+	num_cols = bms_num_members(bms);
+	bms_free(bms);
+
+	return num_cols;
+}
+
+/**
+ * Planner configuration related
+ */
+
+/**
+ * Default configuration information
+ */
+PlannerConfig *DefaultPlannerConfig(void)
+{
+	PlannerConfig *c1 = (PlannerConfig *) palloc(sizeof(PlannerConfig));
+	c1->enable_sort = enable_sort;
+	c1->enable_hashagg = enable_hashagg;
+	c1->enable_groupagg = enable_groupagg;
+	c1->enable_nestloop = enable_nestloop;
+	c1->enable_mergejoin = enable_mergejoin;
+	c1->enable_hashjoin = enable_hashjoin;
+	c1->gp_enable_hashjoin_size_heuristic = gp_enable_hashjoin_size_heuristic;
+	c1->gp_enable_predicate_propagation = gp_enable_predicate_propagation;
+	c1->constraint_exclusion = constraint_exclusion;
+
+	c1->gp_enable_minmax_optimization = gp_enable_minmax_optimization;
+	c1->gp_enable_multiphase_agg = gp_enable_multiphase_agg;
+	c1->gp_enable_preunique = gp_enable_preunique;
+	c1->gp_eager_preunique = gp_eager_preunique;
+	c1->gp_hashagg_streambottom = gp_hashagg_streambottom;
+	c1->gp_enable_agg_distinct = gp_enable_agg_distinct;
+	c1->gp_enable_dqa_pruning = gp_enable_dqa_pruning;
+	c1->gp_eager_dqa_pruning = gp_eager_dqa_pruning;
+	c1->gp_eager_one_phase_agg = gp_eager_one_phase_agg;
+	c1->gp_eager_two_phase_agg = gp_eager_two_phase_agg;
+	c1->gp_enable_groupext_distinct_pruning = gp_enable_groupext_distinct_pruning;
+	c1->gp_enable_groupext_distinct_gather = gp_enable_groupext_distinct_gather;
+	c1->gp_enable_sort_distinct = gp_enable_sort_distinct;
+
+	c1->gp_enable_direct_dispatch = gp_enable_direct_dispatch;
+	c1->gp_dynamic_partition_pruning = gp_dynamic_partition_pruning;
+
+	c1->gp_cte_sharing = gp_cte_sharing;
+
+	c1->honor_order_by = true;
+
+	c1->is_under_subplan = false;
+
+	c1->force_singleQE = false;
+
+	return c1;
+}
+
+/*
+ * Copy configuration information
+ */
+PlannerConfig *
+CopyPlannerConfig(const PlannerConfig *c1)
+{
+	PlannerConfig *c2 = (PlannerConfig *) palloc(sizeof(PlannerConfig));
+
+	memcpy(c2, c1, sizeof(PlannerConfig));
+	return c2;
 }

@@ -40,12 +40,14 @@
 #include <sys/stat.h>
 
 #include "access/transam.h"
+#include "access/xlog_internal.h"
 #include "common/string.h"
 #include "miscadmin.h"
 #include "replication/slot.h"
 #include "storage/fd.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
+#include "replication/walsender.h"
 
 /*
  * Replication slot on-disk data structure.
@@ -391,6 +393,7 @@ ReplicationSlotRelease(void)
 
 		SpinLockAcquire(&slot->mutex);
 		vslot->active = false;
+		vslot->walsnd = NULL;
 		SpinLockRelease(&slot->mutex);
 	}
 
@@ -487,6 +490,7 @@ ReplicationSlotDropAcquired(void)
 
 		SpinLockAcquire(&slot->mutex);
 		vslot->active = false;
+		vslot->walsnd = NULL;
 		SpinLockRelease(&slot->mutex);
 
 		ereport(fail_softly ? WARNING : ERROR,
@@ -505,6 +509,7 @@ ReplicationSlotDropAcquired(void)
 	LWLockAcquire(ReplicationSlotControlLock, LW_EXCLUSIVE);
 	slot->active = false;
 	slot->in_use = false;
+	slot->walsnd = NULL;
 	LWLockRelease(ReplicationSlotControlLock);
 
 	/*
@@ -726,6 +731,9 @@ ReplicationSlotsComputeLogicalRestartLSN(void)
 		restart_lsn = s->data.restart_lsn;
 		SpinLockRelease(&s->mutex);
 
+		if (restart_lsn == InvalidXLogRecPtr)
+			continue;
+
 		if (result == InvalidXLogRecPtr ||
 			restart_lsn < result)
 			result = restart_lsn;
@@ -809,6 +817,144 @@ CheckSlotRequirements(void)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("replication slots can only be used if wal_level >= archive")));
+}
+
+/*
+ * Reserve WAL for the currently active slot.
+ *
+ * Compute and set restart_lsn in a manner that's appropriate for the type of
+ * the slot and concurrency safe.
+ */
+void
+ReplicationSlotReserveWal(void)
+{
+	ReplicationSlot *slot = MyReplicationSlot;
+
+	Assert(slot != NULL);
+	Assert(slot->data.restart_lsn == InvalidXLogRecPtr);
+
+	/*
+	 * The replication slot mechanism is used to prevent removal of required
+	 * WAL. As there is no interlock between this routine and checkpoints, WAL
+	 * segments could concurrently be removed when a now stale return value of
+	 * ReplicationSlotsComputeRequiredLSN() is used. In the unlikely case that
+	 * this happens we'll just retry.
+	 */
+	while (true)
+	{
+		XLogSegNo	segno;
+
+		/*
+		 * For logical slots log a standby snapshot and start logical decoding
+		 * at exactly that position. That allows the slot to start up more
+		 * quickly.
+		 *
+		 * That's not needed (or indeed helpful) for physical slots as they'll
+		 * start replay at the last logged checkpoint anyway. Instead return
+		 * the location of the last redo LSN. While that slightly increases
+		 * the chance that we have to retry, it's where a base backup has to
+		 * start replay at.
+		 */
+		if (!RecoveryInProgress() && SlotIsLogical(slot))
+		{
+			XLogRecPtr	flushptr;
+
+			/* start at current insert position */
+			slot->data.restart_lsn = GetXLogInsertRecPtr();
+
+			/* make sure we have enough information to start */
+			flushptr = LogStandbySnapshot();
+
+			/* and make sure it's fsynced to disk */
+			XLogFlush(flushptr);
+		}
+		else
+		{
+			slot->data.restart_lsn = GetRedoRecPtr();
+		}
+
+		/* prevent WAL removal as fast as possible */
+		ReplicationSlotsComputeRequiredLSN();
+
+		/*
+		 * If all required WAL is still there, great, otherwise retry. The
+		 * slot should prevent further removal of WAL, unless there's a
+		 * concurrent ReplicationSlotsComputeRequiredLSN() after we've written
+		 * the new restart_lsn above, so normally we should never need to loop
+		 * more than twice.
+		 */
+		XLByteToSeg(slot->data.restart_lsn, segno);
+		if (XLogGetLastRemovedSegno() < segno)
+			break;
+	}
+}
+
+/*
+ * Mark any slot that points to an LSN older than the given segment
+ * as invalid; it requires WAL that's about to be removed.
+ *
+ * NB - this runs as part of checkpoint, so avoid raising errors if possible.
+ */
+void
+InvalidateObsoleteReplicationSlots(XLogSegNo oldestSegno)
+{
+	XLogRecPtr	oldestLSN;
+
+	XLogSegNoOffsetToRecPtr(oldestSegno, 0, oldestLSN);
+
+restart:
+	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
+	for (int i = 0; i < max_replication_slots; i++)
+	{
+		ReplicationSlot *s = &ReplicationSlotCtl->replication_slots[i];
+		XLogRecPtr	restart_lsn = InvalidXLogRecPtr;
+		char	   *slotname;
+
+		if (!s->in_use)
+			continue;
+		if (!s->walsnd)
+			continue;
+
+		SpinLockAcquire(&s->mutex);
+		if (s->data.restart_lsn == InvalidXLogRecPtr ||
+			s->data.restart_lsn >= oldestLSN)
+		{
+			SpinLockRelease(&s->mutex);
+			continue;
+		}
+
+		slotname = pstrdup(NameStr(s->data.name));
+		restart_lsn = s->data.restart_lsn;
+
+		SpinLockRelease(&s->mutex);
+		LWLockRelease(ReplicationSlotControlLock);
+
+		ereport(LOG,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				errmsg("replication slot %s becomes obsolete, stop the WAL sender %d",
+						slotname, s->walsnd->pid)));
+		/*
+		 * Signal walsenders to move to stopping state.
+		 */
+		WalSndInitStoppingOneWalSender(s->walsnd);
+
+		/*
+		 * Wait for WAL senders to be in stopping state.  This prevents commands
+		 * from writing new WAL.
+		 */
+		WalSndWaitStoppingOneWalSender(s->walsnd);
+
+		WalSndCtl->error = WALSNDERROR_WALREAD;
+
+		SpinLockAcquire(&s->mutex);
+		s->data.restart_lsn = InvalidXLogRecPtr;
+		SpinLockRelease(&s->mutex);
+
+		/* if we did anything, start from scratch */
+		CHECK_FOR_INTERRUPTS();
+		goto restart;
+	}
+	LWLockRelease(ReplicationSlotControlLock);
 }
 
 /*
@@ -1008,6 +1154,16 @@ SaveSlotToPath(ReplicationSlot *slot, const char *dir, int elevel)
 						   S_IRUSR | S_IWUSR);
 	if (fd < 0)
 	{
+		/*
+		 * If not an ERROR, then release the lock before returning.  In case
+		 * of an ERROR, the error recovery path automatically releases the
+		 * lock, but no harm in explicitly releasing even in that case.  Note
+		 * that LWLockRelease() could affect errno.
+		 */
+		int			save_errno = errno;
+
+		LWLockRelease(slot->io_in_progress_lock);
+		errno = save_errno;
 		ereport(elevel,
 				(errcode_for_file_access(),
 				 errmsg("could not create file \"%s\": %m",
@@ -1016,7 +1172,7 @@ SaveSlotToPath(ReplicationSlot *slot, const char *dir, int elevel)
 	}
 
 	cp.magic = SLOT_MAGIC;
-	INIT_CRC32(cp.checksum);
+	INIT_CRC32C(cp.checksum);
 	cp.version = SLOT_VERSION;
 	cp.length = ReplicationSlotOnDiskV2Size;
 
@@ -1026,10 +1182,10 @@ SaveSlotToPath(ReplicationSlot *slot, const char *dir, int elevel)
 
 	SpinLockRelease(&slot->mutex);
 
-	COMP_CRC32(cp.checksum,
+	COMP_CRC32C(cp.checksum,
 				(char *) (&cp) + SnapBuildOnDiskNotChecksummedSize,
 				SnapBuildOnDiskChecksummedSize);
-	FIN_CRC32(cp.checksum);
+	FIN_CRC32C(cp.checksum);
 
 	errno = 0;
 	if ((write(fd, &cp, sizeof(cp))) != sizeof(cp))
@@ -1037,6 +1193,7 @@ SaveSlotToPath(ReplicationSlot *slot, const char *dir, int elevel)
 		int			save_errno = errno;
 
 		CloseTransientFile(fd);
+		LWLockRelease(slot->io_in_progress_lock);
 
 		/* if write didn't set errno, assume problem is no disk space */
 		errno = save_errno ? save_errno : ENOSPC;
@@ -1053,6 +1210,7 @@ SaveSlotToPath(ReplicationSlot *slot, const char *dir, int elevel)
 		int			save_errno = errno;
 
 		CloseTransientFile(fd);
+		LWLockRelease(slot->io_in_progress_lock);
 		errno = save_errno;
 		ereport(elevel,
 				(errcode_for_file_access(),
@@ -1066,6 +1224,10 @@ SaveSlotToPath(ReplicationSlot *slot, const char *dir, int elevel)
 	/* rename to permanent file, fsync file and directory */
 	if (rename(tmppath, path) != 0)
 	{
+		int			save_errno = errno;
+
+		LWLockRelease(slot->io_in_progress_lock);
+		errno = save_errno;
 		ereport(elevel,
 				(errcode_for_file_access(),
 				 errmsg("could not rename file \"%s\" to \"%s\": %m",
@@ -1214,13 +1376,13 @@ RestoreSlotFromDisk(const char *name)
 	CloseTransientFile(fd);
 
 	/* now verify the CRC */
-	INIT_CRC32(checksum);
-	COMP_CRC32(checksum,
+	INIT_CRC32C(checksum);
+	COMP_CRC32C(checksum,
 			   (char *) &cp + SnapBuildOnDiskNotChecksummedSize,
 			   SnapBuildOnDiskChecksummedSize);
-	FIN_CRC32(checksum);
+	FIN_CRC32C(checksum);
 
-	if (!EQ_CRC32(checksum, cp.checksum))
+	if (!EQ_CRC32C(checksum, cp.checksum))
 		ereport(PANIC,
 				(errmsg("replication slot file %s: checksum mismatch, is %u, should be %u",
 						path, checksum, cp.checksum)));
@@ -1291,6 +1453,7 @@ RestoreSlotFromDisk(const char *name)
 
 		slot->in_use = true;
 		slot->active = false;
+		slot->walsnd = NULL;
 
 		restored = true;
 		break;
@@ -1300,4 +1463,36 @@ RestoreSlotFromDisk(const char *name)
 		ereport(PANIC,
 				(errmsg("too many replication slots active before shutdown"),
 				 errhint("Increase max_replication_slots and try again.")));
+}
+
+/*
+ * Permanently drop replication slot identified by the passed in name.
+ */
+void
+ReplicationSlotDropIfExists(const char *name)
+{
+	bool exists = false;
+	int i;
+
+	/*
+	 * There exists a race condition if multiple callers check the existence of
+	 * replication slot at the same time. Then we may incorrectly try to drop
+	 * the same slot twice.  Currently this is not an issue as this function is
+	 * only called once at startup from StartupXLOG.
+	 */
+	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
+	for (i = 0; i < max_replication_slots; i++)
+	{
+		ReplicationSlot *s = &ReplicationSlotCtl->replication_slots[i];
+
+		if (s->in_use && strcmp(name, NameStr(s->data.name)) == 0)
+		{
+			exists = true;
+			break;
+		}
+	}
+	LWLockRelease(ReplicationSlotControlLock);
+
+	if (exists)
+		ReplicationSlotDrop(name);
 }

@@ -27,8 +27,11 @@
  */
 #include "postgres.h"
 
+#include "cdb/cdbvars.h"
 #include "executor/execdebug.h"
 #include "executor/nodeSubqueryscan.h"
+#include "optimizer/var.h"              /* CDB: contain_var_reference() */
+#include "parser/parsetree.h"
 
 static TupleTableSlot *SubqueryNext(SubqueryScanState *node);
 
@@ -57,6 +60,29 @@ SubqueryNext(SubqueryScanState *node)
 	 * cycles for ExecCopySlot().  (Our own ScanTupleSlot is used only for
 	 * EvalPlanQual rechecks.)
 	 */
+
+    /*
+     * CDB: Label each row with a synthetic ctid if needed for subquery dedup.
+     */
+    if (node->cdb_want_ctid &&
+        !TupIsNull(slot))
+    {
+		/*
+		 * When update statement contains subquery,  add a WholeRowVar to the
+		 * target of the subquery, here slot is a virtual tuple, we assign ctid
+		 * for a virtual tuple in slot_set_ctid_from_fake , however, when doing
+		 * ExecTargetList for WholeRowVar, this slot is formed to heap tuple,
+		 * but heap->t_self is null. when doing ExecTargetList for the target of ctid,
+		 * While the slot is heaptuple, we get ctid from heap->t_selt, an assert in
+		 * slot_getsysattr is tirgged.
+		 * if cdb_want_ctid, we transform virtual slot to heaptuple, then do slot_set_ctid_from_fake.
+		 * details please see https://github.com/greenplum-db/gpdb/issues/12512
+		 */
+		HeapTuple       tuple = ExecFetchSlotHeapTuple(slot);
+		slot->PRIVATE_tts_heaptuple = tuple;
+		slot_set_ctid_from_fake(slot, &node->cdb_fake_ctid);
+	}
+
 	return slot;
 }
 
@@ -127,6 +153,10 @@ ExecInitSubqueryScan(SubqueryScan *node, EState *estate, int eflags)
 		ExecInitExpr((Expr *) node->scan.plan.qual,
 					 (PlanState *) subquerystate);
 
+	/* Check if targetlist or qual contains a var node referencing the ctid column */
+	subquerystate->cdb_want_ctid = contain_ctid_var_reference(&node->scan);
+	ItemPointerSetInvalid(&subquerystate->cdb_fake_ctid);
+
 	/*
 	 * tuple table initialization
 	 */
@@ -137,8 +167,6 @@ ExecInitSubqueryScan(SubqueryScan *node, EState *estate, int eflags)
 	 * initialize subquery
 	 */
 	subquerystate->subplan = ExecInitNode(node->subplan, estate, eflags);
-
-	subquerystate->ss.ps.ps_TupFromTlist = false;
 
 	/*
 	 * Initialize scan tuple type (needed by ExecAssignScanProjectionInfo)
@@ -172,8 +200,12 @@ ExecEndSubqueryScan(SubqueryScanState *node)
 	/*
 	 * clean out the upper tuple table
 	 */
-	ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
-	ExecClearTuple(node->ss.ss_ScanTupleSlot);
+	if (node->ss.ss_ScanTupleSlot != NULL)
+	{
+		ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
+		ExecClearTuple(node->ss.ss_ScanTupleSlot);
+	}
+
 
 	/*
 	 * close down subquery
@@ -192,6 +224,8 @@ ExecReScanSubqueryScan(SubqueryScanState *node)
 {
 	ExecScanReScan(&node->ss);
 
+	ItemPointerSet(&node->cdb_fake_ctid, 0, 0);
+
 	/*
 	 * ExecReScan doesn't know about my subplan, so I have to do
 	 * changed-parameter signaling myself.  This is just as well, because the
@@ -206,4 +240,12 @@ ExecReScanSubqueryScan(SubqueryScanState *node)
 	 */
 	if (node->subplan->chgParam == NULL)
 		ExecReScan(node->subplan);
+
+}
+
+void
+ExecSquelchSubqueryScan(SubqueryScanState *node)
+{
+	/* Recurse to subquery */
+	ExecSquelchNode(node->subplan);
 }

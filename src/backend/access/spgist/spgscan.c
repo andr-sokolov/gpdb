@@ -585,6 +585,7 @@ spggetbitmap(PG_FUNCTION_ARGS)
 	IndexScanDesc scan = (IndexScanDesc) PG_GETARG_POINTER(0);
 	TIDBitmap  *tbm = (TIDBitmap *) PG_GETARG_POINTER(1);
 	SpGistScanOpaque so = (SpGistScanOpaque) scan->opaque;
+	int64		ntids;
 
 	/* Copy want_itup to *so so we don't need to pass it around separately */
 	so->want_itup = false;
@@ -594,7 +595,9 @@ spggetbitmap(PG_FUNCTION_ARGS)
 
 	spgWalk(scan->indexRelation, so, true, storeBitmap);
 
-	PG_RETURN_INT64(so->ntids);
+	ntids = so->ntids;
+
+	PG_RETURN_INT64(ntids);
 }
 
 /* storeRes subroutine for gettuple case */

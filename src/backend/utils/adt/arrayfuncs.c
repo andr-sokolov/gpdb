@@ -18,6 +18,7 @@
 
 #include "access/htup_details.h"
 #include "funcapi.h"
+#include "access/tupmacs.h"
 #include "libpq/pqformat.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -25,6 +26,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/typcache.h"
+#include "catalog/pg_type.h"
 
 
 /*
@@ -343,6 +345,8 @@ array_in(PG_FUNCTION_ARGS)
 
 	/* This checks for overflow of the array dimensions */
 	nitems = ArrayGetNItems(ndim, dim);
+	ArrayCheckBounds(ndim, dim, lBound);
+
 	/* Empty array? */
 	if (nitems == 0)
 		PG_RETURN_ARRAYTYPE_P(construct_empty_array(element_type));
@@ -1306,24 +1310,11 @@ array_recv(PG_FUNCTION_ARGS)
 	{
 		dim[i] = pq_getmsgint(buf, 4);
 		lBound[i] = pq_getmsgint(buf, 4);
-
-		/*
-		 * Check overflow of upper bound. (ArrayNItems() below checks that
-		 * dim[i] >= 0)
-		 */
-		if (dim[i] != 0)
-		{
-			int			ub = lBound[i] + dim[i] - 1;
-
-			if (lBound[i] > ub)
-				ereport(ERROR,
-						(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-						 errmsg("integer out of range")));
-		}
 	}
 
 	/* This checks for overflow of array dimensions */
 	nitems = ArrayGetNItems(ndim, dim);
+	ArrayCheckBounds(ndim, dim, lBound);
 
 	/*
 	 * We arrange to look up info about element type, including its receive
@@ -2133,7 +2124,7 @@ array_set(ArrayType *array,
 					(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
 					 errmsg("wrong number of array subscripts")));
 
-		if (indx[0] < 0 || indx[0] * elmlen >= arraytyplen)
+		if (indx[0] < 0 || indx[0] >= arraytyplen / elmlen)
 			ereport(ERROR,
 					(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
 					 errmsg("array subscript out of range")));
@@ -2233,10 +2224,13 @@ array_set(ArrayType *array,
 		}
 	}
 
+	/* This checks for overflow of the array dimensions */
+	newnitems = ArrayGetNItems(ndim, dim);
+	ArrayCheckBounds(ndim, dim, lb);
+
 	/*
 	 * Compute sizes of items and areas to copy
 	 */
-	newnitems = ArrayGetNItems(ndim, dim);
 	if (newhasnulls)
 		overheadlen = ARR_OVERHEAD_WITHNULLS(ndim, newnitems);
 	else
@@ -2540,6 +2534,7 @@ array_set_slice(ArrayType *array,
 
 	/* Do this mainly to check for overflow */
 	nitems = ArrayGetNItems(ndim, dim);
+	ArrayCheckBounds(ndim, dim, lb);
 
 	/*
 	 * Make sure source array has enough entries.  Note we ignore the shape of
@@ -2962,6 +2957,7 @@ construct_md_array(Datum *elems,
 	int32		dataoffset;
 	int			i;
 	int			nelems;
+	bool		fixedwidthtype;
 
 	if (ndims < 0)				/* we do allow zero-dimension arrays */
 		ereport(ERROR,
@@ -2978,28 +2974,65 @@ construct_md_array(Datum *elems,
 		return construct_empty_array(elmtype);
 
 	nelems = ArrayGetNItems(ndims, dims);
+	ArrayCheckBounds(ndims, dims, lbs);
 
 	/* compute required space */
 	nbytes = 0;
-	hasnulls = false;
-	for (i = 0; i < nelems; i++)
+
+	/*   fast path for fixed width types */
+	switch (elmtype) 
 	{
-		if (nulls && nulls[i])
+		case INT2OID:
+		case INT4OID:
+		case INT8OID:
+		case FLOAT4OID:
+		case FLOAT8OID:
+			fixedwidthtype=true;
+			break;
+		default:
+			fixedwidthtype=false;
+	}
+	hasnulls = false;
+	if (fixedwidthtype)
+	{
+		nbytes = nelems * elmlen;
+
+		/* Still need to handle the possibility of nulls */
+		if (nulls)
 		{
-			hasnulls = true;
-			continue;
+			for (i = 0; i < nelems; i++)
+			{
+				if (nulls[i])
+				{
+					hasnulls = true;
+					nbytes -= elmlen;
+				}
+			}
 		}
-		/* make sure data is not toasted */
-		if (elmlen == -1)
-			elems[i] = PointerGetDatum(PG_DETOAST_DATUM(elems[i]));
-		nbytes = att_addlength_datum(nbytes, elmlen, elems[i]);
+
 		nbytes = att_align_nominal(nbytes, elmalign);
-		/* check for overflow of total request */
-		if (!AllocSizeIsValid(nbytes))
-			ereport(ERROR,
-					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("array size exceeds the maximum allowed (%d)",
-							(int) MaxAllocSize)));
+	} 
+	else 
+	{
+		for (i = 0; i < nelems; i++)
+		{
+			/* make sure data is not toasted */
+			if (nulls && nulls[i])
+			{
+				hasnulls = true;
+				continue;
+			}
+			else if (elmlen == -1)
+				elems[i] = PointerGetDatum(PG_DETOAST_DATUM(elems[i]));
+			nbytes = att_addlength_datum(nbytes, elmlen, elems[i]);
+			nbytes = att_align_nominal(nbytes, elmalign);
+			/* check for overflow of total request */
+			if (!AllocSizeIsValid(nbytes))
+				ereport(ERROR,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("array size exceeds the maximum allowed (%d)",
+								(int) MaxAllocSize)));
+		}
 	}
 
 	/* Allocate and initialize result array */
@@ -3021,10 +3054,17 @@ construct_md_array(Datum *elems,
 	memcpy(ARR_DIMS(result), dims, ndims * sizeof(int));
 	memcpy(ARR_LBOUND(result), lbs, ndims * sizeof(int));
 
-	CopyArrayEls(result,
-				 elems, nulls, nelems,
-				 elmlen, elmbyval, elmalign,
-				 false);
+	if (elems==NULL && fixedwidthtype) 
+	{
+		/* do nothing */
+	} 
+	else
+	{
+		CopyArrayEls(result,
+					 elems, nulls, nelems,
+					 elmlen, elmbyval, elmalign,
+					 false);
+	}
 
 	return result;
 }
@@ -5024,6 +5064,7 @@ array_fill_internal(ArrayType *dims, ArrayType *lbs,
 	}
 
 	nitems = ArrayGetNItems(ndims, dimv);
+	ArrayCheckBounds(ndims, dimv, lbsv);
 
 	/* fast track for empty array */
 	if (nitems <= 0)

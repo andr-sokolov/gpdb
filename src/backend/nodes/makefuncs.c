@@ -14,6 +14,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "funcapi.h"
 
 #include "catalog/pg_class.h"
 #include "catalog/pg_type.h"
@@ -152,7 +153,7 @@ makeWholeRowVar(RangeTblEntry *rte,
 							 InvalidOid,
 							 varlevelsup);
 			break;
-
+		case RTE_TABLEFUNCTION:
 		case RTE_FUNCTION:
 
 			/*

@@ -30,16 +30,36 @@
 
 typedef struct BufFile BufFile;
 
+struct workfile_set;
+
 /*
  * prototypes for functions in buffile.c
  */
 
-extern BufFile *BufFileCreateTemp(bool interXact);
+extern BufFile *BufFileCreateTemp(char *operation_name, bool interXact);
+extern BufFile *BufFileCreateTempInSet(struct workfile_set *work_set, bool interXact);
+extern BufFile *BufFileCreateNamedTemp(const char *fileName, bool interXact, struct workfile_set *work_set);
+extern BufFile *BufFileOpenNamedTemp(const char * fileName, bool interXact);
 extern void BufFileClose(BufFile *file);
-extern size_t BufFileRead(BufFile *file, void *ptr, size_t size);
-extern size_t BufFileWrite(BufFile *file, void *ptr, size_t size);
+extern Size BufFileRead(BufFile *file, void *ptr, Size size);
+extern void *BufFileReadFromBuffer(BufFile *file, Size size);
+extern Size BufFileWrite(BufFile *file, const void *ptr, Size size);
+
 extern int	BufFileSeek(BufFile *file, int fileno, off_t offset, int whence);
 extern void BufFileTell(BufFile *file, int *fileno, off_t *offset);
-extern int	BufFileSeekBlock(BufFile *file, long blknum);
+extern int	BufFileSeekBlock(BufFile *file, int64 blknum);
+extern void BufFileFlush(BufFile *file);
+extern int64 BufFileGetSize(BufFile *buffile);
+
+extern const char *BufFileGetFilename(BufFile *buffile);
+extern BufFile *BufFileCreateForOperation(char *operator_name, bool interXact);
+extern BufFile *BufFileCreateInSet(struct workfile_set *work_set, const char *fileSuffix, bool interXact);
+
+extern void BufFileSuspend(BufFile *buffile);
+extern void BufFileResume(BufFile *buffile);
+
+extern bool gp_workfile_compression;
+extern void BufFilePledgeSequential(BufFile *buffile);
+extern void BufFileSetIsTempFile(BufFile *file, bool isTempFile);
 
 #endif   /* BUFFILE_H */

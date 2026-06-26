@@ -41,6 +41,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "access/htup_details.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "libpq/pqsignal.h"
@@ -52,13 +53,17 @@
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
+#include "storage/pmsignal.h"
 #include "storage/proc.h"
 #include "storage/shmem.h"
 #include "storage/smgr.h"
 #include "storage/spin.h"
+#include "tcop/tcopprot.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
+#include "postmaster/fork_process.h"
+#include "postmaster/postmaster.h"
 
 
 /*----------
@@ -110,6 +115,12 @@ typedef struct
 	RelFileNode rnode;
 	ForkNumber	forknum;
 	BlockNumber segno;			/* see md.c for special values */
+	/*
+	 * Is segno a real ao segno but not specially ones like
+	 * FORGET_RELATION_FSYNC. For example for a real relfile like
+	 * /base/16384/50237.129, it should be true and segno should be 129.
+	 */
+	bool		is_ao_segno;
 	/* might add a real request-type field later; not needed yet */
 } CheckpointerRequest;
 
@@ -193,6 +204,7 @@ CheckpointerMain(void)
 	sigjmp_buf	local_sigjmp_buf;
 	MemoryContext checkpointer_context;
 
+	Assert(CheckpointerShmem != NULL);
 	CheckpointerShmem->checkpointer_pid = MyProcPid;
 
 	/*
@@ -234,7 +246,11 @@ CheckpointerMain(void)
 	pqsignal(SIGWINCH, SIG_DFL);
 
 	/* We allow SIGQUIT (quickdie) at all times */
+#ifdef HAVE_SIGPROCMASK
 	sigdelset(&BlockSig, SIGQUIT);
+#else
+	BlockSig &= ~(sigmask(SIGQUIT));
+#endif
 
 	/*
 	 * Initialize so that first time-driven event happens at the correct time.
@@ -1117,7 +1133,8 @@ RequestCheckpoint(int flags)
  * let the backend know by returning false.
  */
 bool
-ForwardFsyncRequest(RelFileNode rnode, ForkNumber forknum, BlockNumber segno)
+ForwardFsyncRequest(RelFileNode rnode, ForkNumber forknum, BlockNumber segno,
+					bool is_ao_segno)
 {
 	CheckpointerRequest *request;
 	bool		too_full;
@@ -1158,6 +1175,7 @@ ForwardFsyncRequest(RelFileNode rnode, ForkNumber forknum, BlockNumber segno)
 	request->rnode = rnode;
 	request->forknum = forknum;
 	request->segno = segno;
+	request->is_ao_segno = is_ao_segno;
 
 	/* If queue is more than half full, nudge the checkpointer to empty it */
 	too_full = (CheckpointerShmem->num_requests >=
@@ -1304,8 +1322,9 @@ AbsorbFsyncRequests(void)
 	CheckpointerRequest *request;
 	int			n;
 
-	if (!AmCheckpointerProcess())
-		return;
+	if (IsUnderPostmaster && !AmStartupProcess() && !AmCheckpointerProcess())
+		elog(ERROR, "AbsorbFsyncRequests() called in process %d (type %d)",
+			 MyProcPid, MyAuxProcType);
 
 	/*
 	 * We have to PANIC if we fail to absorb all the pending requests (eg,
@@ -1340,7 +1359,7 @@ AbsorbFsyncRequests(void)
 	LWLockRelease(CheckpointerCommLock);
 
 	for (request = requests; n > 0; request++, n--)
-		RememberFsyncRequest(request->rnode, request->forknum, request->segno);
+		RememberFsyncRequest(request->rnode, request->forknum, request->segno, request->is_ao_segno);
 
 	if (requests)
 		pfree(requests);

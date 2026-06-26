@@ -26,16 +26,36 @@
 #include "catalog/catalog.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "catalog/oid_dispatch.h"
+#include "catalog/pg_amop.h"
+#include "catalog/pg_amproc.h"
 #include "catalog/pg_auth_members.h"
+#include "catalog/pg_auth_time_constraint.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_largeobject.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_pltemplate.h"
+#include "catalog/pg_resourcetype.h"
+#include "catalog/pg_resqueue.h"
+#include "catalog/pg_resqueuecapability.h"
+#include "catalog/pg_resgroup.h"
 #include "catalog/pg_db_role_setting.h"
 #include "catalog/pg_shdepend.h"
 #include "catalog/pg_shdescription.h"
 #include "catalog/pg_shseclabel.h"
 #include "catalog/pg_tablespace.h"
+#include "catalog/pg_rewrite.h"
+#include "catalog/pg_statistic.h"
+#include "catalog/pg_trigger.h"
+
+#include "catalog/gp_configuration_history.h"
+#include "catalog/gp_segment_config.h"
+#include "catalog/pg_stat_last_operation.h"
+#include "catalog/pg_stat_last_shoperation.h"
+
+#include "catalog/gp_id.h"
+#include "catalog/gp_version.h"
 #include "catalog/toasting.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
@@ -43,6 +63,62 @@
 #include "utils/rel.h"
 #include "utils/tqual.h"
 
+#include "cdb/cdbvars.h"
+
+/*
+ * Like relpath(), but gets the directory containing the data file
+ * and the filename separately.
+ */
+void
+reldir_and_filename(RelFileNode node, BackendId backend, ForkNumber forknum,
+					char **dir, char **filename)
+{
+	char	   *path;
+	int			i;
+
+	path = relpathbackend(node, backend, forknum);
+
+	/*
+	 * The base path is like "<path>/<rnode>". Split it into
+	 * path and filename parts.
+	 */
+	for (i = strlen(path) - 1; i >= 0; i--)
+	{
+		if (path[i] == '/')
+			break;
+	}
+	if (i <= 0 || path[i] != '/')
+		elog(ERROR, "unexpected path: \"%s\"", path);
+
+	*dir = pnstrdup(path, i);
+	*filename = pstrdup(&path[i + 1]);
+
+	pfree(path);
+}
+
+/*
+ * Like relpathbackend(), but more convenient when dealing with
+ * AO relations. The filename pattern is the same as for heap
+ * tables, but this variant takes also 'segno' as argument.
+ */
+char *
+aorelpathbackend(RelFileNode node, BackendId backend, int32 segno)
+{
+	char	   *fullpath;
+	char	   *path;
+
+	path = relpathbackend(node, backend, MAIN_FORKNUM);
+	if (segno == 0)
+		fullpath = path;
+	else
+	{
+		/* be sure we have enough space for the '.segno' */
+		fullpath = (char *) palloc(strlen(path) + 12);
+		sprintf(fullpath, "%s.%u", path, segno);
+		pfree(path);
+	}
+	return fullpath;
+}
 
 /*
  * IsSystemRelation
@@ -190,11 +266,31 @@ bool
 IsReservedName(const char *name)
 {
 	/* ugly coding for speed */
-	return (name[0] == 'p' &&
-			name[1] == 'g' &&
-			name[2] == '_');
+	return ((name[0] == 'p' && name[1] == 'g' && name[2] == '_') ||
+			(name[0] == 'g' && name[1] == 'p' && name[2] == '_'));
 }
 
+/*
+ * GetReservedPrefix
+ *		Given a string that is a reserved name return the portion of
+ *      the name that makes it reserved - the reserved prefix.
+ *
+ *      Current return values include "pg_" and "gp_"
+ */
+char *
+GetReservedPrefix(const char *name)
+{
+	char		*prefix = NULL;
+
+	if (IsReservedName(name))
+	{
+		prefix = palloc(4);
+		memcpy(prefix, name, 3);
+		prefix[3] = '\0';
+	}
+
+	return prefix;
+}
 
 /*
  * IsSharedRelation
@@ -226,6 +322,25 @@ IsSharedRelation(Oid relationId)
 		relationId == TableSpaceRelationId ||
 		relationId == DbRoleSettingRelationId)
 		return true;
+
+	/* GPDB additions */
+	if (relationId == GpIdRelationId ||
+		relationId == GpVersionRelationId ||
+
+		/* MPP-6929: metadata tracking */
+		relationId == StatLastShOpRelationId ||
+
+		relationId == ResQueueRelationId ||
+		relationId == ResourceTypeRelationId ||
+		relationId == ResQueueCapabilityRelationId ||
+		relationId == ResGroupRelationId ||
+		relationId == ResGroupCapabilityRelationId ||
+		relationId == GpConfigHistoryRelationId ||
+		relationId == GpSegmentConfigRelationId ||
+
+		relationId == AuthTimeConstraintRelationId)
+		return true;
+
 	/* These are their indexes (see indexing.h) */
 	if (relationId == AuthIdRolnameIndexId ||
 		relationId == AuthIdOidIndexId ||
@@ -242,15 +357,91 @@ IsSharedRelation(Oid relationId)
 		relationId == TablespaceNameIndexId ||
 		relationId == DbRoleSettingDatidRolidIndexId)
 		return true;
+
+	/* GPDB added indexes */
+	if (/* MPP-6929: metadata tracking */
+		relationId == StatLastShOpClassidObjidIndexId ||
+		relationId == StatLastShOpClassidObjidStaactionnameIndexId ||
+
+		relationId == ResQueueOidIndexId ||
+		relationId == ResQueueRsqnameIndexId ||
+		relationId == ResourceTypeOidIndexId ||
+		relationId == ResourceTypeRestypidIndexId ||
+		relationId == ResourceTypeResnameIndexId ||
+		relationId == ResQueueCapabilityOidIndexId ||
+		relationId == ResQueueCapabilityResqueueidIndexId ||
+		relationId == ResQueueCapabilityRestypidIndexId ||
+		relationId == ResGroupOidIndexId ||
+		relationId == ResGroupRsgnameIndexId ||
+		relationId == ResGroupCapabilityOidIndexId ||
+		relationId == ResGroupCapabilityResgroupidIndexId ||
+		relationId == ResGroupCapabilityResgroupidResLimittypeIndexId ||
+		relationId == AuthIdRolResQueueIndexId ||
+		relationId == AuthIdRolResGroupIndexId ||
+		relationId == GpSegmentConfigContentPreferred_roleIndexId ||
+		relationId == GpSegmentConfigDbidIndexId ||
+		relationId == AuthTimeConstraintAuthIdIndexId)
+	{
+		return true;
+	}
+
 	/* These are their toast tables and toast indexes (see toasting.h) */
 	if (relationId == PgShdescriptionToastTable ||
 		relationId == PgShdescriptionToastIndex ||
 		relationId == PgDbRoleSettingToastTable ||
 		relationId == PgDbRoleSettingToastIndex)
 		return true;
+
+	/* GPDB added toast tables and their indexes */
+	if (relationId == GpSegmentConfigToastTable ||
+		relationId == GpSegmentConfigToastIndex)
+	{
+		return true;
+	}
 	return false;
 }
 
+/*
+ * OIDs for catalog object are normally allocated in the master, and
+ * executor nodes should just use the OIDs passed by the master. But
+ * there are some exceptions.
+ */
+static bool
+RelationNeedsSynchronizedOIDs(Relation relation)
+{
+	if (IsSystemNamespace(RelationGetNamespace(relation)))
+	{
+		switch(RelationGetRelid(relation))
+		{
+			/*
+			 * pg_largeobject is more like a user table, and has
+			 * different contents in each segment and master.
+			 */
+			case LargeObjectRelationId:
+				return false;
+
+			/*
+			 * We don't currently synchronize the OIDs of these catalogs.
+			 * It's a bit sketchy that we don't, but we get away with it
+			 * because these OIDs don't appear in any of the Node structs
+			 * that are dispatched from master to segments. (Except for the
+			 * OIDs, the contents of these tables should be in sync.)
+			 */
+			case RewriteRelationId:
+			case TriggerRelationId:
+			case AccessMethodOperatorRelationId:
+			case AccessMethodProcedureRelationId:
+				return false;
+		}
+
+		/*
+		 * All other system catalogs are assumed to need synchronized
+		 * OIDs.
+		 */
+		return true;
+	}
+	return false;
+}
 
 /*
  * GetNewOid
@@ -280,6 +471,7 @@ IsSharedRelation(Oid relationId)
 Oid
 GetNewOid(Relation relation)
 {
+	Oid			newOid;
 	Oid			oidIndex;
 
 	/* If relation doesn't have OIDs at all, caller is confused */
@@ -308,7 +500,23 @@ GetNewOid(Relation relation)
 	}
 
 	/* Otherwise, use the index to find a nonconflicting OID */
-	return GetNewOidWithIndex(relation, oidIndex, ObjectIdAttributeNumber);
+	do {
+		newOid = GetNewOidWithIndex(relation, oidIndex, ObjectIdAttributeNumber);
+	} while(!IsOidAcceptable(newOid));
+
+	/*
+	 * Most catalog objects need to have the same OID in the master and all
+	 * segments. When creating a new object, the master should allocate the
+	 * OID and tell the segments to use the same, so segments should have no
+	 * need to ever allocate OIDs on their own. Therefore, give a WARNING if
+	 * GetNewOid() is called in a segment. (There are a few exceptions, see
+	 * RelationNeedsSynchronizedOIDs()).
+	 */
+	if (Gp_role == GP_ROLE_EXECUTE && RelationNeedsSynchronizedOIDs(relation))
+		elog(PANIC, "allocated OID %u for relation \"%s\" in segment",
+			 newOid, RelationGetRelationName(relation));
+
+	return newOid;
 }
 
 /*
@@ -356,6 +564,37 @@ GetNewOidWithIndex(Relation relation, Oid indexId, AttrNumber oidcolumn)
 	return newOid;
 }
 
+static bool
+GpCheckRelFileCollision(RelFileNodeBackend rnode)
+{
+	char	   *rpath;
+	bool		collides;
+
+	/* Check for existing file of same name */
+	rpath = relpath(rnode, MAIN_FORKNUM);
+	if (access(rpath, F_OK) == 0)
+		collides = true;
+	else
+	{
+		/*
+		 * Here we have a little bit of a dilemma: if errno is something
+		 * other than ENOENT, should we declare a collision and loop? In
+		 * particular one might think this advisable for, say, EPERM.
+		 * However there really shouldn't be any unreadable files in a
+		 * tablespace directory, and if the EPERM is actually complaining
+		 * that we can't read the directory itself, we'd be in an infinite
+		 * loop.  In practice it seems best to go ahead regardless of the
+		 * errno.  If there is a colliding file we will get an smgr
+		 * failure when we attempt to create the new relation file.
+		 */
+		collides = false;
+	}
+
+	pfree(rpath);
+
+	return collides;
+}
+
 /*
  * GetNewRelFileNode
  *		Generate a new relfilenode number that is unique within the
@@ -376,15 +615,13 @@ Oid
 GetNewRelFileNode(Oid reltablespace, Relation pg_class, char relpersistence)
 {
 	RelFileNodeBackend rnode;
-	char	   *rpath;
-	int			fd;
-	bool		collides;
+	bool		collides = true;
 	BackendId	backend;
 
 	switch (relpersistence)
 	{
 		case RELPERSISTENCE_TEMP:
-			backend = MyBackendId;
+			backend = TempRelBackendId;
 			break;
 		case RELPERSISTENCE_UNLOGGED:
 		case RELPERSISTENCE_PERMANENT:
@@ -410,40 +647,34 @@ GetNewRelFileNode(Oid reltablespace, Relation pg_class, char relpersistence)
 	{
 		CHECK_FOR_INTERRUPTS();
 
-		/* Generate the OID */
-		if (pg_class)
-			rnode.node.relNode = GetNewOid(pg_class);
-		else
-			rnode.node.relNode = GetNewObjectId();
+		/* Generate the Relfilenode */
+		rnode.node.relNode = GetNewSegRelfilenode();
 
-		/* Check for existing file of same name */
-		rpath = relpath(rnode, MAIN_FORKNUM);
-		fd = BasicOpenFile(rpath, O_RDONLY | PG_BINARY, 0);
+		if (!IsOidAcceptable(rnode.node.relNode))
+			continue;
 
-		if (fd >= 0)
-		{
-			/* definite collision */
-			close(fd);
-			collides = true;
-		}
-		else
+		collides = GpCheckRelFileCollision(rnode);
+
+		if (!collides && rnode.node.spcNode != GLOBALTABLESPACE_OID)
 		{
 			/*
-			 * Here we have a little bit of a dilemma: if errno is something
-			 * other than ENOENT, should we declare a collision and loop? In
-			 * particular one might think this advisable for, say, EPERM.
-			 * However there really shouldn't be any unreadable files in a
-			 * tablespace directory, and if the EPERM is actually complaining
-			 * that we can't read the directory itself, we'd be in an infinite
-			 * loop.  In practice it seems best to go ahead regardless of the
-			 * errno.  If there is a colliding file we will get an smgr
-			 * failure when we attempt to create the new relation file.
+			 * GPDB_91_MERGE_FIXME: check again for a collision with a temp
+			 * table (if this is a normal relation) or a normal table (if this
+			 * is a temp relation).
+			 *
+			 * The shared buffer manager currently assumes that relfilenodes of
+			 * relations stored in shared buffers can't conflict, which is
+			 * trivially true in upstream because temp tables don't use shared
+			 * buffers at all. We have to make this additional check to make
+			 * sure of that.
 			 */
-			collides = false;
+			rnode.backend = (backend == InvalidBackendId) ? TempRelBackendId
+														  : InvalidBackendId;
+			collides = GpCheckRelFileCollision(rnode);
 		}
-
-		pfree(rpath);
 	} while (collides);
+
+	elog(DEBUG1, "Calling GetNewRelFileNode returns new relfilenode = %d", rnode.node.relNode);
 
 	return rnode.node.relNode;
 }

@@ -385,7 +385,7 @@ list_truncate(List *list, int new_size)
  * Locate the n'th cell (counting from 0) of the list.  It is an assertion
  * failure if there is no such cell.
  */
-static ListCell *
+ListCell *
 list_nth_cell(const List *list, int n)
 {
 	ListCell   *match;
@@ -403,6 +403,21 @@ list_nth_cell(const List *list, int n)
 		;
 
 	return match;
+}
+
+/**
+ * Replace the n-th data pointer in the list with newvalue.
+ * Returns oldvalue. Assumes that n is a valid offset.
+ */
+void *
+list_nth_replace(List *list, int n, void *new_data)
+{
+	ListCell *lc = NULL;
+	lc = list_nth_cell(list, n);
+	Assert(lc);
+	void *old_data = lc->data.ptr_value;
+	lc->data.ptr_value = new_data;
+	return old_data;
 }
 
 /*
@@ -988,8 +1003,11 @@ list_append_unique_oid(List *list, Oid datum)
  * via equal().
  *
  * This is almost the same functionality as list_union(), but list1 is
- * modified in-place rather than being copied.  Note also that list2's cells
- * are not inserted in list1, so the analogy to list_concat() isn't perfect.
+ * modified in-place rather than being copied. However, callers of this
+ * function may have strict ordering expectations -- i.e. that the relative
+ * order of those list2 elements that are not duplicates is preserved. Note
+ * also that list2's cells are not inserted in list1, so the analogy to
+ * list_concat() isn't perfect.
  */
 List *
 list_concat_unique(List *list1, List *list2)

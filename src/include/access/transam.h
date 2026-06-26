@@ -14,6 +14,7 @@
 #ifndef TRANSAM_H
 #define TRANSAM_H
 
+#include "catalog/pg_magic_oid.h"
 #include "access/xlogdefs.h"
 
 
@@ -68,31 +69,6 @@
 	(AssertMacro(TransactionIdIsNormal(id1) && TransactionIdIsNormal(id2)), \
 	(int32) ((id1) - (id2)) > 0)
 
-/* ----------
- *		Object ID (OID) zero is InvalidOid.
- *
- *		OIDs 1-9999 are reserved for manual assignment (see the files
- *		in src/include/catalog/).
- *
- *		OIDS 10000-16383 are reserved for assignment during initdb
- *		using the OID generator.  (We start the generator at 10000.)
- *
- *		OIDs beginning at 16384 are assigned from the OID generator
- *		during normal multiuser operation.  (We force the generator up to
- *		16384 as soon as we are in normal operation.)
- *
- * The choices of 10000 and 16384 are completely arbitrary, and can be moved
- * if we run low on OIDs in either category.  Changing the macros below
- * should be sufficient to do this.
- *
- * NOTE: if the OID generator wraps around, we skip over OIDs 0-16383
- * and resume with 16384.  This minimizes the odds of OID conflict, by not
- * reassigning OIDs that might have been assigned during initdb.
- * ----------
- */
-#define FirstBootstrapObjectId	10000
-#define FirstNormalObjectId		16384
-
 /*
  * VariableCache is a data structure in shared memory that is used to track
  * OID and XID assignment state.  For largely historical reasons, there is
@@ -112,6 +88,12 @@ typedef struct VariableCacheData
 	uint32		oidCount;		/* OIDs available before must do XLOG work */
 
 	/*
+	 * These fields are protected by RelfilenodeGenLock.
+	 */
+	Oid			nextRelfilenode;	/* next relfilenode to assign */
+	uint32		relfilenodeCount;	/* relfilenodes available before we must do XLOG work */
+
+	/*
 	 * These fields are protected by XidGenLock.
 	 */
 	TransactionId nextXid;		/* next XID to assign */
@@ -128,6 +110,8 @@ typedef struct VariableCacheData
 	 */
 	TransactionId latestCompletedXid;	/* newest XID that has committed or
 										 * aborted */
+	TransactionId latestCompletedDxid;	/* newest distributed XID that has
+										   committed or aborted */
 } VariableCacheData;
 
 typedef VariableCacheData *VariableCache;
@@ -144,11 +128,15 @@ extern bool TransactionStartedDuringRecovery(void);
 /* in transam/varsup.c */
 extern PGDLLIMPORT VariableCache ShmemVariableCache;
 
+extern int xid_stop_limit;
+extern int xid_warn_limit;
+
 /*
  * prototypes for functions in transam/transam.c
  */
 extern bool TransactionIdDidCommit(TransactionId transactionId);
 extern bool TransactionIdDidAbort(TransactionId transactionId);
+extern bool TransactionIdDidAbortForReader(TransactionId transactionId);
 extern bool TransactionIdIsKnownCompleted(TransactionId transactionId);
 extern void TransactionIdAbort(TransactionId transactionId);
 extern void TransactionIdCommitTree(TransactionId xid, int nxids, TransactionId *xids);
@@ -169,5 +157,8 @@ extern void SetTransactionIdLimit(TransactionId oldest_datfrozenxid,
 					  Oid oldest_datoid);
 extern bool ForceTransactionIdLimitUpdate(void);
 extern Oid	GetNewObjectId(void);
+extern void AdvanceObjectId(Oid newOid);
+extern Oid	GetNewSegRelfilenode(void);
+extern bool OidFollowsNextOid(Oid id);
 
 #endif   /* TRAMSAM_H */

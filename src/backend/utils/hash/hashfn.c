@@ -67,6 +67,15 @@ oid_hash(const void *key, Size keysize)
 }
 
 /*
+ * int32_hash: hash function for int32: no-op
+ */
+uint32
+int32_hash(const void *key, Size keysize)
+{
+	return *(uint32 *)key;
+}
+
+/*
  * bitmap_hash: hash function for keys that are (pointers to) Bitmapsets
  *
  * Note: don't forget to specify bitmap_match as the match function!

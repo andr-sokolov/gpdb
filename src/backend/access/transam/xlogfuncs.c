@@ -52,6 +52,11 @@ pg_start_backup(PG_FUNCTION_ARGS)
 	char	   *backupidstr;
 	XLogRecPtr	startpoint;
 
+	ereport(NOTICE,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("pg_start_backup() is not supported in Greenplum Database"),
+			 errhint("Contact support to get more information and resolve the issue")));
+
 	backupidstr = text_to_cstring(backupid);
 
 	if (!superuser() && !has_rolreplication(GetUserId()))
@@ -80,7 +85,12 @@ pg_start_backup(PG_FUNCTION_ARGS)
 Datum
 pg_stop_backup(PG_FUNCTION_ARGS)
 {
-	XLogRecPtr	stoppoint;
+	XLogRecPtr	stoppoint = InvalidXLogRecPtr;
+
+	ereport(NOTICE,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("pg_stop_backup() is not supported in Greenplum Database"),
+			 errhint("Contact support to get more information and resolve the issue")));
 
 	if (!superuser() && !has_rolreplication(GetUserId()))
 		ereport(ERROR,

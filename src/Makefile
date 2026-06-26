@@ -21,11 +21,9 @@ SUBDIRS = \
 	backend/snowball \
 	include \
 	interfaces \
-	backend/replication/libpqwalreceiver \
 	bin \
 	pl \
 	makefiles \
-	test/regress \
 	test/perl
 
 # There are too many interdependencies between the subdirectories, so
@@ -74,7 +72,6 @@ coverage:
 	$(MAKE) -C backend/utils/mb/conversion_procs $@
 	$(MAKE) -C backend/snowball $@
 	$(MAKE) -C interfaces $@
-	$(MAKE) -C backend/replication/libpqwalreceiver $@
 	$(MAKE) -C bin $@
 	$(MAKE) -C pl $@
 
