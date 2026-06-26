@@ -622,22 +622,18 @@ index_getnext(IndexScanDesc scan, ScanDirection direction)
 /* ----------------
  *		index_getbitmap - get all tuples at once from an index scan
  *
- * Adds the TIDs of all heap tuples satisfying the scan keys to a bitmap.
- * Since there's no interlock between the index scan and the eventual heap
- * access, this is only safe to use with MVCC-based snapshots: the heap
- * item slot could have been replaced by a newer tuple by the time we get
- * to it.
- *
- * Returns the number of matching tuples found.  (Note: this might be only
- * approximate, so it should only be used for statistical purposes.)
+ *		it invokes am's getmulti function to get a bitmap. If am is an on-disk
+ *		bitmap index access method (see bitmap.h), then a StreamBitmap is
+ *		returned; a TIDBitmap otherwise. Note that an index am's getmulti
+ *		function can assume that the bitmap that it's given as argument is of
+ *		the same type as what the function constructs itself.
  * ----------------
  */
-int64
-index_getbitmap(IndexScanDesc scan, TIDBitmap *bitmap)
+Node *
+index_getbitmap(IndexScanDesc scan, Node *bitmap)
 {
 	FmgrInfo   *procedure;
-	int64		ntids;
-	Datum		d;
+	Node		*bm;
 
 	SCAN_CHECKS;
 	GET_SCAN_PROCEDURE(amgetbitmap);
@@ -648,20 +644,11 @@ index_getbitmap(IndexScanDesc scan, TIDBitmap *bitmap)
 	/*
 	 * have the am's getbitmap proc do all the work.
 	 */
-	d = FunctionCall2(procedure,
-					  PointerGetDatum(scan),
-					  PointerGetDatum(bitmap));
+	bm = (Node *) DatumGetPointer(FunctionCall2(procedure,
+									  PointerGetDatum(scan),
+									  PointerGetDatum(bitmap)));
 
-	ntids = DatumGetInt64(d);
-
-	/* If int8 is pass-by-ref, must free the result to avoid memory leak */
-#ifndef USE_FLOAT8_BYVAL
-	pfree(DatumGetPointer(d));
-#endif
-
-	pgstat_count_index_tuples(scan->indexRelation, ntids);
-
-	return ntids;
+	return bm;
 }
 
 /* ----------------

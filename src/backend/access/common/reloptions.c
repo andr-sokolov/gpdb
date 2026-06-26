@@ -22,6 +22,8 @@
 #include "access/reloptions.h"
 #include "access/spgist.h"
 #include "catalog/pg_type.h"
+#include "cdb/cdbappendonlyam.h"
+#include "cdb/cdbvars.h"
 #include "commands/defrem.h"
 #include "commands/tablespace.h"
 #include "commands/view.h"
@@ -29,9 +31,12 @@
 #include "utils/array.h"
 #include "utils/attoptcache.h"
 #include "utils/builtins.h"
+#include "utils/formatting.h"
 #include "utils/guc.h"
+#include "utils/guc_tables.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "miscadmin.h"
 
 /*
  * Contents of pg_class.reloptions
@@ -49,6 +54,8 @@
  *
  * Note that we don't handle "oids" in relOpts because it is handled by
  * interpretOidsOption().
+ *
+ * To add an GPDB option, please touch reloptions_gp.c rather than this file.
  */
 
 static relopt_bool boolRelOpts[] =
@@ -318,6 +325,8 @@ initialize_reloptions(void)
 {
 	int			i;
 	int			j;
+
+	initialize_reloptions_gp();
 
 	j = 0;
 	for (i = 0; boolRelOpts[i].gen.name; i++)
@@ -996,7 +1005,8 @@ parse_one_reloption(relopt_value *option, char *text_str, int text_len,
 				parsed = parse_bool(value, &option->values.bool_val);
 				if (validate && !parsed)
 					ereport(ERROR,
-					   (errmsg("invalid value for boolean option \"%s\": %s",
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("invalid value for boolean option \"%s\": %s",
 							   option->gen->name, value)));
 			}
 			break;
@@ -1007,15 +1017,17 @@ parse_one_reloption(relopt_value *option, char *text_str, int text_len,
 				parsed = parse_int(value, &option->values.int_val, 0, NULL);
 				if (validate && !parsed)
 					ereport(ERROR,
-					   (errmsg("invalid value for integer option \"%s\": %s",
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("invalid value for integer option \"%s\": %s",
 							   option->gen->name, value)));
 				if (validate && (option->values.int_val < optint->min ||
 								 option->values.int_val > optint->max))
 					ereport(ERROR,
-						  (errmsg("value %s out of bounds for option \"%s\"",
-								  value, option->gen->name),
-					 errdetail("Valid values are between \"%d\" and \"%d\".",
-							   optint->min, optint->max)));
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("value %s out of bounds for option \"%s\"",
+									value, option->gen->name),
+							 errdetail("Valid values are between \"%d\" and \"%d\".",
+									   optint->min, optint->max)));
 			}
 			break;
 		case RELOPT_TYPE_REAL:
@@ -1025,12 +1037,14 @@ parse_one_reloption(relopt_value *option, char *text_str, int text_len,
 				parsed = parse_real(value, &option->values.real_val);
 				if (validate && !parsed)
 					ereport(ERROR,
-							(errmsg("invalid value for floating point option \"%s\": %s",
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("invalid value for floating point option \"%s\": %s",
 									option->gen->name, value)));
 				if (validate && (option->values.real_val < optreal->min ||
 								 option->values.real_val > optreal->max))
 					ereport(ERROR,
-						  (errmsg("value %s out of bounds for option \"%s\"",
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("invalid value for floating point option \"%s\": %s",
 								  value, option->gen->name),
 					 errdetail("Valid values are between \"%f\" and \"%f\".",
 							   optreal->min, optreal->max)));
@@ -1176,6 +1190,15 @@ default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
 	int			numoptions;
 	static const relopt_parse_elt tab[] = {
 		{"fillfactor", RELOPT_TYPE_INT, offsetof(StdRdOptions, fillfactor)},
+
+		/* AO table options */
+		{SOPT_APPENDONLY, RELOPT_TYPE_BOOL, offsetof(StdRdOptions, appendonly)},
+		{SOPT_BLOCKSIZE, RELOPT_TYPE_INT, offsetof(StdRdOptions, blocksize)},
+		{SOPT_COMPLEVEL, RELOPT_TYPE_INT, offsetof(StdRdOptions, compresslevel)},
+		{SOPT_COMPTYPE, RELOPT_TYPE_STRING, offsetof(StdRdOptions, compresstype)},
+		{SOPT_CHECKSUM, RELOPT_TYPE_BOOL, offsetof(StdRdOptions, checksum)},
+		{SOPT_ORIENTATION, RELOPT_TYPE_STRING, offsetof(StdRdOptions, orientation)},
+
 		{"autovacuum_enabled", RELOPT_TYPE_BOOL,
 		offsetof(StdRdOptions, autovacuum) +offsetof(AutoVacOpts, enabled)},
 		{"autovacuum_vacuum_threshold", RELOPT_TYPE_INT,
@@ -1216,6 +1239,8 @@ default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
 
 	fillRelOptions((void *) rdopts, sizeof(StdRdOptions), options, numoptions,
 				   validate, tab, lengthof(tab));
+
+	validate_and_refill_options(rdopts, options, numoptions, kind, validate);
 
 	pfree(options);
 

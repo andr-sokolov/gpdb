@@ -3,6 +3,8 @@
  * fd.c
  *	  Virtual file descriptor code.
  *
+ * Portions Copyright (c) 2007-2009, Greenplum inc
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -71,11 +73,18 @@
 #include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/pg_tablespace.h"
+#include "cdb/cdbvars.h"
 #include "pgstat.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "utils/guc.h"
 #include "utils/resowner_private.h"
+#include "utils/workfile_mgr.h"
+#include "utils/faultinjector.h"
+
+// Provide some indirection here in case we have problems with lseek and
+// 64 bits on some platforms
+#define pg_lseek64(a,b,c) (int64)lseek(a,b,c)
 
 
 /* Define PG_FLUSH_DATA_WORKS if we have an implementation for pg_flush_data */
@@ -166,6 +175,7 @@ bool		data_sync_retry = false;
 /* these are the assigned bits in fdstate below: */
 #define FD_TEMPORARY		(1 << 0)	/* T = delete when closed */
 #define FD_XACT_TEMPORARY	(1 << 1)	/* T = delete at eoXact */
+#define FD_WORKFILE			(1 << 2)	/* tracked by workfile manager */
 
 typedef struct vfd
 {
@@ -213,6 +223,10 @@ static uint64 temporary_files_size = 0;
 /*
  * List of OS handles opened with AllocateFile, AllocateDir and
  * OpenTransientFile.
+ *
+ * Since we don't want to encourage heavy use of those functions,
+ * it seems OK to put a pretty small maximum limit on the number of
+ * simultaneously allocated descs.
  */
 typedef enum
 {
@@ -251,7 +265,6 @@ static long tempFileCounter = 0;
 static Oid *tempTableSpaces = NULL;
 static int	numTempTableSpaces = -1;
 static int	nextTempTableSpace = 0;
-
 
 /*--------------------
  *
@@ -295,13 +308,15 @@ static File AllocateVfd(void);
 static void FreeVfd(File file);
 
 static int	FileAccess(File file);
-static File OpenTemporaryFileInTablespace(Oid tblspcOid, bool rejectError);
+static File OpenTemporaryFileInTablespace(Oid tblspcOid, bool rejectError,
+										  const char *filename, bool makenameunique, bool create);
 static bool reserveAllocatedDesc(void);
 static int	FreeDesc(AllocateDesc *desc);
 
 static void AtProcExit_Files(int code, Datum arg);
 static void CleanupTempFiles(bool isProcExit);
-static void RemovePgTempFilesInDir(const char *tmpdirname);
+static void RemovePgTempFilesInDir(const char *tmpdirname, bool missing_ok,
+					   bool unlink_all);
 static void RemovePgTempRelationFiles(const char *tsdirname);
 static void RemovePgTempRelationFilesInDbspace(const char *dbspacedirname);
 static bool looks_like_temp_rel_name(const char *name);
@@ -413,6 +428,20 @@ pg_flush_data(int fd, off_t offset, off_t amount)
 	}
 #endif
 	return 0;
+}
+
+/*
+ * Retrying close in case it gets interrupted. If that happens, it will cause
+ * unlink to fail later.
+ */
+int
+gp_retry_close(int fd) {
+	int err = 0;
+	do
+	{
+		err = close(fd);
+	} while (err == -1 && errno == EINTR);
+	return err;
 }
 
 
@@ -662,7 +691,7 @@ count_usable_fds(int max_to_probe, int *usable_fds, int *already_open)
 		{
 			/* Expect EMFILE or ENFILE, else it's fishy */
 			if (errno != EMFILE && errno != ENFILE)
-				elog(WARNING, "dup(0) failed after %d successes: %m", used);
+				ereport(WARNING, (errmsg("dup(0) failed after %d successes: %m", used)));
 			break;
 		}
 
@@ -1177,6 +1206,103 @@ PathNameOpenFile(FileName fileName, int fileFlags, int fileMode)
 }
 
 /*
+ * Open a temporary file that will (optionally) disappear when we close it.
+ *
+ * 'fileName' identify a new or existing temporary file which other processes
+ * also could open and share.
+ *
+ * If 'create' is true, a new file is created.  If successful, a valid vfd
+ * index (>0) is returned; otherwise an error is thrown.
+ *
+ * If 'create' is false, an existing file is opened.  If successful, a valid
+ * vfd index (>0) is returned.  If the file does not exist or cannot be
+ * opened, an invalid vfd index (<= 0) is returned.
+ *
+ * If 'delOnClose' is true, then the file is removed when you call
+ * FileClose(); or when the process exits; or (unless 'interXact' is
+ * true) when the transaction ends.
+ *
+ * If 'interXact' is false, the vfd is closed automatically at end of
+ * transaction unless you have called FileClose() to close it before then.
+ * If 'interXact' is true, the vfd state is not changed at end of
+ * transaction.
+ *
+ * In most cases, you don't want temporary files to outlive the transaction
+ * that created them, so you should specify 'true' for 'delOnClose' and
+ * 'false' for 'interXact'.
+ *
+ * This is used for inter-process communication, where one process creates
+ * a file, and another process reads it.
+ *
+ * NOTE: this always uses the session temp tablespace from `temp_tablespaces`. Otherwise
+ * picking randomly from list would be hard for the reader process to find the
+ * file created by the writer process.
+ */
+File
+OpenNamedTemporaryFile(const char *fileName,
+					   bool create,
+					   bool delOnClose,
+					   bool interXact)
+{
+	File		file = 0;
+
+	/*
+	 * If some temp tablespace(s) have been given to us, calculate a determined
+	 * one.  If a given tablespace can't be found, we silently fall back to
+	 * the database's default tablespace.
+	 *
+	 * BUT: if the temp file is slated to outlive the current transaction,
+	 * force it into the database's default tablespace, so that it will not
+	 * pose a threat to possible tablespace drop attempts.
+	 */
+	if (numTempTableSpaces > 0 && !interXact)
+	{
+		Oid            tblspcOid = GetNextTempTableSpace();
+
+		if (OidIsValid(tblspcOid))
+			file = OpenTemporaryFileInTablespace(tblspcOid,
+												 false, /* rejectError */
+												 fileName,
+												 false, /* makenameunique */
+												 create); /* create */
+	}
+
+	/*
+	 * If not, or if tablespace is bad, create in database's default
+	 * tablespace.  MyDatabaseTableSpace should normally be set before we get
+	 * here, but just in case it isn't, fall back to pg_default tablespace.
+	 */
+	if (file <= 0)
+		file = OpenTemporaryFileInTablespace(MyDatabaseTableSpace ?
+											 MyDatabaseTableSpace :
+											 DEFAULTTABLESPACE_OID,
+											 true, /* rejectError */
+											 fileName,
+											 false, /* makenameunique */
+											 create);
+
+	/* Mark it for deletion at close */
+	if (delOnClose)
+		VfdCache[file].fdstate |= FD_TEMPORARY;
+
+	/* Register it with the current resource owner */
+	if (!interXact)
+	{
+		VfdCache[file].fdstate |= FD_XACT_TEMPORARY;
+
+		ResourceOwnerEnlargeFiles(CurrentResourceOwner);
+		ResourceOwnerRememberFile(CurrentResourceOwner, file);
+		VfdCache[file].resowner = CurrentResourceOwner;
+
+		/* ensure cleanup happens at eoxact */
+		have_xact_temporary_files = true;
+	}
+
+	return file;
+}
+
+
+/*
  * Open a temporary file that will disappear when we close it.
  *
  * This routine takes care of generating an appropriate tempfile name.
@@ -1189,9 +1315,12 @@ PathNameOpenFile(FileName fileName, int fileFlags, int fileMode)
  * outlive the transaction that created them, so this should be false -- but
  * if you need "somewhat" temporary storage, this might be useful. In either
  * case, the file is removed when the File is explicitly closed.
+ *
+ * GPDB: As a convenience for monitoring and debugging, the given 'filePrefix'
+ * string is embedded in the file name. It can be NULL.
  */
 File
-OpenTemporaryFile(bool interXact)
+OpenTemporaryFile(bool interXact, const char *filePrefix)
 {
 	File		file = 0;
 
@@ -1216,7 +1345,11 @@ OpenTemporaryFile(bool interXact)
 		Oid			tblspcOid = GetNextTempTableSpace();
 
 		if (OidIsValid(tblspcOid))
-			file = OpenTemporaryFileInTablespace(tblspcOid, false);
+			file = OpenTemporaryFileInTablespace(tblspcOid,
+												 false, /* rejectError */
+												 filePrefix,
+												 true, /* makenameunique */
+												 true); /* create */
 	}
 
 	/*
@@ -1228,7 +1361,10 @@ OpenTemporaryFile(bool interXact)
 		file = OpenTemporaryFileInTablespace(MyDatabaseTableSpace ?
 											 MyDatabaseTableSpace :
 											 DEFAULTTABLESPACE_OID,
-											 true);
+											 true,
+											 filePrefix,
+											 true, /* makenameunique */
+											 true); /* create */
 
 	/* Mark it for deletion at close */
 	VfdCache[file].fdstate |= FD_TEMPORARY;
@@ -1249,15 +1385,31 @@ OpenTemporaryFile(bool interXact)
 }
 
 /*
- * Open a temporary file in a specific tablespace.
- * Subroutine for OpenTemporaryFile, which see for details.
+ * Get full path to a temporary file with given name.
+ *
+ * This can be used, if you want to create a temporary file,
+ * but don't want to use the OpenNamedTemporaryFile function
+ * for some reason. For example, if you want to create a FIFO
+ * or a directory, rather than a regular file.
+ *
+ * If 'createdir' is true, the pgsql_tmp directory is created
+ * if it doesn't exist yet.
  */
-static File
-OpenTemporaryFileInTablespace(Oid tblspcOid, bool rejectError)
+char *
+GetTempFilePath(const char *filename, bool createdir)
 {
 	char		tempdirpath[MAXPGPATH];
 	char		tempfilepath[MAXPGPATH];
-	File		file;
+	Oid			tblspcOid;
+
+	tblspcOid = GetNextTempTableSpace();
+	if (!OidIsValid(tblspcOid))
+	{
+		if (MyDatabaseTableSpace)
+			tblspcOid = MyDatabaseTableSpace;
+		else
+			tblspcOid = DEFAULTTABLESPACE_OID;
+	}
 
 	/*
 	 * Identify the tempfile directory for this tablespace.
@@ -1275,22 +1427,86 @@ OpenTemporaryFileInTablespace(Oid tblspcOid, bool rejectError)
 	{
 		/* All other tablespaces are accessed via symlinks */
 		snprintf(tempdirpath, sizeof(tempdirpath), "pg_tblspc/%u/%s/%s",
-				 tblspcOid, TABLESPACE_VERSION_DIRECTORY, PG_TEMP_FILES_DIR);
+				 tblspcOid, GP_TABLESPACE_VERSION_DIRECTORY, PG_TEMP_FILES_DIR);
+	}
+
+	/*
+	 * We might need to create the tablespace's tempfile directory, if no
+	 * one has yet done so.
+	 *
+	 * Don't check for error from mkdir. It will fail if the directory
+	 * exists already, which is quite likely. If it fails for some other
+	 * reason, we'll bomb out when creating the file in the directory.
+	 */
+	if (createdir)
+		mkdir(tempdirpath, S_IRWXU);
+
+	snprintf(tempfilepath, sizeof(tempfilepath), "%s/%s_%s",
+			 tempdirpath, PG_TEMP_FILE_PREFIX, filename);
+	return pstrdup(tempfilepath);
+}
+
+/*
+ * Open a temporary file in a specific tablespace.
+ * Subroutine for OpenTemporaryFile, which see for details.
+ */
+static File
+OpenTemporaryFileInTablespace(Oid tblspcOid, bool rejectError,
+							  const char *filename, bool makenameunique, bool create)
+{
+	char		tempdirpath[MAXPGPATH];
+	char		tempfilepath[MAXPGPATH];
+	File		file;
+	int			flags;
+
+	/*
+	 * Identify the tempfile directory for this tablespace.
+	 *
+	 * If someone tries to specify pg_global, use pg_default instead.
+	 */
+	if (tblspcOid == DEFAULTTABLESPACE_OID ||
+		tblspcOid == GLOBALTABLESPACE_OID)
+	{
+		/* The default tablespace is {datadir}/base */
+		snprintf(tempdirpath, sizeof(tempdirpath), "base/%s",
+				 PG_TEMP_FILES_DIR);
+	}
+	else
+	{
+		/* All other tablespaces are accessed via symlinks */
+		snprintf(tempdirpath, sizeof(tempdirpath), "pg_tblspc/%u/%s/%s",
+				 tblspcOid, GP_TABLESPACE_VERSION_DIRECTORY, PG_TEMP_FILES_DIR);
 	}
 
 	/*
 	 * Generate a tempfile name that should be unique within the current
 	 * database instance.
 	 */
-	snprintf(tempfilepath, sizeof(tempfilepath), "%s/%s%d.%ld",
-			 tempdirpath, PG_TEMP_FILE_PREFIX, MyProcPid, tempFileCounter++);
+	if (filename == NULL)
+	{
+		Assert (makenameunique);
+		filename = "";
+	}
+
+	if (makenameunique)
+	{
+		Assert(create);
+		snprintf(tempfilepath, sizeof(tempfilepath), "%s/%s%s%d.%ld",
+				 tempdirpath, PG_TEMP_FILE_PREFIX, filename, MyProcPid, tempFileCounter++);
+	}
+	else
+		snprintf(tempfilepath, sizeof(tempfilepath), "%s/%s_%s",
+				 tempdirpath, PG_TEMP_FILE_PREFIX, filename);
 
 	/*
 	 * Open the file.  Note: we don't use O_EXCL, in case there is an orphaned
 	 * temp file that can be reused.
 	 */
+	flags = O_RDWR | PG_BINARY;
+	if (create)
+		flags |= O_CREAT | O_TRUNC;
 	file = PathNameOpenFile(tempfilepath,
-							O_RDWR | O_CREAT | O_TRUNC | PG_BINARY,
+							flags,
 							0600);
 	if (file <= 0)
 	{
@@ -1305,11 +1521,17 @@ OpenTemporaryFileInTablespace(Oid tblspcOid, bool rejectError)
 		mkdir(tempdirpath, S_IRWXU);
 
 		file = PathNameOpenFile(tempfilepath,
-								O_RDWR | O_CREAT | O_TRUNC | PG_BINARY,
+								flags,
 								0600);
 		if (file <= 0 && rejectError)
-			elog(ERROR, "could not create temporary file \"%s\": %m",
-				 tempfilepath);
+		{
+			if (create)
+				elog(ERROR, "could not create temporary file \"%s\": %m",
+					 tempfilepath);
+			else
+				elog(ERROR, "could not open existing temporary file \"%s\": %m",
+					 tempfilepath);
+		}
 	}
 
 	return file;
@@ -1333,7 +1555,7 @@ FileClose(File file)
 	if (!FileIsNotOpen(file))
 	{
 		/* close the file */
-		if (close(vfdP->fd))
+		if (gp_retry_close(vfdP->fd))
 		{
 			/*
 			 * We may need to panic on failure to close non-temporary files;
@@ -1377,9 +1599,12 @@ FileClose(File file)
 		else
 			stat_errno = 0;
 
+		if (vfdP->fdstate & FD_WORKFILE)
+			WorkFileDeleted(file, true);
+
 		/* in any case do the unlink */
 		if (unlink(vfdP->fileName))
-			elog(LOG, "could not unlink file \"%s\": %m", vfdP->fileName);
+			elog(DEBUG1, "could not unlink file \"%s\": %m", vfdP->fileName);
 
 		/* and last report the stat results */
 		if (stat_errno == 0)
@@ -1398,7 +1623,7 @@ FileClose(File file)
 		else
 		{
 			errno = stat_errno;
-			elog(LOG, "could not stat file \"%s\": %m", vfdP->fileName);
+			elog(DEBUG1, "could not stat file \"%s\": %m", vfdP->fileName);
 		}
 	}
 
@@ -1567,6 +1792,23 @@ FileWrite(File file, char *buffer, int amount)
 		}
 	}
 
+	/*
+	 * Also update the stats in workfile manager. This might also
+	 * throw an error, if we're over the limits.
+	 *
+	 * Because we update the stats in workfile manager first, if the write
+	 * fails, the workfile manager's status will be out of sync with reality.
+	 * That's OK, the inaccuracy doens't accumulate, and it doesn't need to be
+	 * totallyaccurate.
+	 */
+	if ((VfdCache[file].fdstate & FD_WORKFILE) != 0)
+	{
+		off_t		newPos = VfdCache[file].seekPos + amount;
+
+		if (newPos > VfdCache[file].fileSize)
+			UpdateWorkFileSize(file, newPos);
+	}
+
 retry:
 	errno = 0;
 	returnCode = write(vfdP->fd, buffer, amount);
@@ -1633,7 +1875,6 @@ int
 FileSync(File file)
 {
 	int			returnCode;
-
 	Assert(FileIsValid(file));
 
 	DO_DB(elog(LOG, "FileSync: %d (%s)",
@@ -1643,11 +1884,13 @@ FileSync(File file)
 	if (returnCode < 0)
 		return returnCode;
 
-	return pg_fsync(VfdCache[file].fd);
+	returnCode =  pg_fsync(VfdCache[file].fd);
+
+	return returnCode;
 }
 
-off_t
-FileSeek(File file, off_t offset, int whence)
+int64
+FileSeek(File file, int64 offset, int whence)
 {
 	Vfd		   *vfdP;
 
@@ -1721,10 +1964,50 @@ FileSeek(File file, off_t offset, int whence)
 }
 
 /*
+ * Get the size of a physical file by using fstat()
+ *
+ * Returns size in bytes if successful, < 0 otherwise
+ */
+int64
+FileDiskSize(File file)
+{
+	int			returnCode = 0;
+	struct stat buf;
+
+	returnCode = FileAccess(file);
+	if (returnCode < 0)
+		return returnCode;
+
+	returnCode = fstat(VfdCache[file].fd, &buf);
+	if (returnCode < 0)
+		return returnCode;
+
+	return (int64) buf.st_size;
+}
+
+int64
+FileNonVirtualCurSeek(File file)
+{
+	int			returnCode;
+
+	Assert(FileIsValid(file));
+
+	DO_DB(elog(LOG, "FileNonVirtualCurSeek: %d (%s) virtual position" INT64_FORMAT,
+			   file, VfdCache[file].fileName,
+			   VfdCache[file].seekPos));
+
+	returnCode = FileAccess(file);
+	if (returnCode < 0)
+		return returnCode;
+
+	return pg_lseek64(VfdCache[file].fd, 0, SEEK_CUR);
+}
+
+/*
  * XXX not actually used but here for completeness
  */
 #ifdef NOT_USED
-off_t
+int64
 FileTell(File file)
 {
 	Assert(FileIsValid(file));
@@ -1735,7 +2018,7 @@ FileTell(File file)
 #endif
 
 int
-FileTruncate(File file, off_t offset)
+FileTruncate(File file, int64 offset)
 {
 	int			returnCode;
 
@@ -1748,7 +2031,17 @@ FileTruncate(File file, off_t offset)
 	if (returnCode < 0)
 		return returnCode;
 
+	/*
+	 * Call ftruncate with a int64 value.
+	 *
+	 * WARNING:DO NOT typecast this down to a 32-bit long or
+	 * append-only vacuum full adjustment of the eof will erroneously remove
+	 * table data.
+	 */
 	returnCode = ftruncate(VfdCache[file].fd, offset);
+
+	/* Assume we don't know the file position anymore */
+	VfdCache[file].seekPos = FileUnknownPos;
 
 	if (returnCode == 0 && VfdCache[file].fileSize > offset)
 	{
@@ -1895,6 +2188,20 @@ TryAgain:
 			goto TryAgain;
 		errno = save_errno;
 	}
+
+	/*
+	 * TEMPORARY hack to log the Windows error code on fopen failures, in
+	 * hopes of diagnosing some hard-to-reproduce problems.
+	 */
+#ifdef WIN32
+	{
+		int			save_errno = errno;
+
+		elog(LOG, "Windows fopen(\"%s\",\"%s\") failed: code %lu, errno %d",
+			 name, mode, GetLastError(), save_errno);
+		errno = save_errno;
+	}
+#endif
 
 	return NULL;
 }
@@ -2054,6 +2361,7 @@ FreeFile(FILE *file)
 
 	/* Only get here if someone passes us a file not in allocatedDescs */
 	elog(WARNING, "file passed to FreeFile was not obtained from AllocateFile");
+	Assert(false);
 
 	return fclose(file);
 }
@@ -2238,6 +2546,7 @@ FreeDir(DIR *dir)
 
 	/* Only get here if someone passes us a dir not in allocatedDescs */
 	elog(WARNING, "dir passed to FreeDir was not obtained from AllocateDir");
+	Assert(false);
 
 	return closedir(dir);
 }
@@ -2336,6 +2645,30 @@ TempTablespacesAreSet(void)
 }
 
 /*
+ * GetSessionTempTableSpace
+ *
+ * Select temp tablespace for current session to use. It's like
+ * GetNextTempTableSpace in upstream, but it gets the same temp
+ * tablespace in all QD/QE processes in the same session.
+ * A result of InvalidOid means to use the current database's
+ * default tablespace.
+ */
+static inline Oid
+GetSessionTempTableSpace(void)
+{
+	if (numTempTableSpaces <= 0)
+		return InvalidOid;
+
+	if (gp_session_id >= 0)
+		return tempTableSpaces[gp_session_id % numTempTableSpaces];
+
+	/* If this session is not MPP, uses the implementation from upstream */
+	if (++nextTempTableSpace >= numTempTableSpaces)
+		nextTempTableSpace = 0;
+	return tempTableSpaces[nextTempTableSpace];
+}
+
+/*
  * GetNextTempTableSpace
  *
  * Select the next temp tablespace to use.  A result of InvalidOid means
@@ -2344,16 +2677,8 @@ TempTablespacesAreSet(void)
 Oid
 GetNextTempTableSpace(void)
 {
-	if (numTempTableSpaces > 0)
-	{
-		/* Advance nextTempTableSpace counter with wraparound */
-		if (++nextTempTableSpace >= numTempTableSpaces)
-			nextTempTableSpace = 0;
-		return tempTableSpaces[nextTempTableSpace];
-	}
-	return InvalidOid;
+	return GetSessionTempTableSpace();
 }
-
 
 /*
  * AtEOSubXact_Files
@@ -2485,7 +2810,7 @@ CleanupTempFiles(bool isProcExit)
 void
 RemovePgTempFiles(void)
 {
-	char		temp_path[MAXPGPATH + 10 + sizeof(TABLESPACE_VERSION_DIRECTORY) + sizeof(PG_TEMP_FILES_DIR)];
+	char		temp_path[MAXPGPATH + 11 + get_dbid_string_length() + 1 + sizeof(GP_TABLESPACE_VERSION_DIRECTORY) + sizeof(PG_TEMP_FILES_DIR)];
 	DIR		   *spc_dir;
 	struct dirent *spc_de;
 
@@ -2493,7 +2818,7 @@ RemovePgTempFiles(void)
 	 * First process temp files in pg_default ($PGDATA/base)
 	 */
 	snprintf(temp_path, sizeof(temp_path), "base/%s", PG_TEMP_FILES_DIR);
-	RemovePgTempFilesInDir(temp_path);
+	RemovePgTempFilesInDir(temp_path, true, false);
 	RemovePgTempRelationFiles("base");
 
 	/*
@@ -2508,11 +2833,11 @@ RemovePgTempFiles(void)
 			continue;
 
 		snprintf(temp_path, sizeof(temp_path), "pg_tblspc/%s/%s/%s",
-			spc_de->d_name, TABLESPACE_VERSION_DIRECTORY, PG_TEMP_FILES_DIR);
-		RemovePgTempFilesInDir(temp_path);
+				 spc_de->d_name, GP_TABLESPACE_VERSION_DIRECTORY, PG_TEMP_FILES_DIR);
+		RemovePgTempFilesInDir(temp_path, true, false);
 
 		snprintf(temp_path, sizeof(temp_path), "pg_tblspc/%s/%s",
-				 spc_de->d_name, TABLESPACE_VERSION_DIRECTORY);
+				 spc_de->d_name, GP_TABLESPACE_VERSION_DIRECTORY);
 		RemovePgTempRelationFiles(temp_path);
 	}
 
@@ -2523,30 +2848,38 @@ RemovePgTempFiles(void)
 	 * DataDir as well.
 	 */
 #ifdef EXEC_BACKEND
-	RemovePgTempFilesInDir(PG_TEMP_FILES_DIR);
+	RemovePgTempFilesInDir(PG_TEMP_FILES_DIR, true, false);
 #endif
 }
 
-/* Process one pgsql_tmp directory for RemovePgTempFiles */
+/*
+ * Process one pgsql_tmp directory for RemovePgTempFiles.
+ *
+ * If missing_ok is true, it's all right for the named directory to not exist.
+ * Any other problem results in a LOG message.  (missing_ok should be true at
+ * the top level, since pgsql_tmp directories are not created until needed.)
+ *
+ * At the top level, this should be called with unlink_all = false, so that
+ * only files matching the temporary name prefix will be unlinked.  When
+ * recursing it will be called with unlink_all = true to unlink everything
+ * under a top-level temporary directory.
+ *
+ * (These two flags could be replaced by one, but it seems clearer to keep
+ * them separate.)
+ */
 static void
-RemovePgTempFilesInDir(const char *tmpdirname)
+RemovePgTempFilesInDir(const char *tmpdirname, bool missing_ok, bool unlink_all)
 {
 	DIR		   *temp_dir;
 	struct dirent *temp_de;
 	char		rm_path[MAXPGPATH * 2];
 
 	temp_dir = AllocateDir(tmpdirname);
-	if (temp_dir == NULL)
-	{
-		/* anything except ENOENT is fishy */
-		if (errno != ENOENT)
-			elog(LOG,
-				 "could not open temporary-files directory \"%s\": %m",
-				 tmpdirname);
-		return;
-	}
 
-	while ((temp_de = ReadDir(temp_dir, tmpdirname)) != NULL)
+	if (temp_dir == NULL && errno == ENOENT && missing_ok)
+		return;
+
+	while ((temp_de = ReadDirExtended(temp_dir, tmpdirname, LOG)) != NULL)
 	{
 		if (strcmp(temp_de->d_name, ".") == 0 ||
 			strcmp(temp_de->d_name, "..") == 0)
@@ -2555,14 +2888,45 @@ RemovePgTempFilesInDir(const char *tmpdirname)
 		snprintf(rm_path, sizeof(rm_path), "%s/%s",
 				 tmpdirname, temp_de->d_name);
 
-		if (strncmp(temp_de->d_name,
+		if (unlink_all ||
+			strncmp(temp_de->d_name,
 					PG_TEMP_FILE_PREFIX,
 					strlen(PG_TEMP_FILE_PREFIX)) == 0)
-			unlink(rm_path);	/* note we ignore any error */
+		{
+			struct stat statbuf;
+
+			if (lstat(rm_path, &statbuf) < 0)
+			{
+				ereport(LOG,
+						(errcode_for_file_access(),
+						 errmsg("could not stat file \"%s\": %m", rm_path)));
+				continue;
+			}
+
+			if (S_ISDIR(statbuf.st_mode))
+			{
+				/* recursively remove contents, then directory itself */
+				RemovePgTempFilesInDir(rm_path, false, true);
+
+				if (rmdir(rm_path) < 0)
+					ereport(LOG,
+							(errcode_for_file_access(),
+							 errmsg("could not remove directory \"%s\": %m",
+									rm_path)));
+			}
+			else
+			{
+				if (unlink(rm_path) < 0)
+					ereport(LOG,
+							(errcode_for_file_access(),
+							 errmsg("could not remove file \"%s\": %m",
+									rm_path)));
+			}
+		}
 		else
-			elog(LOG,
-				 "unexpected file found in temporary-files directory: \"%s\"",
-				 rm_path);
+			ereport(LOG,
+					(errmsg("unexpected file found in temporary-files directory: \"%s\"",
+							rm_path)));
 	}
 
 	FreeDir(temp_dir);
@@ -2641,7 +3005,18 @@ RemovePgTempRelationFilesInDbspace(const char *dbspacedirname)
 	FreeDir(dbspace_dir);
 }
 
-/* t<digits>_<digits>, or t<digits>_<digits>_<forkname> */
+/*
+ * In PostgreSQL, the pattern is:
+ *
+ * t<digits>_<digits>, or t<digits>_<digits>_<forkname>
+ *
+ * In GPDB, however, we leave out the first <digits>. In PostgreSQL it's
+ * used for the backend ID, but we don't use that in GPDB because even
+ * temporary relation are kept in shared buffers, and need to be accessible
+ * from multiple backends. So the pattern in GPDB is:
+ *
+ * t_<digits>, or t<digits>_<digits>_<forkname>
+ */
 static bool
 looks_like_temp_rel_name(const char *name)
 {
@@ -2652,11 +3027,10 @@ looks_like_temp_rel_name(const char *name)
 	if (name[0] != 't')
 		return false;
 
-	/* Followed by a non-empty string of digits and then an underscore. */
-	for (pos = 1; isdigit((unsigned char) name[pos]); ++pos)
-		;
-	if (pos == 1 || name[pos] != '_')
+	/* Followed by underscode. */
+	if (name[1] != '_')
 		return false;
+	pos = 1;
 
 	/* Followed by another nonempty string of digits. */
 	for (savepos = ++pos; isdigit((unsigned char) name[pos]); ++pos)
@@ -2690,6 +3064,22 @@ looks_like_temp_rel_name(const char *name)
 	return true;
 }
 
+/*
+ * Synchronize all xlog files and pg_wal itself in pg_wal
+ *
+ * This is called at the beginning of recovery.
+ */
+void
+SyncAllXLogFiles(void)
+{
+	/* We can skip this whole thing if fsync is disabled. */
+	if (!enableFsync)
+		return;
+
+	ereport(LOG, (errmsg("Synchronization of the wal directory starts.")));
+	walkdir("pg_xlog", datadir_fsync_fname, false, LOG);
+	ereport(LOG, (errmsg("synchronization of the wal directory finishes.")));
+}
 
 /*
  * Issue fsync recursively on PGDATA and all its contents.
@@ -2992,6 +3382,29 @@ fsync_parent_path(const char *fname, int elevel)
 	return 0;
 }
 
+const char *
+FileGetFilename(File file)
+{
+
+	Assert(FileIsValid(file));
+
+	DO_DB(elog(LOG, "FileSeek: %d (%s) " INT64_FORMAT " " INT64_FORMAT " %d",
+			   file, VfdCache[file].fileName,
+			   (int64) VfdCache[file].seekPos,
+			   (int64) offset, whence));
+
+	return VfdCache[file].fileName;
+}
+
+/*
+ * Mark the file as a "work file" that should be tracked by the workfile manager.
+ */
+void
+FileSetIsWorkfile(File file)
+{
+	VfdCache[file].fdstate |= FD_WORKFILE;
+}
+
 /*
  * Return the passed-in error level, or PANIC if data_sync_retry is off.
  *
@@ -3013,4 +3426,16 @@ int
 data_sync_elevel(int elevel)
 {
 	return data_sync_retry ? elevel : PANIC;
+}
+
+/*
+ * Set file is temp file or not
+ */
+void
+FileSetIsTempFile(File file, bool isTempFile)
+{
+	if (isTempFile)
+		VfdCache[file].fdstate |= FD_TEMPORARY;
+	else
+		VfdCache[file].fdstate &= ~FD_TEMPORARY;
 }

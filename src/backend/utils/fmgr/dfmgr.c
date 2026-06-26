@@ -76,6 +76,7 @@ static char *expand_dynamic_library_name(const char *name);
 static void check_restricted_library_name(const char *name);
 static char *substitute_libpath_macro(const char *name);
 static char *find_in_dynamic_libpath(const char *basename);
+static const char *get_magic_product(const Pg_magic_struct *module_magic_data);
 
 /* Magic structure that module needs to match to be accepted */
 static const Pg_magic_struct magic_data = PG_MODULE_MAGIC_DATA;
@@ -291,6 +292,35 @@ internal_load_library(const char *libname)
 }
 
 /*
+ * Identify what product a particular magic data was compiled for.
+ */
+static const char*
+get_magic_product(const Pg_magic_struct *module_magic_data)
+{
+	/*
+	 * Assume that any magic_data context that does not contain a product code
+	 * must be Postgres, probably.
+	 */
+	if (module_magic_data->len <= offsetof(Pg_magic_struct, product))
+		return "PostgreSQL";
+	
+	switch (module_magic_data->product)
+	{
+		case PgMagicProductNone:
+		case PgMagicProductPostgres:
+			return "PostgreSQL";
+
+		case PgMagicProductGreenplum:
+			return "Greenplum";
+
+		/* Handle Unrecognized product codes */
+		default:
+			return psprintf("Product(%d)", module_magic_data->product);
+	}
+}
+
+
+/*
  * Report a suitable error for an incompatible magic block.
  */
 static void
@@ -298,20 +328,44 @@ incompatible_module_error(const char *libname,
 						  const Pg_magic_struct *module_magic_data)
 {
 	StringInfoData details;
+	const char *magic_product     = get_magic_product(&magic_data);
+	const char *mod_magic_product = get_magic_product(module_magic_data);
+
+	/*
+	 * The default header version for module_magic_data is assumed to be 0
+	 * as it may not be recent enough to have the headerversion field
+	 */
+	int lib_internal_version = 0;
+
+	/* module_magic_data is recent enough to provide its own header version */
+	if (module_magic_data->len > offsetof(Pg_magic_struct, headerversion))
+	{
+		lib_internal_version = module_magic_data->headerversion;
+	}
 
 	/*
 	 * If the version doesn't match, just report that, because the rest of the
 	 * block might not even have the fields we expect.
 	 */
-	if (magic_data.version != module_magic_data->version)
+	if (magic_data.version != module_magic_data->version ||
+		magic_data.product != module_magic_data->product ||
+		magic_data.headerversion != lib_internal_version)
+	{
 		ereport(ERROR,
 				(errmsg("incompatible library \"%s\": version mismatch",
 						libname),
-			  errdetail("Server is version %d.%d, library is version %d.%d.",
+			  errdetail("Server version is %s %d.%d (header version: %d), library is %s %d.%d (header version: %d).",
+						magic_product,
 						magic_data.version / 100,
 						magic_data.version % 100,
+						magic_data.headerversion,
+						mod_magic_product,
 						module_magic_data->version / 100,
-						module_magic_data->version % 100)));
+						module_magic_data->version % 100,
+						lib_internal_version)
+				)
+		);
+	}
 
 	/*
 	 * Otherwise, spell out which fields don't agree.

@@ -33,6 +33,7 @@
 
 #include "executor/tuptable.h"
 
+struct Instrumentation;                 /* #include "executor/instrument.h" */
 
 /* Tuplestorestate is an opaque type whose details are not known outside
  * tuplestore.c.
@@ -85,5 +86,8 @@ extern void tuplestore_rescan(Tuplestorestate *state);
 extern void tuplestore_clear(Tuplestorestate *state);
 
 extern void tuplestore_end(Tuplestorestate *state);
+
+extern void tuplestore_set_instrument(Tuplestorestate *state,
+                          struct Instrumentation *instrument);
 
 #endif   /* TUPLESTORE_H */

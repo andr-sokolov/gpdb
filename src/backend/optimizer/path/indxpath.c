@@ -4,6 +4,8 @@
  *	  Routines to determine which indexes are usable for scanning a
  *	  given relation, and create Paths accordingly.
  *
+ * Portions Copyright (c) 2006-2008, Greenplum inc
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -31,13 +33,15 @@
 #include "optimizer/paths.h"
 #include "optimizer/predtest.h"
 #include "optimizer/restrictinfo.h"
+#include "optimizer/subselect.h"
 #include "optimizer/var.h"
+#include "parser/parsetree.h"
 #include "utils/builtins.h"
 #include "utils/bytea.h"
+#include "utils/faultinjector.h"
 #include "utils/lsyscache.h"
 #include "utils/pg_locale.h"
 #include "utils/selfuncs.h"
-
 
 #define IsBooleanOpfamily(opfamily) \
 	((opfamily) == BOOL_BTREE_FAM_OID || (opfamily) == BOOL_HASH_FAM_OID)
@@ -779,11 +783,30 @@ get_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	{
 		IndexPath  *ipath = (IndexPath *) lfirst(lc);
 
-		if (index->amhasgettuple)
+		/* CDB: Flag RelOptInfo if at most one row can satisfy index quals. */
+		if (ipath->num_leading_eq > 0 &&
+			ipath->num_leading_eq == ipath->indexinfo->ncolumns &&
+			ipath->indexinfo->unique)
+			rel->onerow = true;
+
+		/*
+		 * Random access to Append-Only is slow because AO doesn't use the buffer
+		 * pool and we want to avoid decompressing blocks multiple times.  So,
+		 * only consider bitmap paths because they are processed in TID order.
+		 * The appendonlyam.c module will optimize fetches in TID order by keeping
+		 * the last decompressed block between fetch calls.
+		 */
+		if (index->amhasgettuple && rel->relstorage == RELSTORAGE_HEAP)
 			add_path(rel, (Path *) ipath);
 
 		if (index->amhasgetbitmap &&
-			(ipath->path.pathkeys == NIL ||
+			/* GPDB: Give a chance of bitmap index path if seqscan is disabled.
+			 * GPDB_92_MERGE_FIXME: Maybe we should remove this check to follow
+			 * pg upstream? test co_nestloop_idxscan output will diff with and
+			 * without this line.
+			 */
+			(!enable_seqscan ||
+			 ipath->path.pathkeys == NIL ||
 			 ipath->indexselectivity < 1.0))
 			*bitindexpaths = lappend(*bitindexpaths, ipath);
 	}
@@ -986,6 +1009,7 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	{
 		index_pathkeys = build_index_pathkeys(root, index,
 											  ForwardScanDirection);
+
 		useful_pathkeys = truncate_useless_pathkeys(root, rel,
 													index_pathkeys);
 		orderbyclauses = NIL;
@@ -1609,6 +1633,17 @@ bitmap_and_cost_est(PlannerInfo *root, RelOptInfo *rel, List *paths)
 						  bpath.path.param_info,
 						  (Path *) &apath,
 						  get_loop_count(root, required_outer));
+
+	#ifdef FAULT_INJECTOR
+		/* Simulate an bitmapAnd plan by changing bitmap cost. */
+		if (FaultInjector_InjectFaultIfSet("simulate_bitmap_and",
+									DDLNotSpecified,
+									"",
+									"") == FaultInjectorTypeSkip)
+		{
+			bpath.path.total_cost = 0;
+		}
+	#endif
 
 	return bpath.path.total_cost;
 }

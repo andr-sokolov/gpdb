@@ -5,6 +5,8 @@
  *	  along with the relation's initial contents.
  *
  *
+ * Portions Copyright (c) 2006-2010, Greenplum inc.
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -119,6 +121,13 @@ CATALOG(pg_statistic,2619) BKI_WITHOUT_OIDS
 } FormData_pg_statistic;
 
 #define STATISTIC_NUM_SLOTS  5
+
+/* GPDB added foreign key definitions for gpcheckcat. */
+FOREIGN_KEY(starelid REFERENCES pg_attribute(attrelid));
+FOREIGN_KEY(staop1 REFERENCES pg_operator(oid));
+FOREIGN_KEY(staop2 REFERENCES pg_operator(oid));
+FOREIGN_KEY(staop3 REFERENCES pg_operator(oid));
+FOREIGN_KEY(staop4 REFERENCES pg_operator(oid));
 
 
 /* ----------------
@@ -290,5 +299,20 @@ typedef FormData_pg_statistic *Form_pg_statistic;
  * bounds.  Only non-NULL, non-empty ranges are included.
  */
 #define STATISTIC_KIND_BOUNDS_HISTOGRAM  7
+
+/*
+ * A "hyperloglog" slot stores the hyperloglog_counter created for sampled data.
+ * This hyperloglog_counter data structure is converted into a bytea and stored
+ * in "stavalues4" slot of pg_statistic catalog table
+ */
+#define STATISTIC_KIND_HLL  99
+
+/*
+ * A "full hyperloglog" slot is similar to "hyperloglog" slot, except it stores
+ * the "hyperloglog_counter" created for full table scan.
+ * This hyperloglog_counter data structure is converted into a bytea and stored
+ * in "stavalues4" slot of pg_statistic catalog table
+ */
+#define STATISTIC_KIND_FULLHLL  98
 
 #endif   /* PG_STATISTIC_H */

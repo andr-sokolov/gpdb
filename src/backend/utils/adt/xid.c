@@ -83,14 +83,79 @@ xideq(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(TransactionIdEquals(xid1, xid2));
 }
 
+Datum
+xidne(PG_FUNCTION_ARGS)
+{
+	TransactionId xid1 = PG_GETARG_TRANSACTIONID(0);
+	TransactionId xid2 = PG_GETARG_TRANSACTIONID(1);
+
+	PG_RETURN_BOOL(xid1 != xid2);
+}
+
+Datum
+xidlt(PG_FUNCTION_ARGS)
+{
+	TransactionId xid1 = PG_GETARG_TRANSACTIONID(0);
+	TransactionId xid2 = PG_GETARG_TRANSACTIONID(1);
+
+	PG_RETURN_BOOL(xid1 < xid2);
+}
+
+Datum
+xidgt(PG_FUNCTION_ARGS)
+{
+	TransactionId xid1 = PG_GETARG_TRANSACTIONID(0);
+	TransactionId xid2 = PG_GETARG_TRANSACTIONID(1);
+
+	PG_RETURN_BOOL(xid1 > xid2);
+}
+
+Datum
+xidle(PG_FUNCTION_ARGS)
+{
+	TransactionId xid1 = PG_GETARG_TRANSACTIONID(0);
+	TransactionId xid2 = PG_GETARG_TRANSACTIONID(1);
+
+	PG_RETURN_BOOL(xid1 <= xid2);
+}
+
+Datum
+xidge(PG_FUNCTION_ARGS)
+{
+	TransactionId xid1 = PG_GETARG_TRANSACTIONID(0);
+	TransactionId xid2 = PG_GETARG_TRANSACTIONID(1);
+
+	PG_RETURN_BOOL(xid1 >= xid2);
+}
+
+Datum
+btxidcmp(PG_FUNCTION_ARGS)
+{
+	TransactionId xid1 = PG_GETARG_TRANSACTIONID(0);
+	TransactionId xid2 = PG_GETARG_TRANSACTIONID(1);
+
+	if (xid1 == xid2)
+		PG_RETURN_INT32(0);
+	else if (xid1 > xid2)
+		PG_RETURN_INT32(1);
+	else
+		PG_RETURN_INT32(-1);
+}
+
+
 /*
- *		xid_age			- compute age of an XID (relative to latest stable xid)
+ * xid_age - compute age of an XID (relative to latest transaction id
+ * allocated in system)
+ *
+ * ReadNewTransactionId() is used here instead of GetTopTransactionId(), as
+ * this function may be called on QE Reader and with laxy XID try to allocate
+ * XID as QE Reader which is not allowed.
  */
 Datum
 xid_age(PG_FUNCTION_ARGS)
 {
 	TransactionId xid = PG_GETARG_TRANSACTIONID(0);
-	TransactionId now = GetStableLatestTransactionId();
+	TransactionId now = ReadNewTransactionId();
 
 	/* Permanent XIDs are always infinitely old */
 	if (!TransactionIdIsNormal(xid))
