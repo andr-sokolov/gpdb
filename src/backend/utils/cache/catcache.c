@@ -33,6 +33,7 @@
 #include "utils/fmgroids.h"
 #include "utils/inval.h"
 #include "utils/memutils.h"
+#include "utils/relcache.h"
 #include "utils/rel.h"
 #include "utils/resowner_private.h"
 #include "utils/syscache.h"
@@ -1008,6 +1009,54 @@ IndexScanOK(CatCache *cache, ScanKey cur_skey)
 }
 
 /*
+ * This function performs checks for certain system tables to validate tuple
+ * fetched from table has the key, using which it was fetched from index.
+ */
+static void
+CrossCheckTuple(int cacheId,
+		Datum key1,
+		Datum key2,
+		Datum key3,
+		Datum key4,
+		HeapTuple tuple)
+{
+	Form_pg_class rd_rel;
+
+	switch (cacheId)
+	{
+		case RELOID:
+			if (HeapTupleGetOid(tuple) != DatumGetObjectId(key1))
+			{
+				elog(ERROR, "pg_class_oid_index is broken, oid=%d is pointing to tuple with oid=%d (xmin:%u xmax:%u)",
+					DatumGetObjectId(key1), HeapTupleGetOid(tuple),
+					HeapTupleHeaderGetXmin((tuple)->t_data),
+					HeapTupleHeaderGetRawXmax((tuple)->t_data));
+			}
+			break;
+		case RELNAMENSP:
+			rd_rel = (Form_pg_class) GETSTRUCT(tuple);
+			if (strncmp(rd_rel->relname.data, DatumGetCString(key1), NAMEDATALEN) != 0)
+			{
+				elog(ERROR, "pg_class_relname_nsp_index is broken, intended tuple with name \"%s\" fetched \"%s\""
+					" (xmin:%u xmax:%u)",
+					DatumGetCString(key1), rd_rel->relname.data,
+					HeapTupleHeaderGetXmin((tuple)->t_data),
+					HeapTupleHeaderGetRawXmax((tuple)->t_data));
+			}
+			break;
+		case TYPEOID:
+			if (HeapTupleGetOid(tuple) != DatumGetObjectId(key1))
+			{
+				elog(ERROR, "pg_type_oid_index is broken, oid=%d is pointing to tuple with oid=%d (xmin:%u xmax:%u)",
+					DatumGetObjectId(key1), HeapTupleGetOid(tuple),
+					HeapTupleHeaderGetXmin((tuple)->t_data),
+					HeapTupleHeaderGetRawXmax((tuple)->t_data));
+			}
+			break;
+	}
+}
+
+/*
  *	SearchCatCache
  *
  *		This call searches a system cache for a tuple, opening the relation
@@ -1166,6 +1215,17 @@ SearchCatCache(CatCache *cache,
 
 	while (HeapTupleIsValid(ntp = systable_getnext(scandesc)))
 	{
+		/*
+		 * Good place to sanity check the tuple, before adding it to cache.
+		 * So if its fetched using index, lets cross verify tuple intended is the tuple
+		 * fetched. If not fail and contain the damage which maybe caused due to
+		 * index corruption for some reason.
+		 */
+		if (scandesc->irel)
+		{
+			CrossCheckTuple(cache->id, v1, v2, v3, v4, ntp);
+		}
+
 		ct = CatalogCacheCreateEntry(cache, ntp,
 									 hashValue, hashIndex,
 									 false);
@@ -1782,6 +1842,7 @@ PrepareToInvalidateCacheTuple(Relation relation,
 	 */
 	Assert(RelationIsValid(relation));
 	Assert(HeapTupleIsValid(tuple));
+	Assert(function != NULL);
 	Assert(PointerIsValid(function));
 	Assert(CacheHdr != NULL);
 
@@ -1831,7 +1892,7 @@ PrepareToInvalidateCacheTuple(Relation relation,
  * that resowner.c can call them.
  */
 void
-PrintCatCacheLeakWarning(HeapTuple tuple)
+PrintCatCacheLeakWarning(HeapTuple tuple, const char *resOwnerName)
 {
 	CatCTup    *ct = (CatCTup *) (((char *) tuple) -
 								  offsetof(CatCTup, tuple));
@@ -1839,17 +1900,19 @@ PrintCatCacheLeakWarning(HeapTuple tuple)
 	/* Safety check to ensure we were handed a cache entry */
 	Assert(ct->ct_magic == CT_MAGIC);
 
-	elog(WARNING, "cache reference leak: cache %s (%d), tuple %u/%u has count %d",
+	elog(WARNING, "cache reference leak: cache %s (%d), tuple %u/%u (oid %d) has count %d, resowner '%s'",
 		 ct->my_cache->cc_relname, ct->my_cache->id,
 		 ItemPointerGetBlockNumber(&(tuple->t_self)),
 		 ItemPointerGetOffsetNumber(&(tuple->t_self)),
-		 ct->refcount);
+         tuple->t_data ? HeapTupleGetOid(tuple) : 0,
+		 ct->refcount,
+         resOwnerName);
 }
 
 void
-PrintCatCacheListLeakWarning(CatCList *list)
+PrintCatCacheListLeakWarning(CatCList *list, const char *resOwnerName)
 {
-	elog(WARNING, "cache reference leak: cache %s (%d), list %p has count %d",
+	elog(WARNING, "cache reference leak: cache %s (%d), list %p has count %d, resowner '%s'",
 		 list->my_cache->cc_relname, list->my_cache->id,
-		 list, list->refcount);
+		 list, list->refcount, resOwnerName);
 }

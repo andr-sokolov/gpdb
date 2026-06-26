@@ -30,7 +30,9 @@
 
 #include "access/clog.h"
 #include "access/multixact.h"
+#include "access/distributedlog.h"
 #include "access/subtrans.h"
+#include "access/twophase.h"
 #include "commands/async.h"
 #include "miscadmin.h"
 #include "pg_trace.h"
@@ -40,6 +42,8 @@
 #include "storage/predicate.h"
 #include "storage/proc.h"
 #include "storage/spin.h"
+#include "utils/sharedsnapshot.h"
+#include "pg_trace.h"
 #include "utils/memutils.h"
 
 #ifdef LWLOCK_STATS
@@ -79,9 +83,11 @@ static LWLockTranche MainLWLockTranche;
  * ever be held simultaneously.
  */
 #define MAX_SIMUL_LWLOCKS	100
+#define MAX_FRAME_DEPTH  	64
 
 static int	num_held_lwlocks = 0;
 static LWLock *held_lwlocks[MAX_SIMUL_LWLOCKS];
+static bool held_lwlocks_exclusive[MAX_SIMUL_LWLOCKS];
 
 static int	lock_addin_request = 0;
 static bool lock_addin_request_allowed = true;
@@ -240,6 +246,12 @@ NumLWLocks(void)
 
 	/* subtrans.c needs one per SubTrans buffer */
 	numLocks += NUM_SUBTRANS_BUFFERS;
+    
+    /* cdbtm.c needs one lock */
+    numLocks++;
+    
+    /* cdbfts.c needs one lock */
+    numLocks++;
 
 	/* multixact.c needs two SLRU areas */
 	numLocks += NUM_MXACTOFFSET_BUFFERS + NUM_MXACTMEMBER_BUFFERS;
@@ -249,6 +261,12 @@ NumLWLocks(void)
 
 	/* predicate.c needs one per old serializable xid buffer */
 	numLocks += NUM_OLDSERXID_BUFFERS;
+
+	/* distributedlog.c needs one per DistributedLog buffer */
+	numLocks += DistributedLog_ShmemBuffers();
+
+	/* sharedsnapshot.c needs one per shared snapshot slot */
+	numLocks += NUM_SHARED_SNAPSHOT_SLOTS;
 
 	/* slot.c needs one for each slot */
 	numLocks += max_replication_slots;
@@ -390,6 +408,31 @@ LWLockAssign(void)
 	SpinLockRelease(ShmemLock);
 	return result;
 }
+
+#ifdef LOCK_DEBUG
+
+static void
+LWLockTryLockWaiting(PGPROC *proc, volatile LWLock *l)
+{
+	int 		milliseconds = 0;
+	
+	while(true)
+	{
+		pg_usleep(5000L);
+		if (PGSemaphoreTryLock(&proc->sem))
+		{
+			if (milliseconds >= 750)
+				elog(LOG, "Done waiting on lockid %d", T_ID(l));
+			return;
+		}
+
+		milliseconds += 5;
+		if (milliseconds == 750)
+			elog(LOG, "Waited .75 seconds on lockid %d with no success", T_ID(l));
+	}
+}
+
+#endif
 
 /*
  * Allocate a new tranche ID.
@@ -541,6 +584,7 @@ LWLockAcquireCommon(LWLock *l, LWLockMode mode, uint64 *valptr, uint64 val)
 	for (;;)
 	{
 		bool		mustwait;
+		int			c;
 
 		/* Acquire mutex.  Time spent holding mutex should be short! */
 #ifdef LWLOCK_STATS
@@ -618,12 +662,22 @@ LWLockAcquireCommon(LWLock *l, LWLockMode mode, uint64 *valptr, uint64 val)
 		lwstats->block_count++;
 #endif
 
+		for (c = 0; c < num_held_lwlocks; c++)
+		{
+			if (held_lwlocks[c] == lock  )
+				elog(PANIC, "Waiting on lock already held!");
+		}
+
 		TRACE_POSTGRESQL_LWLOCK_WAIT_START(T_NAME(l), T_ID(l), mode);
 
 		for (;;)
 		{
 			/* "false" means cannot accept cancel/die interrupt here. */
+#ifdef LOCK_DEBUG
+			LWLockTryLockWaiting(proc, lock);
+#else
 			PGSemaphoreLock(&proc->sem, false);
+#endif
 			if (!proc->lwWaiting)
 				break;
 			extraWaits++;
@@ -648,6 +702,7 @@ LWLockAcquireCommon(LWLock *l, LWLockMode mode, uint64 *valptr, uint64 val)
 	TRACE_POSTGRESQL_LWLOCK_ACQUIRE(T_NAME(l), T_ID(l), mode);
 
 	/* Add lock to list of locks held by this backend */
+	held_lwlocks_exclusive[num_held_lwlocks] = (mode == LW_EXCLUSIVE);
 	held_lwlocks[num_held_lwlocks++] = l;
 
 	/*
@@ -723,6 +778,7 @@ LWLockConditionalAcquire(LWLock *l, LWLockMode mode)
 	else
 	{
 		/* Add lock to list of locks held by this backend */
+		held_lwlocks_exclusive[num_held_lwlocks] = (mode == LW_EXCLUSIVE);
 		held_lwlocks[num_held_lwlocks++] = l;
 		TRACE_POSTGRESQL_LWLOCK_CONDACQUIRE(T_NAME(l), T_ID(l), mode);
 	}
@@ -1137,7 +1193,14 @@ LWLockRelease(LWLock *l)
 		elog(ERROR, "lock %s %d is not held", T_NAME(l), T_ID(l));
 	num_held_lwlocks--;
 	for (; i < num_held_lwlocks; i++)
+	{
+		held_lwlocks_exclusive[i] = held_lwlocks_exclusive[i + 1];
 		held_lwlocks[i] = held_lwlocks[i + 1];
+	}
+
+	// Clear out old last entry.
+	held_lwlocks_exclusive[num_held_lwlocks] = false;
+	held_lwlocks[num_held_lwlocks] = 0;
 
 	/* Acquire mutex.  Time spent holding mutex should be short! */
 	SpinLockAcquire(&lock->mutex);
@@ -1282,6 +1345,26 @@ LWLockHeldByMe(LWLock *l)
 	for (i = 0; i < num_held_lwlocks; i++)
 	{
 		if (held_lwlocks[i] == l)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * LWLockHeldByMe - test whether my process currently holds an exclusive lock
+ *
+ * This is meant as debug support only.  We do not distinguish whether the
+ * lock is held shared or exclusive.
+ */
+bool
+LWLockHeldExclusiveByMe(LWLockId lockid)
+{
+	int			i;
+
+	for (i = 0; i < num_held_lwlocks; i++)
+	{
+		if (held_lwlocks[i] == lockid &&
+			held_lwlocks_exclusive[i])
 			return true;
 	}
 	return false;

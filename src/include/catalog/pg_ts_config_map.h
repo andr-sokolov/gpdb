@@ -38,6 +38,10 @@ CATALOG(pg_ts_config_map,3603) BKI_WITHOUT_OIDS
 	Oid			mapdict;		/* dictionary to consult */
 } FormData_pg_ts_config_map;
 
+/* GPDB added foreign key definitions for gpcheckcat. */
+FOREIGN_KEY(mapcfg REFERENCES pg_ts_config(oid));
+FOREIGN_KEY(mapdict REFERENCES pg_ts_dict(oid));
+
 typedef FormData_pg_ts_config_map *Form_pg_ts_config_map;
 
 /* ----------------

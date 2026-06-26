@@ -61,6 +61,9 @@
 #include "utils/syscache.h"
 #include "utils/tqual.h"
 
+#include "cdb/cdbvars.h"
+#include "cdb/cdbdisp_query.h"
+
 
 static Oid	AlterObjectNamespace_internal(Relation rel, Oid objid, Oid nspOid);
 
@@ -299,8 +302,8 @@ AlterObjectRename_internal(Relation rel, Oid objectId, const char *new_name)
  * Executes an ALTER OBJECT / RENAME TO statement.  Based on the object
  * type, the function appropriate to that type is executed.
  */
-Oid
-ExecRenameStmt(RenameStmt *stmt)
+static Oid
+ExecRenameStmt_internal(RenameStmt *stmt)
 {
 	switch (stmt->renameType)
 	{
@@ -383,12 +386,36 @@ ExecRenameStmt(RenameStmt *stmt)
 	}
 }
 
+Oid
+ExecRenameStmt(RenameStmt *stmt)
+{
+	Oid			result;
+
+	result = ExecRenameStmt_internal(stmt);
+
+	/*
+	 * Dispatch to the segments. Except for event triggers, they're only stored
+	 * in the QD node.
+	 */
+	if (Gp_role == GP_ROLE_DISPATCH && stmt->renameType != OBJECT_EVENT_TRIGGER)
+	{
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									NIL,
+									NULL);
+	}
+
+	return result;
+}
+
 /*
  * Executes an ALTER OBJECT / SET SCHEMA statement.  Based on the object
  * type, the function appropriate to that type is executed.
  */
-Oid
-ExecAlterObjectSchemaStmt(AlterObjectSchemaStmt *stmt)
+static Oid
+ExecAlterObjectSchemaStmt_internal(AlterObjectSchemaStmt *stmt)
 {
 	switch (stmt->objectType)
 	{
@@ -450,6 +477,30 @@ ExecAlterObjectSchemaStmt(AlterObjectSchemaStmt *stmt)
 				 (int) stmt->objectType);
 			return InvalidOid;	/* keep compiler happy */
 	}
+}
+Oid
+ExecAlterObjectSchemaStmt(AlterObjectSchemaStmt *stmt)
+{
+	Oid			result;
+
+	result = ExecAlterObjectSchemaStmt_internal(stmt);
+
+	/*
+	 * Dispatch to the segments. Except for event triggers, they're only stored
+	 * in the QD node. (Event triggers have no schema, so that exception doesn't
+	 * really apply here, but keep this consistent with all the other commands.)
+	 */
+	if (Gp_role == GP_ROLE_DISPATCH && stmt->objectType != OBJECT_EVENT_TRIGGER)
+	{
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									NIL,
+									NULL);
+	}
+
+	return result;
 }
 
 /*
@@ -671,8 +722,8 @@ AlterObjectNamespace_internal(Relation rel, Oid objid, Oid nspOid)
  * Executes an ALTER OBJECT / OWNER TO statement.  Based on the object
  * type, the function appropriate to that type is executed.
  */
-Oid
-ExecAlterOwnerStmt(AlterOwnerStmt *stmt)
+static Oid
+ExecAlterOwnerStmt_internal(AlterOwnerStmt *stmt)
 {
 	Oid			newowner = get_role_oid(stmt->newowner, false);
 
@@ -752,6 +803,30 @@ ExecAlterOwnerStmt(AlterOwnerStmt *stmt)
 
 			return InvalidOid;	/* keep compiler happy */
 	}
+}
+
+Oid
+ExecAlterOwnerStmt(AlterOwnerStmt *stmt)
+{
+	Oid			result;
+
+	result = ExecAlterOwnerStmt_internal(stmt);
+
+	/*
+	 * Dispatch to the segments. Except for event triggers, they're only stored
+	 * in the QD node.
+	 */
+	if (Gp_role == GP_ROLE_DISPATCH && stmt->objectType != OBJECT_EVENT_TRIGGER)
+	{
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									NIL,
+									NULL);
+	}
+
+	return result;
 }
 
 /*

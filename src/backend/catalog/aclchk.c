@@ -24,8 +24,10 @@
 #include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
+#include "catalog/heap.h"
 #include "catalog/indexing.h"
 #include "catalog/objectaccess.h"
+#include "catalog/oid_dispatch.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_conversion.h"
@@ -49,6 +51,7 @@
 #include "catalog/pg_ts_dict.h"
 #include "commands/dbcommands.h"
 #include "commands/proclang.h"
+#include "commands/tablecmds.h"
 #include "commands/tablespace.h"
 #include "foreign/foreign.h"
 #include "miscadmin.h"
@@ -57,12 +60,23 @@
 #include "parser/parse_type.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/catcache.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 #include "utils/tqual.h"
 
+#include "catalog/pg_inherits_fn.h"
+#include "cdb/cdbdisp_query.h"
+#include "cdb/cdbpartition.h"
+#include "cdb/cdbvars.h"
+
+/*
+ * Flag used during REVOKE processing, to keep track of whether it did
+ * anything.
+ */
+bool		revoked_something = false;
 
 /*
  * The information about one Grant/Revoke statement, in internal format: object
@@ -319,6 +333,14 @@ restrict_and_check_grant(bool is_grant, AclMode avail_goptions, bool all_privs,
 	 * too noisy, as well as inconsistent with the GRANT case.)
 	 */
 	this_privileges = privileges & ACL_OPTION_TO_PRIVS(avail_goptions);
+	
+	 /*
+	 * GPDB: don't do this if we're an execute node. Let the QD handle the
+	 * WARNING.
+	 */
+	if (Gp_role == GP_ROLE_EXECUTE)
+		return this_privileges;
+
 	if (is_grant)
 	{
 		if (this_privileges == 0)
@@ -419,6 +441,7 @@ ExecuteGrantStmt(GrantStmt *stmt)
 	istmt.grantees = NIL;		/* filled below */
 	istmt.grant_option = stmt->grant_option;
 	istmt.behavior = stmt->behavior;
+
 
 	/*
 	 * Convert the PrivGrantee list into an Oid list.  Note that at this point
@@ -553,7 +576,73 @@ ExecuteGrantStmt(GrantStmt *stmt)
 		}
 	}
 
+	/* reset flag before processing the command; see below */
+	revoked_something = false;
+
 	ExecGrantStmt_oids(&istmt);
+
+	/*
+	 * If a REVOKE doesn't find any permissions to REVOKE, it's a no-op.
+	 * Users find that confusing, e.g. when an object has a permission
+	 * that's granted by a different user with GRANT OPTION, and you try
+	 * to REVOKE the permission as a different user. It will do nothing,
+	 * because there is no permission granted by the current user.
+	 *
+	 * See discussion on this in the upstream:
+	 *
+	 * https://www.postgresql.org/message-id/flat/CA%2BTgmoZ%2B79wnTCt56YBnbPw-%3D0FPF-CzgL%3DNjnQip0MtORp2NQ%40mail.gmail.com
+	 *
+	 * The case mentioned there is if you try to deny a user from
+	 * connecting with "REVOKE CONNECT ON DATABASE foo FROM someuser;".
+	 * If there's a GRANT on PUBLIC to connect, rather than on the specific
+	 * user, then it will do nothing.
+	 *
+	 * To make that a little bit less confusing, emit a NOTICE, when
+	 * REVOKE find no permissions to remove.
+	 */
+	if (!revoked_something && !stmt->is_grant && Gp_role == GP_ROLE_DISPATCH)
+	{
+		ereport(NOTICE,
+				(errcode(ERRCODE_WARNING_PRIVILEGE_NOT_REVOKED),
+				 errmsg("no privileges could be revoked")));
+	}
+
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		GrantStmt *tmpStmt = copyObject(stmt);
+
+		/*
+		 * GPDB: It is possible that objectNamesToOids has expanded references to
+		 * partitioned relations. It is needed to recostruct the GrantStmt objects
+		 * to include those references. We do it uncoditionally of partitioned
+		 * references now for Object Targets.
+		 */
+		if (tmpStmt->targtype == ACL_TARGET_OBJECT &&
+			tmpStmt->objtype == ACL_OBJECT_RELATION)
+		{
+			List *n = NIL;
+
+			foreach(cell, istmt.objects)
+			{
+				Oid rid = lfirst_oid(cell);
+				RangeVar *rv;
+				char *nspname = get_namespace_name(get_rel_namespace(rid));
+				char *relname = get_rel_name(rid);
+
+				rv = makeRangeVar(nspname, relname, -1);
+				n = lappend(n, rv);
+			}
+
+			tmpStmt->objects = n;
+		}
+
+		CdbDispatchUtilityStatement((Node *) tmpStmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									NIL,
+									NULL);
+	}
 }
 
 /*
@@ -678,6 +767,12 @@ objectNamesToOids(GrantObjectType objtype, List *objnames)
 			}
 			break;
 		case ACL_OBJECT_LARGEOBJECT:
+			ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("large objects are not supported")));
+
+			if (Gp_role == GP_ROLE_EXECUTE)
+				break;
 			foreach(cell, objnames)
 			{
 				Oid			lobjOid = oidparse(lfirst(cell));
@@ -732,6 +827,41 @@ objectNamesToOids(GrantObjectType objtype, List *objnames)
 		default:
 			elog(ERROR, "unrecognized GrantStmt.objtype: %d",
 				 (int) objtype);
+	}
+
+	/*
+	 * GPDB: If we are the DISPATCH node and the object is a partitioned
+	 * relation, then we need to populate the partition references because the
+	 * information is not present in the cataloge tables on the segment nodes.
+	 */
+	if (Gp_role == GP_ROLE_DISPATCH && objtype == ACL_OBJECT_RELATION)
+	{
+		List *expanded = NIL;
+
+		foreach(cell, objects)
+		{
+			Oid relOid = lfirst_oid(cell);
+			List *partOids;
+
+			if (rel_is_partitioned(relOid))
+			{
+				PartitionNode *pn = RelationBuildPartitionDescByOid(relOid, false);
+				partOids = all_partition_relids(pn);
+
+				expanded = list_concat(expanded, partOids);
+				expanded = lappend_oid(expanded, relOid);
+			}
+			else if (rel_is_child_partition(relOid))
+			{
+				partOids = find_all_inheritors(relOid, NoLock, NULL);
+
+				/* partOids contains relOid so concat is enough */
+				expanded = list_concat(expanded, partOids);
+			}
+		}
+
+		if (expanded != NIL)
+			objects = expanded;
 	}
 
 	return objects;
@@ -1018,6 +1148,16 @@ ExecAlterDefaultPrivilegesStmt(AlterDefaultPrivilegesStmt *stmt)
 
 			SetDefaultACLsInSchemas(&iacls, nspnames);
 		}
+	}
+
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									GetAssignedOidsForDispatch(),
+									NULL);
 	}
 }
 
@@ -2019,6 +2159,27 @@ ExecGrant_Relation(InternalGrant *istmt)
 			}
 		}
 
+		/* MPP-7572: Don't track metadata if table in any
+		 * temporary namespace
+		 */
+		if (Gp_role == GP_ROLE_DISPATCH)
+		{
+			bool		bTemp = isAnyTempNamespace(pg_class_tuple->relnamespace);
+
+			/* MPP-6929: metadata tracking */
+			if (!bTemp
+				&& ((pg_class_tuple->relkind == RELKIND_INDEX) ||
+					(pg_class_tuple->relkind == RELKIND_RELATION) ||
+					(pg_class_tuple->relkind == RELKIND_SEQUENCE) ||
+					(pg_class_tuple->relkind == RELKIND_VIEW)))
+				MetaTrackUpdObject(RelationRelationId,
+								   relOid,
+								   GetUserId(), /* not grantorId, */
+								   "PRIVILEGE",
+								   (istmt->is_grant) ? "GRANT" : "REVOKE"
+					);
+		}
+
 		pfree(old_rel_acl);
 		pfree(col_privileges);
 
@@ -2030,6 +2191,169 @@ ExecGrant_Relation(InternalGrant *istmt)
 
 	heap_close(attRelation, RowExclusiveLock);
 	heap_close(relation, RowExclusiveLock);
+}
+
+/*
+ * Copy ACL info from one relation to another.
+ *
+ * This is currently used by ADD PARTITION, to copy the ACLs of the parent
+ * to the new partition.
+ */
+void
+CopyRelationAcls(Oid srcId, Oid destId)
+{
+	Relation	pg_class_rel;
+	Relation	pg_attribute_rel;
+	Datum		aclDatum;
+	bool		isNull;
+	Acl		   *acl;
+	Form_pg_class pg_class_tuple;
+	HeapTuple	srcTuple;
+	HeapTuple	destTuple;
+	HeapTuple	newTuple;
+	Datum		values[Natts_pg_class];
+	bool		nulls[Natts_pg_class];
+	bool		replaces[Natts_pg_class];
+	int			nnewmembers;
+	Oid		   *newmembers;
+	Oid			ownerId;
+	CatCList   *attlist;
+	int			i;
+
+	pg_class_rel = heap_open(RelationRelationId, RowExclusiveLock);
+	pg_attribute_rel = heap_open(AttributeRelationId, RowExclusiveLock);
+
+	/* Look up the ACL on the source relation. */
+	srcTuple = SearchSysCache1(RELOID, ObjectIdGetDatum(srcId));
+	if (!HeapTupleIsValid(srcTuple))
+		elog(ERROR, "cache lookup failed for relation %u", srcId);
+	aclDatum = SysCacheGetAttr(RELOID, srcTuple, Anum_pg_class_relacl,
+							   &isNull);
+	if (isNull)
+		acl = NULL;
+	else
+		acl = DatumGetAclPCopy(aclDatum);
+
+	/* Open the pg_class row of the dest relation */
+	destTuple = SearchSysCache1(RELOID, ObjectIdGetDatum(destId));
+	if (!HeapTupleIsValid(destTuple))
+		elog(ERROR, "cache lookup failed for relation %u", destId);
+	pg_class_tuple = (Form_pg_class) GETSTRUCT(destTuple);
+
+	if (pg_class_tuple->relkind != RELKIND_RELATION)
+		elog(ERROR, "unexpected relkind %c",  pg_class_tuple->relkind);
+
+	/*
+	 * Check that the target ACL is NULL. Overwriting a non-NULL would require
+	 * removing the old dependencies first, and we're not preprared to do
+	 * that. In the current use of this function, there should be no previous
+	 * privileges.
+	 */
+	(void) SysCacheGetAttr(RELOID, destTuple, Anum_pg_class_relacl,
+						   &isNull);
+	if (!isNull)
+		elog(ERROR, "cannot copy ACL from parent, because there is an existing ACL");
+
+	/* Replace the ACL value */
+	MemSet(values, 0, sizeof(values));
+	MemSet(nulls, false, sizeof(nulls));
+	MemSet(replaces, false, sizeof(replaces));
+
+	replaces[Anum_pg_class_relacl - 1] = true;
+	if (acl)
+	{
+		values[Anum_pg_class_relacl - 1] = PointerGetDatum(acl);
+		nulls[Anum_pg_class_relacl - 1] = false;
+	}
+	else
+	{
+		values[Anum_pg_class_relacl - 1] = (Datum) 0;
+		nulls[Anum_pg_class_relacl - 1] = true;
+	}
+	newTuple = heap_modify_tuple(destTuple, RelationGetDescr(pg_class_rel),
+								 values, nulls, replaces);
+
+	simple_heap_update(pg_class_rel, &newTuple->t_self, newTuple);
+
+	/* keep the catalog indexes up to date */
+	CatalogUpdateIndexes(pg_class_rel, newTuple);
+
+	/* Update the shared dependency ACL info */
+	ownerId = pg_class_tuple->relowner;
+	nnewmembers = aclmembers(acl, &newmembers);
+
+	updateAclDependencies(RelationRelationId, destId, 0,
+						  ownerId,
+						  0, NULL,
+						  nnewmembers, newmembers);
+
+	/*
+	 * Now copy column-level privileges.
+	 */
+	attlist = SearchSysCacheList1(ATTNUM, srcId);
+	for (i = 0; i < attlist->n_members; i++)
+	{
+		HeapTuple	attSrcTuple = &attlist->members[i]->tuple;
+		Form_pg_attribute attSrcForm = (Form_pg_attribute) GETSTRUCT(attSrcTuple);
+		AttrNumber	attnum = attSrcForm->attnum;
+		HeapTuple	attDestTuple;
+		Datum		values[Natts_pg_attribute];
+		bool		nulls[Natts_pg_attribute];
+		bool		replaces[Natts_pg_attribute];
+
+		aclDatum = SysCacheGetAttr(ATTNUM, attSrcTuple, Anum_pg_attribute_attacl,
+								   &isNull);
+		if (isNull)
+			continue;
+		acl = DatumGetAclPCopy(aclDatum);
+
+		attDestTuple = SearchSysCache2(ATTNUM, destId, attnum);
+
+		(void) SysCacheGetAttr(ATTNUM, attDestTuple, Anum_pg_attribute_attacl,
+								   &isNull);
+		if (!isNull)
+			elog(ERROR, "cannot copy ACL from parent, because there is an existing ACL");
+
+		MemSet(values, 0, sizeof(values));
+		MemSet(nulls, false, sizeof(nulls));
+		MemSet(replaces, false, sizeof(replaces));
+
+		replaces[Anum_pg_attribute_attacl - 1] = true;
+		if (acl)
+		{
+			values[Anum_pg_attribute_attacl - 1] = PointerGetDatum(acl);
+			nulls[Anum_pg_attribute_attacl - 1] = false;
+		}
+		else
+		{
+			values[Anum_pg_attribute_attacl - 1] = (Datum) 0;
+			nulls[Anum_pg_attribute_attacl - 1] = true;
+		}
+		newTuple = heap_modify_tuple(attDestTuple, RelationGetDescr(pg_attribute_rel),
+									 values, nulls, replaces);
+
+		simple_heap_update(pg_attribute_rel, &newTuple->t_self, newTuple);
+
+		/* keep the catalog indexes up to date */
+		CatalogUpdateIndexes(pg_attribute_rel, newTuple);
+
+		/* Update the shared dependency ACL info */
+		ownerId = pg_class_tuple->relowner;
+		nnewmembers = aclmembers(acl, &newmembers);
+
+		updateAclDependencies(RelationRelationId, destId, attnum,
+							  ownerId,
+							  0, NULL,
+							  nnewmembers, newmembers);
+
+		ReleaseSysCache(attDestTuple);
+	}
+	ReleaseSysCacheList(attlist);
+
+	ReleaseSysCache(srcTuple);
+	ReleaseSysCache(destTuple);
+	heap_close(pg_class_rel, RowExclusiveLock);
+	heap_close(pg_attribute_rel, RowExclusiveLock);
 }
 
 static void
@@ -2137,6 +2461,15 @@ ExecGrant_Database(InternalGrant *istmt)
 
 		/* keep the catalog indexes up to date */
 		CatalogUpdateIndexes(relation, newtuple);
+
+		/* MPP-6929: metadata tracking */
+		if (Gp_role == GP_ROLE_DISPATCH)
+			MetaTrackUpdObject(DatabaseRelationId,
+							   datId,
+							   GetUserId(), /* not grantorId, */
+							   "PRIVILEGE", 
+							   (istmt->is_grant) ? "GRANT" : "REVOKE"
+					);
 
 		/* Update the shared dependency ACL info */
 		updateAclDependencies(DatabaseRelationId, HeapTupleGetOid(tuple), 0,
@@ -2906,6 +3239,15 @@ ExecGrant_Namespace(InternalGrant *istmt)
 		/* keep the catalog indexes up to date */
 		CatalogUpdateIndexes(relation, newtuple);
 
+		/* MPP-6929: metadata tracking */
+		if (Gp_role == GP_ROLE_DISPATCH)
+			MetaTrackUpdObject(NamespaceRelationId,
+							   nspid,
+							   GetUserId(), /* not grantorId, */
+							   "PRIVILEGE", 
+							   (istmt->is_grant) ? "GRANT" : "REVOKE"
+					);
+
 		/* Update the shared dependency ACL info */
 		updateAclDependencies(NamespaceRelationId, HeapTupleGetOid(tuple), 0,
 							  ownerId,
@@ -3029,6 +3371,15 @@ ExecGrant_Tablespace(InternalGrant *istmt)
 
 		/* keep the catalog indexes up to date */
 		CatalogUpdateIndexes(relation, newtuple);
+
+		/* MPP-6929: metadata tracking */
+		if (Gp_role == GP_ROLE_DISPATCH)
+			MetaTrackUpdObject(TableSpaceRelationId,
+							   tblId,
+							   GetUserId(), /* not grantorId, */
+							   "PRIVILEGE", 
+							   (istmt->is_grant) ? "GRANT" : "REVOKE"
+					);
 
 		/* Update the shared dependency ACL info */
 		updateAclDependencies(TableSpaceRelationId, tblId, 0,
@@ -3183,7 +3534,6 @@ ExecGrant_Type(InternalGrant *istmt)
 	heap_close(relation, RowExclusiveLock);
 }
 
-
 static AclMode
 string_to_privilege(const char *privname)
 {
@@ -3306,7 +3656,7 @@ static const char *const no_priv_msg[MAX_ACL_KIND] =
 	/* ACL_KIND_EVENT_TRIGGER */
 	gettext_noop("permission denied for event trigger %s"),
 	/* ACL_KIND_EXTENSION */
-	gettext_noop("permission denied for extension %s"),
+	gettext_noop("permission denied for extension %s")
 };
 
 static const char *const not_owner_msg[MAX_ACL_KIND] =
@@ -3352,7 +3702,7 @@ static const char *const not_owner_msg[MAX_ACL_KIND] =
 	/* ACL_KIND_EVENT_TRIGGER */
 	gettext_noop("must be owner of event trigger %s"),
 	/* ACL_KIND_EXTENSION */
-	gettext_noop("must be owner of extension %s"),
+	gettext_noop("must be owner of extension %s")
 };
 
 
@@ -3620,7 +3970,7 @@ pg_class_aclmask(Oid table_oid, Oid roleid,
 
 	/*
 	 * Deny anyone permission to update a system catalog unless
-	 * pg_authid.rolcatupdate is set.   (This is to let superusers protect
+	 * pg_authid.rolcatupdate is set.  (This is to let superusers protect
 	 * themselves from themselves.)  Also allow it if allowSystemTableMods.
 	 *
 	 * As of 7.4 we have some updatable system views; those shouldn't be

@@ -100,6 +100,11 @@ static event_trigger_support_data event_trigger_support[] = {
 	{"TYPE", true},
 	{"USER MAPPING", true},
 	{"VIEW", true},
+
+	/* GPDB additions */
+	{"EXTERNAL TABLE", true},
+	{"PROTOCOL", true},
+
 	{NULL, false}
 };
 
@@ -948,6 +953,11 @@ EventTriggerSupportsObjectType(ObjectType obtype)
 		case OBJECT_TYPE:
 		case OBJECT_VIEW:
 			return true;
+
+		/* GPDB additions */
+		case OBJECT_RESQUEUE:
+		case OBJECT_RESGROUP:
+			return false;
 	}
 	return true;
 }

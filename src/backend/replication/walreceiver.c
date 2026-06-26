@@ -61,10 +61,12 @@
 #include "utils/ps_status.h"
 #include "utils/resowner.h"
 #include "utils/timestamp.h"
+#include "utils/faultinjector.h"
+#include "storage/fd.h"
 
 
 /* GUC variables */
-int			wal_receiver_status_interval;
+int			wal_receiver_status_interval = 10;
 int			wal_receiver_timeout;
 bool		hot_standby_feedback;
 
@@ -110,28 +112,7 @@ static struct
 static StringInfoData reply_message;
 static StringInfoData incoming_message;
 
-/*
- * About SIGTERM handling:
- *
- * We can't just exit(1) within SIGTERM signal handler, because the signal
- * might arrive in the middle of some critical operation, like while we're
- * holding a spinlock. We also can't just set a flag in signal handler and
- * check it in the main loop, because we perform some blocking operations
- * like libpqrcv_PQexec(), which can take a long time to finish.
- *
- * We use a combined approach: When WalRcvImmediateInterruptOK is true, it's
- * safe for the signal handler to elog(FATAL) immediately. Otherwise it just
- * sets got_SIGTERM flag, which is checked in the main loop when convenient.
- *
- * This is very much like what regular backends do with ImmediateInterruptOK,
- * ProcessInterrupts() etc.
- */
-static volatile bool WalRcvImmediateInterruptOK = false;
-
 /* Prototypes for private functions */
-static void ProcessWalRcvInterrupts(void);
-static void EnableWalRcvImmediateExit(void);
-static void DisableWalRcvImmediateExit(void);
 static void WalRcvFetchTimeLineHistoryFiles(TimeLineID first, TimeLineID last);
 static void WalRcvWaitForStartPosition(XLogRecPtr *startpoint, TimeLineID *startpointTLI);
 static void WalRcvDie(int code, Datum arg);
@@ -147,9 +128,23 @@ static void WalRcvSigHupHandler(SIGNAL_ARGS);
 static void WalRcvSigUsr1Handler(SIGNAL_ARGS);
 static void WalRcvShutdownHandler(SIGNAL_ARGS);
 static void WalRcvQuickDieHandler(SIGNAL_ARGS);
+static void WalRcvCrashHandler(SIGNAL_ARGS);
 
 
-static void
+/*
+ * Process any interrupts the walreceiver process may have received.
+ * This should be called any time the process's latch has become set.
+ *
+ * Currently, only SIGTERM is of interest.  We can't just exit(1) within the
+ * SIGTERM signal handler, because the signal might arrive in the middle of
+ * some critical operation, like while we're holding a spinlock.  Instead, the
+ * signal handler sets a flag variable as well as setting the process's latch.
+ * We must check the flag (by calling ProcessWalRcvInterrupts) anytime the
+ * latch has become set.  Operations that could block for a long time, such as
+ * reading from a remote server, must pay attention to the latch too; see
+ * libpqrcv_PQgetResult for example.
+ */
+void
 ProcessWalRcvInterrupts(void)
 {
 	/*
@@ -161,26 +156,12 @@ ProcessWalRcvInterrupts(void)
 
 	if (got_SIGTERM)
 	{
-		WalRcvImmediateInterruptOK = false;
 		ereport(FATAL,
 				(errcode(ERRCODE_ADMIN_SHUTDOWN),
 				 errmsg("terminating walreceiver process due to administrator command")));
 	}
 }
 
-static void
-EnableWalRcvImmediateExit(void)
-{
-	WalRcvImmediateInterruptOK = true;
-	ProcessWalRcvInterrupts();
-}
-
-static void
-DisableWalRcvImmediateExit(void)
-{
-	WalRcvImmediateInterruptOK = false;
-	ProcessWalRcvInterrupts();
-}
 
 /* Main entry point for walreceiver process */
 void
@@ -198,6 +179,7 @@ WalReceiverMain(void)
 	TimestampTz last_recv_timestamp;
 	TimestampTz now;
 	bool		ping_sent;
+	sigjmp_buf	local_sigjmp_buf;
 
 	/*
 	 * WalRcv should be set up already (if we are a backend, we inherit this
@@ -243,6 +225,10 @@ WalReceiverMain(void)
 	/* Advertise our PID so that the startup process can kill us */
 	walrcv->pid = MyProcPid;
 	walrcv->walRcvState = WALRCV_STREAMING;
+
+	elogif(debug_walrepl_rcv, LOG,
+			"WAL receiver state is set to '%s'",
+			WalRcvGetStateString(walrcv->walRcvState));
 
 	/* Fetch information required to start streaming */
 	strlcpy(conninfo, (char *) walrcv->conninfo, MAXCONNINFO);
@@ -290,11 +276,21 @@ WalReceiverMain(void)
 	pqsignal(SIGCONT, SIG_DFL);
 	pqsignal(SIGWINCH, SIG_DFL);
 
+#ifdef SIGILL
+	pqsignal(SIGILL, WalRcvCrashHandler);
+#endif
+#ifdef SIGSEGV
+	pqsignal(SIGSEGV, WalRcvCrashHandler);
+#endif
+#ifdef SIGBUS
+	pqsignal(SIGBUS, WalRcvCrashHandler);
+#endif
+
 	/* We allow SIGQUIT (quickdie) at all times */
 	sigdelset(&BlockSig, SIGQUIT);
 
 	/* Load the libpq-specific functions */
-	load_file("libpqwalreceiver", false);
+	libpqwalreceiver_PG_init();
 	if (walrcv_connect == NULL || walrcv_startstreaming == NULL ||
 		walrcv_endstreaming == NULL ||
 		walrcv_identify_system == NULL ||
@@ -309,13 +305,29 @@ WalReceiverMain(void)
 	 */
 	CurrentResourceOwner = ResourceOwnerCreate(NULL, "Wal Receiver");
 
+	/*
+	 * In case of ERROR, walreceiver just dies cleanly. Startup process
+	 * will invoke another one if necessary.
+	 */
+	if (sigsetjmp(local_sigjmp_buf, 1) != 0)
+	{
+		EmitErrorReport();
+
+		proc_exit(0);
+	}
+
+	/* We can now handle ereport(ERROR) */
+	PG_exception_stack = &local_sigjmp_buf;
+
 	/* Unblock signals (they were blocked when the postmaster forked us) */
 	PG_SETMASK(&UnBlockSig);
 
 	/* Establish the connection to the primary for XLOG streaming */
-	EnableWalRcvImmediateExit();
 	walrcv_connect(conninfo);
-	DisableWalRcvImmediateExit();
+
+	/* Initialize LogstreamResult, reply_message */
+	LogstreamResult.Write = LogstreamResult.Flush = GetXLogReplayRecPtr(NULL);
+	MemSet(&reply_message, 0, sizeof(reply_message));
 
 	first_stream = true;
 	for (;;)
@@ -324,9 +336,7 @@ WalReceiverMain(void)
 		 * Check that we're connected to a valid server using the
 		 * IDENTIFY_SYSTEM replication command,
 		 */
-		EnableWalRcvImmediateExit();
 		walrcv_identify_system(&primaryTLI);
-		DisableWalRcvImmediateExit();
 
 		/*
 		 * Confirm that the current timeline of the primary is the same or
@@ -520,9 +530,7 @@ WalReceiverMain(void)
 			 * The backend finished streaming. Exit streaming COPY-mode from
 			 * our side, too.
 			 */
-			EnableWalRcvImmediateExit();
 			walrcv_endstreaming(&primaryTLI);
-			DisableWalRcvImmediateExit();
 
 			/*
 			 * If the server had switched to a new timeline that we didn't
@@ -673,9 +681,7 @@ WalRcvFetchTimeLineHistoryFiles(TimeLineID first, TimeLineID last)
 					(errmsg("fetching timeline history file for timeline %u from primary server",
 							tli)));
 
-			EnableWalRcvImmediateExit();
 			walrcv_readtimelinehistoryfile(tli, &fname, &content, &len);
-			DisableWalRcvImmediateExit();
 
 			/*
 			 * Check that the filename on the master matches what we
@@ -726,8 +732,7 @@ WalRcvDie(int code, Datum arg)
 	SpinLockRelease(&walrcv->mutex);
 
 	/* Terminate the connection gracefully. */
-	if (walrcv_disconnect != NULL)
-		walrcv_disconnect();
+	walrcv_disconnect();
 
 	/* Wake up the startup process to notice promptly that we're gone */
 	WakeupRecovery();
@@ -752,7 +757,7 @@ WalRcvSigUsr1Handler(SIGNAL_ARGS)
 	errno = save_errno;
 }
 
-/* SIGTERM: set flag for main loop, or shutdown immediately if safe */
+/* SIGTERM: set flag for ProcessWalRcvInterrupts */
 static void
 WalRcvShutdownHandler(SIGNAL_ARGS)
 {
@@ -761,10 +766,6 @@ WalRcvShutdownHandler(SIGNAL_ARGS)
 	got_SIGTERM = true;
 
 	SetLatch(&WalRcv->latch);
-
-	/* Don't joggle the elbow of proc_exit */
-	if (!proc_exit_inprogress && WalRcvImmediateInterruptOK)
-		ProcessWalRcvInterrupts();
 
 	errno = save_errno;
 }
@@ -793,6 +794,13 @@ WalRcvQuickDieHandler(SIGNAL_ARGS)
 	 * no harm in being doubly sure.)
 	 */
 	_exit(2);
+}
+
+static void
+WalRcvCrashHandler(SIGNAL_ARGS)
+{
+	StandardHandlerForSigillSigsegvSigbus_OnMainThread("walreceiver",
+														PASS_SIGNAL_ARGS);
 }
 
 /*
@@ -964,6 +972,15 @@ XLogWalRcvWrite(char *buf, Size nbytes, XLogRecPtr recptr)
 		buf += byteswritten;
 
 		LogstreamResult.Write = recptr;
+
+		elogif(debug_walrepl_rcv, LOG,
+			   "walrcv write -- Wrote %d bytes in file %s, offset %d."
+			   "Latest write location is %X/%X.",
+			   byteswritten,
+			   XLogFileNameP(recvFileTLI, recvSegNo),
+			   startoff,
+			   (uint32) (LogstreamResult.Write >> 32),
+			   (uint32) LogstreamResult.Write);
 	}
 }
 
@@ -978,6 +995,12 @@ XLogWalRcvFlush(bool dying)
 {
 	if (LogstreamResult.Flush < LogstreamResult.Write)
 	{
+#ifdef FAULT_INJECTOR
+		/* Simulate the case that the standby / mirror is lagging behind. */
+		if (SIMPLE_FAULT_INJECTOR("walrecv_skip_flush") == FaultInjectorTypeSkip)
+			return;
+#endif
+
 		/* use volatile pointer to prevent code rearrangement */
 		volatile WalRcvData *walrcv = WalRcv;
 
@@ -1179,6 +1202,30 @@ XLogWalRcvSendHSFeedback(bool immed)
 		master_has_standby_xmin = true;
 	else
 		master_has_standby_xmin = false;
+}
+
+/*
+ * Return a string constant representing the state.
+ */
+const char *
+WalRcvGetStateString(WalRcvState state)
+{
+	switch (state)
+	{
+		case WALRCV_STOPPED:
+			return "stopped";
+		case WALRCV_STARTING:
+			return "starting";
+		case WALRCV_STREAMING:
+			return "streaming";
+		case WALRCV_WAITING:
+			return "waiting";
+		case WALRCV_RESTARTING:
+			return "restarting";
+		case WALRCV_STOPPING:
+			return "stopping";
+	}
+	return "UNKNOWN";
 }
 
 /*

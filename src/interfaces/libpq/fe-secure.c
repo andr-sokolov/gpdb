@@ -22,7 +22,14 @@
  *-------------------------------------------------------------------------
  */
 
-#include "postgres_fe.h"
+/*
+ * This file is compiled with both frontend and backend codes, symlinked by
+ * src/backend/Makefile, and use macro FRONTEND to switch.
+ *
+ * Include "c.h" to adopt Greenplum C types. Don't include "postgres_fe.h",
+ * which only defines FRONTEND besides including "c.h"
+ */
+#include "c.h"
 
 #include <signal.h>
 #include <fcntl.h>
@@ -463,6 +470,18 @@ rloop:
 					break;
 			}
 		}
+		else if (n == 0)
+		{
+			/*
+			 * According to man recv(2), this means the peer performed an
+			 * orderly shutdown.
+			 */
+			printfPQExpBuffer(&conn->errorMessage,
+							  libpq_gettext(
+						"server closed the connection unexpectedly\n"
+			"\tThis probably means the server terminated abnormally\n"
+					 "\tbefore or while processing the request.\n"));
+		}
 	}
 
 	/* ensure we return the intended errno to caller */
@@ -635,9 +654,9 @@ retry_masked:
 				case EPIPE:
 					/* Set flag for EPIPE */
 					REMEMBER_EPIPE(spinfo, true);
-					/* FALL THRU */
 
 #ifdef ECONNRESET
+					/* fallthrough */
 				case ECONNRESET:
 #endif
 					printfPQExpBuffer(&conn->errorMessage,

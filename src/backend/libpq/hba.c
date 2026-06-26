@@ -376,7 +376,7 @@ tokenize_file(const char *filename, FILE *file,
 	MemoryContext linecxt;
 	MemoryContext oldcxt;
 
-	linecxt = AllocSetContextCreate(TopMemoryContext,
+	linecxt = AllocSetContextCreate(CurrentMemoryContext,
 									"tokenize file cxt",
 									ALLOCSET_DEFAULT_MINSIZE,
 									ALLOCSET_DEFAULT_INITSIZE,
@@ -708,7 +708,7 @@ check_network_callback(struct sockaddr * addr, struct sockaddr * netmask,
 /*
  * Use pg_foreach_ifaddr to check a samehost or samenet match
  */
-static bool
+bool
 check_same_host_or_net(SockAddr *raddr, IPCompareMethod method)
 {
 	check_network_data cn;
@@ -1337,6 +1337,23 @@ parse_hba_line(List *line, int line_num, char *raw_line)
 								line_num, HbaFileName)));
 			return NULL;
 		}
+
+		if ((parsedline->ldaptls || parsedline->ldapport != 0) && strncmp(parsedline->ldapserver, "ldaps://", 8) == 0)
+		{
+			ereport(LOG,
+					(errcode(ERRCODE_CONFIG_FILE_ERROR),
+					 errmsg("cannot use 'ldaptls' or 'ldapport' with 'ldapserver' start with 'ldaps://'"),
+					 errcontext("line %d of configuration file \"%s\"",
+								line_num, HbaFileName)));
+			return NULL;
+
+		}
+	}
+
+	if (parsedline->auth_method == uaRADIUS)
+	{
+		MANDATORY_AUTH_ARG(parsedline->radiusserver, "radiusserver", "radius");
+		MANDATORY_AUTH_ARG(parsedline->radiussecret, "radiussecret", "radius");
 	}
 
 	if (parsedline->auth_method == uaRADIUS)
@@ -1757,7 +1774,8 @@ load_hba(void)
 	FreeFile(file);
 
 	/* Now parse all the lines */
-	hbacxt = AllocSetContextCreate(TopMemoryContext,
+	Assert(PostmasterContext);
+	hbacxt = AllocSetContextCreate(PostmasterContext,
 								   "hba parser context",
 								   ALLOCSET_DEFAULT_MINSIZE,
 								   ALLOCSET_DEFAULT_MINSIZE,
@@ -2131,7 +2149,8 @@ load_ident(void)
 	FreeFile(file);
 
 	/* Now parse all the lines */
-	ident_context = AllocSetContextCreate(TopMemoryContext,
+	Assert(PostmasterContext);
+	ident_context = AllocSetContextCreate(PostmasterContext,
 										  "ident parser context",
 										  ALLOCSET_DEFAULT_MINSIZE,
 										  ALLOCSET_DEFAULT_MINSIZE,
