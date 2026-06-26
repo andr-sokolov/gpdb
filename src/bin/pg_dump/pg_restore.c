@@ -65,7 +65,7 @@ main(int argc, char **argv)
 {
 	RestoreOptions *opts;
 	int			c;
-	int			exit_code;
+	int			exit_code = 0;
 	int			numWorkers = 1;
 	Archive    *AH;
 	char	   *inputFileSpec;
@@ -75,6 +75,8 @@ main(int argc, char **argv)
 	static int	outputNoTablespaces = 0;
 	static int	use_setsessauth = 0;
 	static int	no_security_labels = 0;
+
+	static int	binary_upgrade = 0;
 
 	struct option cmdopts[] = {
 		{"clean", 0, NULL, 'c'},
@@ -119,6 +121,9 @@ main(int argc, char **argv)
 		{"use-set-session-authorization", no_argument, &use_setsessauth, 1},
 		{"no-security-labels", no_argument, &no_security_labels, 1},
 
+		/* GPDB */
+		{"binary-upgrade", no_argument, &binary_upgrade, 1},
+
 		{NULL, 0, NULL, 0}
 	};
 
@@ -139,12 +144,12 @@ main(int argc, char **argv)
 		}
 		if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)
 		{
-			puts("pg_restore (PostgreSQL) " PG_VERSION);
+			puts("pg_restore (Greenplum Database) " PG_VERSION);
 			exit_nicely(0);
 		}
 	}
 
-	while ((c = getopt_long(argc, argv, "acCd:ef:F:h:iI:j:lL:n:Op:P:RsS:t:T:U:vwWx1",
+	while ((c = getopt_long(argc, argv, "acCd:ef:F:h:iI:j:lL:n:Op:P:RsS:t:T:uU:vwWx:1",
 							cmdopts, NULL)) != -1)
 	{
 		switch (c)
@@ -232,6 +237,11 @@ main(int argc, char **argv)
 				opts->selTypes = 1;
 				opts->selTable = 1;
 				simple_string_list_append(&opts->tableNames, optarg);
+				break;
+
+			case 'u':
+				opts->promptPassword = TRI_YES;
+				opts->username = simple_prompt("User name: ", 100, true);
 				break;
 
 			case 'U':
@@ -354,6 +364,8 @@ main(int argc, char **argv)
 	opts->use_setsessauth = use_setsessauth;
 	opts->no_security_labels = no_security_labels;
 
+	opts->binary_upgrade = binary_upgrade;
+
 	if (if_exists && !opts->dropSchema)
 	{
 		fprintf(stderr, _("%s: option --if-exists requires option -c/--clean\n"),
@@ -458,7 +470,9 @@ usage(const char *progname)
 			 "                               selecting/ordering output\n"));
 	printf(_("  -n, --schema=NAME            restore only objects in this schema\n"));
 	printf(_("  -O, --no-owner               skip restoration of object ownership\n"));
-	printf(_("  -P, --function=NAME(args)    restore named function\n"));
+	printf(_("  -P, --function='NAME(args)'\n"
+			 "                               restore named function. name must be exactly\n"
+			 "                               as appears in the TOC, and inside single quotes\n"));
 	printf(_("  -s, --schema-only            restore only the schema, no data\n"));
 	printf(_("  -S, --superuser=NAME         superuser user name to use for disabling triggers\n"));
 	printf(_("  -t, --table=NAME             restore named table\n"));
@@ -488,5 +502,5 @@ usage(const char *progname)
 			 "The options -I, -n, -P, -t, -T, and --section can be combined and specified\n"
 			 "multiple times to select multiple objects.\n"));
 	printf(_("\nIf no input file name is supplied, then standard input is used.\n\n"));
-	printf(_("Report bugs to <pgsql-bugs@postgresql.org>.\n"));
+	printf(_("Report bugs to <bugs@greenplum.org>.\n"));
 }

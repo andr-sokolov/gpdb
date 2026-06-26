@@ -18,6 +18,8 @@
  */
 #include "postgres.h"
 
+#include <limits.h>
+
 #include "executor/executor.h"
 #include "miscadmin.h"
 #include "utils/lsyscache.h"
@@ -281,7 +283,15 @@ BuildTupleHashTable(int numCols, AttrNumber *keyColIdx,
 	TupleHashTable hashtable;
 	HASHCTL		hash_ctl;
 
-	Assert(nbuckets > 0);
+	/*
+	 * Many callers pass "long" values for nbuckets, which means that we can
+	 * receive a bogus value on 64-bit machines.  It seems unwise to change
+	 * this function's signature in released branches, so instead assume that
+	 * a negative input means long->int overflow occurred.
+	 */
+	if (nbuckets <= 0)
+		nbuckets = INT_MAX;
+
 	Assert(entrysize >= sizeof(TupleHashEntryData));
 
 	/* Limit initial table size request to not more than work_mem */
@@ -396,7 +406,7 @@ LookupTupleHashEntry(TupleHashTable hashtable, TupleTableSlot *slot,
 
 			/* Copy the first tuple into the table context */
 			MemoryContextSwitchTo(hashtable->tablecxt);
-			entry->firstTuple = ExecCopySlotMinimalTuple(slot);
+			entry->firstTuple = ExecCopySlotMemTuple(slot);
 
 			*isnew = true;
 		}
@@ -477,7 +487,7 @@ FindTupleHashEntry(TupleHashTable hashtable, TupleTableSlot *slot,
 static uint32
 TupleHashTableHash(const void *key, Size keysize)
 {
-	MinimalTuple tuple = ((const TupleHashEntryData *) key)->firstTuple;
+	MemTuple tuple = ((const TupleHashEntryData *) key)->firstTuple;
 	TupleTableSlot *slot;
 	TupleHashTable hashtable = CurTupleHashTable;
 	int			numCols = hashtable->numCols;
@@ -539,10 +549,10 @@ TupleHashTableHash(const void *key, Size keysize)
 static int
 TupleHashTableMatch(const void *key1, const void *key2, Size keysize)
 {
-	MinimalTuple tuple1 = ((const TupleHashEntryData *) key1)->firstTuple;
+	MemTuple tuple1 = ((const TupleHashEntryData *) key1)->firstTuple;
 
 #ifdef USE_ASSERT_CHECKING
-	MinimalTuple tuple2 = ((const TupleHashEntryData *) key2)->firstTuple;
+	MemTuple tuple2 = ((const TupleHashEntryData *) key2)->firstTuple;
 #endif
 	TupleTableSlot *slot1;
 	TupleTableSlot *slot2;

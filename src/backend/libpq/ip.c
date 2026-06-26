@@ -180,7 +180,11 @@ getaddrinfo_unix(const char *path, const struct addrinfo * hintsp,
 
 	MemSet(&hints, 0, sizeof(hints));
 
+#if defined(_AIX) && (_SS_MAXSIZE == 1025 || _SS_MAX_SIZE == 1280)
+	if (strlen(path) >= 108)
+#else
 	if (strlen(path) >= sizeof(unp->sun_path))
+#endif
 		return EAI_FAIL;
 
 	if (hintsp == NULL)
@@ -225,7 +229,11 @@ getaddrinfo_unix(const char *path, const struct addrinfo * hintsp,
 	strcpy(unp->sun_path, path);
 
 #ifdef HAVE_STRUCT_SOCKADDR_STORAGE_SS_LEN
+#if defined(_AIX) && (_SS_MAXSIZE == 1025 || _SS_MAXSIZE == 1280)
+	unp->sun_len = 112;
+#else
 	unp->sun_len = sizeof(struct sockaddr_un);
+#endif
 #endif
 
 	return 0;
