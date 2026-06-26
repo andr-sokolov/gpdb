@@ -56,3 +56,4 @@ check: all
 
 installcheck:
 	$(prove_installcheck)
+

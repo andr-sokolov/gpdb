@@ -454,8 +454,8 @@ insert into rtest_view2 values (7);
 insert into rtest_view2 values (7);
 
 select * from rtest_vview1;
-select * from rtest_vview2;
-select * from rtest_vview3;
+select * from rtest_vview2 ORDER BY 1;
+select * from rtest_vview3 ORDER BY 1;
 select * from rtest_vview4 order by a, b;
 select * from rtest_vview5;
 
@@ -772,7 +772,7 @@ drop table cchild;
 -- temporarily disable fancy output, so view changes create less diff noise
 \a\t
 
-SELECT viewname, definition FROM pg_views WHERE schemaname <> 'information_schema' ORDER BY viewname;
+SELECT viewname, definition FROM pg_views WHERE schemaname <> 'information_schema' AND viewname <> 'pg_roles' AND viewname <> 'gp_pgdatabase' AND viewname <> 'pg_locks' AND viewname <> 'gp_max_external_files' AND viewname <> 'pg_resqueue_status' AND viewname <> 'pg_stat_resqueues' ORDER BY viewname;
 
 SELECT tablename, rulename, definition FROM pg_rules
 	ORDER BY tablename, rulename;
@@ -1037,3 +1037,21 @@ CREATE FUNCTION func_with_set_params() RETURNS integer
     SET search_path TO PG_CATALOG, "Mixed/Case", 'c:/''a"/path', '', '0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789'
     IMMUTABLE STRICT;
 SELECT pg_get_functiondef('func_with_set_params()'::regprocedure);
+
+-- tests for pg_get_*def with invalid objects
+SELECT pg_get_constraintdef(0);
+SELECT pg_get_functiondef(0);
+SELECT pg_get_indexdef(0);
+SELECT pg_get_ruledef(0);
+SELECT pg_get_triggerdef(0);
+SELECT pg_get_viewdef(0);
+SELECT pg_get_function_arguments(0);
+SELECT pg_get_function_identity_arguments(0);
+SELECT pg_get_function_result(0);
+SELECT pg_get_function_arg_default(0, 0);
+SELECT pg_get_function_arg_default('pg_class'::regclass, 0);
+
+-- test rule for select-for-update
+create table t_test_rules_select_for_update (c int) distributed randomly;
+create rule myrule as on insert to t_test_rules_select_for_update
+do instead select * from t_test_rules_select_for_update for update;

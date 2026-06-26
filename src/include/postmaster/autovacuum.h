@@ -14,6 +14,7 @@
 #ifndef AUTOVACUUM_H
 #define AUTOVACUUM_H
 
+#include "tcop/utility.h"
 
 /* GUC variables */
 extern bool autovacuum_start_daemon;
@@ -44,6 +45,8 @@ extern bool IsAutoVacuumWorkerProcess(void);
 
 /* Functions to start autovacuum process, called from postmaster */
 extern void autovac_init(void);
+extern int	autovac_start(void);  // OLD interface
+extern void autovac_stopped(void);  // OLD interface
 extern int	StartAutoVacLauncher(void);
 extern int	StartAutoVacWorker(void);
 

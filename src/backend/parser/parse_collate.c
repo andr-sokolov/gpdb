@@ -215,6 +215,9 @@ select_common_collation(ParseState *pstate, List *exprs, bool none_ok)
 	context.strength = COLLATE_NONE;
 	context.location = -1;
 
+	context.collation2 = InvalidOid;
+	context.location2 = -1;
+
 	/* and away we go */
 	(void) assign_collations_walker((Node *) exprs, &context);
 
@@ -483,6 +486,8 @@ assign_collations_walker(Node *node, assign_collations_context *context)
 		case T_JoinExpr:
 		case T_FromExpr:
 		case T_SortGroupClause:
+		case T_GroupingClause:
+		case T_WindowClause:
 			(void) expression_tree_walker(node,
 										  assign_collations_walker,
 										  (void *) &loccontext);
@@ -492,6 +497,8 @@ assign_collations_walker(Node *node, assign_collations_context *context)
 			 * anything with join nodes except recurse through them to process
 			 * WHERE/ON expressions.  So just stop here.  Likewise, we don't
 			 * need to do anything when invoked on sort/group lists.
+			 *
+			 * GPDB: same for WindowClauses.
 			 */
 			return false;
 		case T_Query:

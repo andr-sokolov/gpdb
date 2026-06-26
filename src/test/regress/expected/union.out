@@ -378,7 +378,7 @@ SELECT q1 FROM int8_tbl UNION ALL SELECT q2 FROM int8_tbl EXCEPT SELECT q1 FROM 
                456
 (2 rows)
 
-SELECT q1 FROM int8_tbl UNION ALL (((SELECT q2 FROM int8_tbl EXCEPT SELECT q1 FROM int8_tbl ORDER BY 1)));
+SELECT q1 FROM int8_tbl UNION ALL (((SELECT q2 FROM int8_tbl EXCEPT SELECT q1 FROM int8_tbl ORDER BY 1))); --order none
         q1         
 -------------------
                123
@@ -416,11 +416,11 @@ LINE 1: ... int8_tbl EXCEPT SELECT q2 FROM int8_tbl ORDER BY q2 LIMIT 1...
                                                              ^
 HINT:  There is a column named "q2" in table "*SELECT* 2", but it cannot be referenced from this part of the query.
 -- But this should work:
-SELECT q1 FROM int8_tbl EXCEPT (((SELECT q2 FROM int8_tbl ORDER BY q2 LIMIT 1)));
+SELECT q1 FROM int8_tbl EXCEPT (((SELECT q2 FROM int8_tbl ORDER BY q2 LIMIT 1))) ORDER BY 1;
         q1        
 ------------------
- 4567890123456789
               123
+ 4567890123456789
 (2 rows)
 
 --
@@ -476,14 +476,16 @@ explain (costs off)
   UNION ALL
   SELECT * FROM t2) t
  WHERE ab = 'ab';
-                 QUERY PLAN                  
----------------------------------------------
- Append
-   ->  Index Scan using t1_ab_idx on t1
-         Index Cond: ((a || b) = 'ab'::text)
-   ->  Index Only Scan using t2_pkey on t2
-         Index Cond: (ab = 'ab'::text)
-(5 rows)
+                    QUERY PLAN                     
+---------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Append
+         ->  Index Scan using t1_ab_idx on t1
+               Index Cond: ((a || b) = 'ab'::text)
+         ->  Index Only Scan using t2_pkey on t2
+               Index Cond: (ab = 'ab'::text)
+ Optimizer: Postgres query optimizer
+(7 rows)
 
 explain (costs off)
  SELECT * FROM
@@ -491,16 +493,22 @@ explain (costs off)
   UNION
   SELECT * FROM t2) t
  WHERE ab = 'ab';
-                    QUERY PLAN                     
----------------------------------------------------
- HashAggregate
-   Group Key: ((t1.a || t1.b))
-   ->  Append
-         ->  Index Scan using t1_ab_idx on t1
-               Index Cond: ((a || b) = 'ab'::text)
-         ->  Index Only Scan using t2_pkey on t2
-               Index Cond: (ab = 'ab'::text)
-(7 rows)
+                             QUERY PLAN                              
+---------------------------------------------------------------------
+ Gather Motion 3:1  (slice2; segments: 3)
+   ->  Unique
+         Group Key: ((t1.a || t1.b))
+         ->  Sort
+               Sort Key (Distinct): ((t1.a || t1.b))
+               ->  Redistribute Motion 3:3  (slice1; segments: 3)
+                     Hash Key: ((t1.a || t1.b))
+                     ->  Append
+                           ->  Index Scan using t1_ab_idx on t1
+                                 Index Cond: ((a || b) = 'ab'::text)
+                           ->  Index Only Scan using t2_pkey on t2
+                                 Index Cond: (ab = 'ab'::text)
+ Optimizer: Postgres query optimizer
+(13 rows)
 
 --
 -- Test that ORDER BY for UNION ALL can be pushed down to inheritance
@@ -514,6 +522,8 @@ INSERT INTO t2c VALUES ('vw'), ('cd'), ('mn'), ('ef');
 CREATE INDEX t1c_ab_idx on t1c ((a || b));
 set enable_seqscan = on;
 set enable_indexonlyscan = off;
+-- NOTE: GPDB planner chooses a seqscan rather than indexscan for t1.
+-- This is a side-effect of disabling pull-up for simple union all in GPDB.
 explain (costs off)
   SELECT * FROM
   (SELECT a || b AS ab FROM t1
@@ -523,13 +533,18 @@ explain (costs off)
                    QUERY PLAN                   
 ------------------------------------------------
  Limit
-   ->  Merge Append
-         Sort Key: ((t1.a || t1.b))
-         ->  Index Scan using t1_ab_idx on t1
-         ->  Index Scan using t1c_ab_idx on t1c
-         ->  Index Scan using t2_pkey on t2
-         ->  Index Scan using t2c_pkey on t2c
-(7 rows)
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         Merge Key: ((t1.a || t1.b))
+         ->  Limit
+               ->  Sort
+                     Sort Key: ((t1.a || t1.b))
+                     ->  Append
+                           ->  Seq Scan on t1
+                           ->  Seq Scan on t1c
+                           ->  Seq Scan on t2
+                           ->  Seq Scan on t2c
+ Optimizer: Postgres query optimizer
+(12 rows)
 
   SELECT * FROM
   (SELECT a || b AS ab FROM t1
@@ -561,16 +576,18 @@ select event_id
        union all
        select event_id from other_events) ss
  order by event_id;
-                        QUERY PLAN                        
-----------------------------------------------------------
- Merge Append
-   Sort Key: events.event_id
-   ->  Index Scan using events_pkey on events
+                 QUERY PLAN                 
+--------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: events.event_id
    ->  Sort
-         Sort Key: events_child.event_id
-         ->  Seq Scan on events_child
-   ->  Index Scan using other_events_pkey on other_events
-(7 rows)
+         Sort Key: events.event_id
+         ->  Append
+               ->  Seq Scan on events
+               ->  Seq Scan on events_child
+               ->  Seq Scan on other_events
+ Optimizer: Postgres query optimizer
+(9 rows)
 
 drop table events_child, events, other_events;
 reset enable_indexonlyscan;
@@ -581,11 +598,13 @@ explain (costs off)
    UNION ALL
    SELECT 2 AS t, * FROM tenk1 b) c
  WHERE t = 2;
-        QUERY PLAN         
----------------------------
- Append
-   ->  Seq Scan on tenk1 b
-(2 rows)
+                QUERY PLAN                
+------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Append
+         ->  Seq Scan on tenk1 b
+ Optimizer: Postgres query optimizer
+(4 rows)
 
 -- Test that we push quals into UNION sub-selects only when it's safe
 explain (costs off)
@@ -594,16 +613,18 @@ SELECT * FROM
    UNION
    SELECT 2 AS t, 4 AS x) ss
 WHERE x < 4;
-                 QUERY PLAN                 
---------------------------------------------
+                    QUERY PLAN                     
+---------------------------------------------------
  Unique
+   Group Key: "outer".t, "outer".x
    ->  Sort
-         Sort Key: (1), (2)
+         Sort Key (Distinct): "outer".t, "outer".x
          ->  Append
                ->  Result
                ->  Result
                      One-Time Filter: false
-(7 rows)
+ Optimizer: Postgres query optimizer
+(9 rows)
 
 SELECT * FROM
   (SELECT 1 AS t, 2 AS x
@@ -622,18 +643,19 @@ SELECT * FROM
    SELECT 2 AS t, 4 AS x) ss
 WHERE x < 4
 ORDER BY x;
-                       QUERY PLAN                       
---------------------------------------------------------
+                          QUERY PLAN                          
+--------------------------------------------------------------
  Sort
    Sort Key: ss.x
    ->  Subquery Scan on ss
          Filter: (ss.x < 4)
          ->  HashAggregate
-               Group Key: (1), (generate_series(1, 10))
+               Group Key: "outer".t, (generate_series(1, 10))
                ->  Append
                      ->  Result
                      ->  Result
-(9 rows)
+ Optimizer: Postgres query optimizer
+(10 rows)
 
 SELECT * FROM
   (SELECT 1 AS t, generate_series(1,10) AS x
@@ -654,17 +676,21 @@ SELECT * FROM
    UNION
    SELECT 2 AS t, 4 AS x) ss
 WHERE x > 3;
-                                 QUERY PLAN                                 
-----------------------------------------------------------------------------
+                                      QUERY PLAN                                       
+---------------------------------------------------------------------------------------
  Subquery Scan on ss
    Filter: (ss.x > 3)
    ->  Unique
+         Group Key: "outer".t, ((($0 * 3::double precision))::integer)
          ->  Sort
-               Sort Key: (1), (((random() * 3::double precision))::integer)
+               Sort Key (Distinct): "outer".t, ((($0 * 3::double precision))::integer)
                ->  Append
                      ->  Result
+                           InitPlan 1 (returns $0)
+                             ->  Result
                      ->  Result
-(8 rows)
+ Optimizer: Postgres query optimizer
+(12 rows)
 
 SELECT * FROM
   (SELECT 1 AS t, (random()*3)::int AS x
@@ -688,16 +714,19 @@ explain (costs off)
 select * from
   (select * from t3 a union all select * from t3 b) ss
   join int4_tbl on f1 = expensivefunc(x);
-                         QUERY PLAN                         
-------------------------------------------------------------
- Nested Loop
-   ->  Seq Scan on int4_tbl
-   ->  Append
-         ->  Index Scan using t3i on t3 a
-               Index Cond: (expensivefunc(x) = int4_tbl.f1)
-         ->  Index Scan using t3i on t3 b
-               Index Cond: (expensivefunc(x) = int4_tbl.f1)
-(7 rows)
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Gather Motion 3:1  (slice2; segments: 3)
+   ->  Hash Join
+         Hash Cond: (int4_tbl.f1 = expensivefunc(a.x))
+         ->  Broadcast Motion 3:3  (slice1; segments: 3)
+               ->  Seq Scan on int4_tbl
+         ->  Hash
+               ->  Append
+                     ->  Seq Scan on t3 a
+                     ->  Seq Scan on t3 b
+ Optimizer: Postgres query optimizer
+(10 rows)
 
 select * from
   (select * from t3 a union all select * from t3 b) ss

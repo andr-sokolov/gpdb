@@ -318,8 +318,10 @@ begin
 end $$ language plpgsql immutable;
 alter table check_con_tbl add check (check_con_function(check_con_tbl.*));
 \d+ check_con_tbl
+-- GPDB: Change from 1 (value in PG) to 2 for copy to make test deterministic.
+-- 2 and null are on seg1 in a 3-seg test environment.
 copy check_con_tbl from stdin;
-1
+2
 \N
 \.
 copy check_con_tbl from stdin;
@@ -333,3 +335,22 @@ DROP FUNCTION truncate_in_subxact();
 DROP TABLE x, y;
 DROP FUNCTION fn_x_before();
 DROP FUNCTION fn_x_after();
+
+CREATE TABLE check_copy_with_oids (a int) WITH OIDS;
+COPY check_copy_with_oids FROM stdin WITH (oids);
+12345	1
+12346	2
+12347	3
+\.
+SELECT oid, * from check_copy_with_oids;
+DROP TABLE check_copy_with_oids;
+
+
+-- When error reject limit is set, copy should be able to continue after hit a corrupted end-of-copy marker 
+CREATE TABLE copy_eoc_marker(a int, b int);
+COPY copy_eoc_marker FROM stdin LOG ERRORS SEGMENT REJECT LIMIT 5;
+123\.	10
+123	20
+\.
+SELECT * FROM copy_eoc_marker;
+DROP TABLE copy_eoc_marker;

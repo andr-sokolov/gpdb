@@ -215,11 +215,32 @@ PostgreSQL documentation
       <listitem>
 
        <para>
-        Write a minimal <filename>recovery.conf</filename> in the output directory (or into
-        the base archive file when using tar format) to ease setting
-        up a standby server.
+        Write a minimal <filename>recovery.conf</filename> in the output
+        directory (or into the base archive file when using tar format) to
+        ease setting up a standby server.
+        The <filename>recovery.conf</filename> file will record the connection
+        settings and, if specified, the replication slot
+        that <application>pg_basebackup</application> is using, so that the
+        streaming replication will use the same settings later on.
        </para>
 
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><option>-S <replaceable>slotname</replaceable></option></term>
+      <term><option>--slot=<replaceable class="parameter">slotname</replaceable></option></term>
+      <listitem>
+       <para>
+        This option can only be used together with <literal>-X
+        stream</literal>.  It causes the WAL streaming to use the specified
+        replication slot.  If the base backup is intended to be used as a
+        streaming replication standby using replication slots, it should then
+        use the same replication slot name
+        in <filename>recovery.conf</filename>.  That way, it is ensured that
+        the server does not remove any necessary WAL data in the time between
+        the end of the base backup and the start of streaming replication.
+       </para>
       </listitem>
      </varlistentry>
 
@@ -579,10 +600,12 @@ PostgreSQL documentation
   <para>
    The backup will include all files in the data directory and tablespaces,
    including the configuration files and any additional files placed in the
-   directory by third parties. But only regular files and directories are
-   copied.  Symbolic links (other than those used for tablespaces) and special
-   device files are skipped.  (See <xref linkend="protocol-replication"> for
-   the precise details.)
+   directory by third parties, except certain temporary files managed by
+   PostgreSQL.  But only regular files and directories are copied, except that
+   symbolic links used for tablespaces are preserved.  Symbolic links pointing
+   to certain directories known to PostgreSQL are copied as empty directories.
+   Other symbolic links and special device files are skipped.
+   See <xref linkend="protocol-replication"> for the precise details.
   </para>
 
   <para>

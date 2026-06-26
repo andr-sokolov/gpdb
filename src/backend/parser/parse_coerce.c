@@ -22,6 +22,9 @@
 #include "catalog/pg_type.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/print.h"
+#include "nodes/nodeFuncs.h"
+#include "parser/parsetree.h"               /* get_tle_by_resno */
 #include "parser/parse_coerce.h"
 #include "parser/parse_relation.h"
 #include "parser/parse_type.h"
@@ -47,9 +50,12 @@ static Node *coerce_record_to_complex(ParseState *pstate, Node *node,
 						 CoercionContext ccontext,
 						 CoercionForm cformat,
 						 int location);
+static Var *coerce_unknown_var(ParseState *pstate, Var *var,
+							   Oid targetTypeId, int32 targetTypeMod,
+							   CoercionContext ccontext, CoercionForm cformat,
+							   int levelsup);
 static bool is_complex_array(Oid typid);
 static bool typeIsOfTypedTable(Oid reltypeId, Oid reloftypeId);
-
 
 /*
  * coerce_to_target_type()
@@ -111,7 +117,8 @@ coerce_to_target_type(ParseState *pstate, Node *expr, Oid exprtype,
 								targettype, targettypmod,
 								cformat, location,
 								(cformat != COERCE_IMPLICIT_CAST),
-								(result != expr && !IsA(result, Const)));
+								(result != expr && !IsA(result, Const)
+								 && !IsA(result, Var)));
 
 	if (expr != origexpr)
 	{
@@ -203,6 +210,33 @@ coerce_type(ParseState *pstate, Node *node,
 		 * since the other functions in this file will not match such a
 		 * parameter to ANYENUM.  But that should get changed eventually.
 		 */
+
+		/*
+		 * GPDB: Special handling for ANYARRAY type. This enables INSERTs into
+		 * catalog tables having anyarray columns.
+		 *
+		 * Restrict the type coercion to INSERT statements as this hack was only
+		 * meant to fix INSERTs for dumping/restoring pg_statistic tuples by
+		 * external utilities such as gpsd, minirepro, gpbackup/gprestore.
+		 */
+		if(targetTypeId == ANYARRAYOID && IsA(node, Const) && inputTypeId != UNKNOWNOID
+		   && (pstate != NULL && pstate->p_expr_kind == EXPR_KIND_INSERT_TARGET))
+		{
+			Const	   *con = (Const *) node;
+			Const	   *newcon = makeNode(Const);
+			Oid elemoid = get_element_type(inputTypeId);
+
+			if(elemoid == InvalidOid)
+				ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH), 
+					 errmsg("Cannot convert non-Array type to ANYARRAY")));
+
+			memcpy(newcon, con, sizeof(Const));
+			newcon->consttype = ANYARRAYOID;
+
+			return (Node *) newcon;
+		}
+
 		if (inputTypeId != UNKNOWNOID)
 		{
 			Oid			baseTypeId = getBaseType(inputTypeId);
@@ -358,6 +392,83 @@ coerce_type(ParseState *pstate, Node *node,
 		newcoll->location = coll->location;
 		return (Node *) newcoll;
 	}
+
+	/*
+	 * CDB:  Var of type UNKNOWN probably comes from an untyped Const
+	 * or Param in the targetlist of a range subquery.  For a successful
+	 * conversion we must coerce the underlying Const or Param to a
+	 * proper type and remake the Var.
+	 * In postgres, it is handled only for insert statements (in transformInsertStmt)
+	 * but not for select queries causing some of the queries to fail.
+	 */
+	if (pstate != NULL && inputTypeId == UNKNOWNOID && IsA(node, Var))
+	{
+		int32	baseTypeMod = -1;
+		Oid		baseTypeId = getBaseTypeAndTypmod(targetTypeId, &baseTypeMod);
+        Var    *fixvar = coerce_unknown_var(pstate, (Var *)node,
+                                            baseTypeId, baseTypeMod,
+                                            ccontext, cformat,
+                                            0);
+        node = (Node *)fixvar;
+        inputTypeId = fixvar->vartype;
+        if (targetTypeId == inputTypeId)
+            return node;
+		else
+		{
+			/* 
+			 * That didn't work, so, try and cast the unknown value to
+			 * what ever the user wants. If it can't be done, they'll
+			 * get an IO error later.
+			 */
+
+			Oid outfunc = InvalidOid;
+			bool outtypisvarlena = false;
+			Oid infunc = InvalidOid;
+			Oid intypioparam = InvalidOid;
+			FuncExpr *fe;
+			List *args = NIL;
+
+			getTypeOutputInfo(UNKNOWNOID, &outfunc, &outtypisvarlena);
+			getTypeInputInfo(targetTypeId, &infunc, &intypioparam);
+
+			Insist(OidIsValid(outfunc));
+			Insist(OidIsValid(infunc));
+
+			/*
+			 * do unknownout(Var)
+			 *
+			 * always supplying COERCE_IMPLICIT_CAST here, set it as an
+			 * implicit cast to hide this Greenplum hack, because the explicit
+			 * cast would be dumped but not able to be loaded, for like a cast
+			 * unknown::cstring::date
+			 */
+			fe = makeFuncExpr(outfunc, CSTRINGOID, list_make1(node),
+							  InvalidOid, InvalidOid, COERCE_IMPLICIT_CAST);
+			fe->location = location;
+
+			if (location >= 0 &&
+				(fixvar->location < 0 || location < fixvar->location))
+			fixvar->location = location;
+
+			/* 
+			 * Now pass the above as an argument to the input function of the
+			 * type we're casting to
+			 */
+			args = list_make3(fe,
+							  makeConst(OIDOID, -1, InvalidOid, sizeof(Oid),
+										ObjectIdGetDatum(intypioparam),
+										false, true),
+							  makeConst(INT4OID, -1, InvalidOid, sizeof(int32),
+										Int32GetDatum(-1),
+										false, true));
+			fe = makeFuncExpr(infunc, targetTypeId, args,
+							  InvalidOid, InvalidOid, cformat);
+			fe->location = location;
+
+			return (Node *)fe;
+		}
+	}
+
 	pathtype = find_coercion_pathway(targetTypeId, inputTypeId, ccontext,
 									 &funcId);
 	if (pathtype != COERCION_PATH_NONE)
@@ -479,6 +590,288 @@ coerce_type(ParseState *pstate, Node *node,
 
 
 /*
+ * coerce_unknown_var
+ *
+ * A Var of type UNKNOWN probably refers, directly or indirectly, to a
+ * Const or Param node of type UNKNOWN in the targetlist of a subquery.
+ * Coercing the Var to a proper type (such as TEXT) implies that the
+ * same must be done to the underlying Const or Param.
+ *
+ * Returns a new Var node; or if the type is still UNKNOWN, returns the
+ * given Var unchanged.
+ *
+ * When 'targettypeid' is UNKNOWNOID, this function returns a new Var if an
+ * already properly typed underlying expr is found; but returns the unchanged
+ * Var with no coercion if the Const or Param type is still UNKNOWN.  In this
+ * case the targetTypeMod, ccontext, and cformat parameters are not used.
+ *
+ * 'levelsup' is an extra offset to interpret the Var's varlevelsup correctly.
+ * See also markTargetListOrigin() in parse_target.c.
+ */
+static Var *
+coerce_unknown_var(ParseState *pstate, Var *var,
+                   Oid targetTypeId, int32 targetTypeMod,
+			       CoercionContext ccontext, CoercionForm cformat,
+                   int levelsup)
+{
+	RangeTblEntry  *rte;
+    int             netlevelsup = var->varlevelsup + levelsup;
+
+    Assert(IsA(var, Var));
+
+	/* 
+	 * If the parser isn't set up, we can't do anything here so just return the
+	 * Var as is. This can happen if we call back into the parser from the
+	 * planner (calls to addRangeTableEntryForJoin()).
+	 */
+	if (!PointerIsValid(pstate))
+		return var;
+
+    rte = GetRTEByRangeTablePosn(pstate, var->varno, netlevelsup);
+
+    switch (rte->rtekind)
+    {
+        /* Descend thru Join RTEs to a leaf RTE. */
+        case RTE_JOIN:
+        {
+            ListCell   *cell;
+            Var        *joinvar;
+
+            Assert(var->varattno > 0 &&
+                   var->varattno <= list_length(rte->joinaliasvars));
+
+            /* Get referenced join result Var */
+            cell = list_nth_cell(rte->joinaliasvars, var->varattno - 1);
+            joinvar = (Var *)lfirst(cell);
+
+            /* If still untyped, try to replace it with a properly typed Var */
+            if (joinvar->vartype == UNKNOWNOID &&
+                targetTypeId != UNKNOWNOID)
+            {
+                joinvar = coerce_unknown_var(pstate, joinvar,
+                                             targetTypeId, targetTypeMod,
+                                             ccontext, cformat,
+                                             netlevelsup);
+
+                /* Substitute new Var into join result list. */
+                lfirst(cell) = joinvar;
+            }
+
+            /* Make a new Var for the caller */
+            if (joinvar->vartype != UNKNOWNOID)
+            {
+                var = (Var *) copyObject(var);
+                var->vartype = joinvar->vartype;
+                var->vartypmod = joinvar->vartypmod;
+				var->varcollid = joinvar->varcollid;
+            }
+            break;
+        }
+
+        /* Impose requested type on Const or Param in subquery's targetlist. */
+        case RTE_SUBQUERY:
+		{
+			TargetEntry    *ste;
+            Node           *targetexpr;
+            Oid             exprtype;
+
+            /* Get referenced subquery result expr */
+            ste = get_tle_by_resno(rte->subquery->targetList, var->varattno);
+			Assert(ste && !ste->resjunk && ste->expr);
+            targetexpr = (Node *)ste->expr;
+
+            /* If still untyped, try to coerce it to the requested type. */
+            exprtype = exprType(targetexpr);
+            if (exprtype == UNKNOWNOID &&
+                targetTypeId != UNKNOWNOID)
+            {
+				ParseState	   *subpstate = make_parsestate(pstate);
+				subpstate->p_rtable = rte->subquery->rtable;
+
+				targetexpr = coerce_type(subpstate, targetexpr, exprtype,
+										 targetTypeId, targetTypeMod,
+										 ccontext, cformat, -1);
+
+				free_parsestate(subpstate);
+				/* Substitute coerced expr into subquery's targetlist. */
+				ste->expr = (Expr *)targetexpr;
+				exprtype = exprType(targetexpr);
+            }
+
+            /* Make a new Var for the caller */
+            if (exprtype != UNKNOWNOID)
+            {
+                var = (Var *)copyObject(var);
+                var->vartype = exprtype;
+                var->vartypmod = exprTypmod(targetexpr);
+				var->varcollid = exprCollation(targetexpr);
+            }
+            break;
+		}
+
+        /* Return unchanged Var if leaf RTE is not a subquery. */
+        default:
+            break;
+    }
+
+    return var;
+}                               /* coerce_unknown_var */
+
+
+/*
+ * fixup_unknown_vars_in_exprlist / fixup_unknown_vars_in_targetlist
+ *
+ * A Var of type UNKNOWN could have been created as a reference to an
+ * untyped expression in the targetlist of a range subquery.  Afterwards
+ * coerce_type() could have changed the underlying Const or Param node
+ * from UNKNOWN to some proper type.  Here we try to update Var nodes
+ * in the given list to reflect recent knowledge of source column types.
+ */
+void
+fixup_unknown_vars_in_exprlist(ParseState *pstate, List *exprlist)
+{
+    ListCell   *cell;
+
+    foreach(cell, exprlist)
+    {
+        if (IsA(lfirst(cell), Var) &&
+            ((Var *)lfirst(cell))->vartype == UNKNOWNOID)
+        {
+            lfirst(cell) = coerce_unknown_var(pstate, (Var *)lfirst(cell),
+                                              UNKNOWNOID, -1,
+                                              COERCION_IMPLICIT, COERCE_EXPLICIT_CALL,
+                                              0);
+        }
+    }
+}                               /* fixup_unknown_vars_in_exprlist */
+
+void
+fixup_unknown_vars_in_targetlist(ParseState *pstate, List *targetlist)
+{
+    ListCell   *cell;
+
+    foreach(cell, targetlist)
+    {
+        TargetEntry    *tle = (TargetEntry *)lfirst(cell);
+
+        Assert(IsA(tle, TargetEntry));
+
+        if (IsA(tle->expr, Var) &&
+            ((Var *)tle->expr)->vartype == UNKNOWNOID)
+        {
+            tle->expr = (Expr *)coerce_unknown_var(pstate, (Var *)tle->expr,
+                                                   UNKNOWNOID, -1,
+                                                   COERCION_IMPLICIT, COERCE_EXPLICIT_CALL,
+                                                   0);
+        }
+    }
+}                               /* fixup_unknown_vars_in_targetlist */
+
+/*
+ * Fix up the unknown Vars in the subquery specified by rtr. The new
+ * types and typemods are given.
+ *
+ * Greenplum Specific Logic:
+ *   this function's call chain is
+ *    fixup_unknown_vars_in_RangeTblRef <-- fixup_unknown_vars_in_setop <-- transformSetOperationStmt
+ *   the whole bunch of code is added by Greenplum and it is only used during
+ *   parse-analyze Set Operation Statement.
+ */
+static void
+fixup_unknown_vars_in_RangeTblRef(ParseState *pstate, RangeTblRef *rtr,
+								  List *colTypes, List *colTypmods)
+{
+	ListCell *tle_lc, *type_lc, *typemod_lc;
+	int rti;
+	RangeTblEntry *rte;
+	Query *query;
+	List *old_rtable = pstate->p_rtable;
+	
+	rti = rtr->rtindex;
+	rte = rt_fetch(rti, pstate->p_rtable);
+	query = rte->subquery;
+	pstate->p_rtable = query->rtable;
+	
+	tle_lc = list_head(query->targetList);
+		
+	forboth (type_lc, colTypes, typemod_lc, colTypmods)
+	{
+		TargetEntry *tle = (TargetEntry *)lfirst(tle_lc);
+		Oid colType = lfirst_oid(type_lc);
+		int32 colTypmod = lfirst_int(typemod_lc);
+			
+		Assert(IsA(tle, TargetEntry) && tle->expr != NULL);
+		if (IsA(tle->expr, Var) &&
+			((Var *)tle->expr)->vartype == UNKNOWNOID)
+		{
+			/*
+			 * As mentioned in this function's comments, this function can only be
+			 * used for Set Operation SQL Statement, like Q: q1 Union q2.
+			 * We are now in Q's context, q1 is parse-analyzed in a sub parse-state of
+			 * Q's and that sub parse-state is free-ed when finishing. So we have to
+			 * pass -1 as levelsup to the following function coerce_unknown_var.
+			 * See Github Issue https://github.com/greenplum-db/gpdb/issues/12407
+			 * for details.
+			 */
+			tle->expr = (Expr *)coerce_unknown_var(pstate, (Var *)tle->expr,
+												   colType, colTypmod,
+												   COERCION_IMPLICIT, COERCE_EXPLICIT_CALL,
+												   -1);
+		}
+
+		tle_lc = lnext(tle_lc);
+	}
+
+	pstate->p_rtable = old_rtable;
+}
+
+/*
+ * Greenplum specific function.
+ * Fix up the unknown Vars in all subqueries in a SetOperationStmt.
+ */
+void
+fixup_unknown_vars_in_setop(ParseState *pstate, SetOperationStmt *stmt)
+{
+	if (stmt->rarg != NULL)
+	{
+		if (IsA(stmt->rarg, SetOperationStmt))
+		{
+			SetOperationStmt *new_stmt = (SetOperationStmt *)stmt->rarg;
+			new_stmt->colTypes = copyObject(stmt->colTypes);
+			new_stmt->colTypmods = copyObject(stmt->colTypmods);
+		
+			fixup_unknown_vars_in_setop(pstate, new_stmt);
+		}
+		else if (IsA(stmt->rarg, RangeTblRef))
+		{
+			fixup_unknown_vars_in_RangeTblRef(pstate, (RangeTblRef *) (stmt->rarg),
+											  stmt->colTypes, stmt->colTypmods);
+		}
+		else
+			Assert(0);
+	}
+
+	if (stmt->larg != NULL)
+	{
+		if (IsA(stmt->larg, SetOperationStmt))
+		{
+			SetOperationStmt *new_stmt = (SetOperationStmt *)stmt->larg;
+			new_stmt->colTypes = copyObject(stmt->colTypes);
+			new_stmt->colTypmods = copyObject(stmt->colTypmods);
+			
+			fixup_unknown_vars_in_setop(pstate, new_stmt);
+		}
+		else if (IsA(stmt->larg, RangeTblRef))
+		{
+			fixup_unknown_vars_in_RangeTblRef(pstate, (RangeTblRef *) (stmt->larg),
+											  stmt->colTypes, stmt->colTypmods);
+		}
+		else
+			Assert(0);
+	}
+}
+
+/*
  * can_coerce_type()
  *		Can input_typeids be coerced to target_typeids?
  *
@@ -503,6 +896,21 @@ can_coerce_type(int nargs, Oid *input_typeids, Oid *target_typeids,
 		/* no problem if same type */
 		if (inputTypeId == targetTypeId)
 			continue;
+
+		/* 
+		 * ANYTABLE is a special case that can occur when a function is 
+		 * called with a TableValue expression.  A table value expression
+		 * can only match a parameter to a function defined as a "anytable".
+		 *
+		 * Only allow ANYTABLE to match another ANYTABLE, anything else would
+		 * be a mismatch of Table domain and Value domain expressions.  
+		 *
+		 * Validation of ANYTABLE coercion is processed at a higher level
+		 * that has more context related to the tupleDesc for the tables
+		 * involved.
+		 */
+		if (targetTypeId == ANYTABLEOID || inputTypeId == ANYTABLEOID)
+			return false;
 
 		/* accept if target is ANY */
 		if (targetTypeId == ANYOID)
@@ -2114,6 +2522,8 @@ find_coercion_pathway(Oid targetTypeId, Oid sourceTypeId,
 	/* Domains are always coercible to and from their base type */
 	if (sourceTypeId == targetTypeId)
 		return COERCION_PATH_RELABELTYPE;
+
+	/* SELECT castcontext from pg_cast */
 
 	/* Look in pg_cast */
 	tuple = SearchSysCache2(CASTSOURCETARGET,

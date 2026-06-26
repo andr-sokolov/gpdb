@@ -3,7 +3,7 @@
  * pgtz.c
  *	  Timezone Library Integration Functions
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/timezone/pgtz.c
@@ -29,7 +29,6 @@ pg_tz	   *session_timezone = NULL;
 
 /* Current log timezone (controlled by log_timezone GUC) */
 pg_tz	   *log_timezone = NULL;
-
 
 static bool scan_directory_ci(const char *dirname,
 				  const char *fname, int fnamelen,
@@ -466,7 +465,7 @@ pg_tzenumerate_next(pg_tzenum *dir)
 			/* Step into the subdirectory */
 			if (dir->depth >= MAX_TZDIR_DEPTH - 1)
 				ereport(ERROR,
-					 (errmsg_internal("timezone directory stack overflow")));
+						(errmsg_internal("timezone directory stack overflow")));
 			dir->depth++;
 			dir->dirname[dir->depth] = pstrdup(fullname);
 			dir->dirdesc[dir->depth] = AllocateDir(fullname);

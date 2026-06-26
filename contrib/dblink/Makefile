@@ -1,9 +1,14 @@
 # contrib/dblink/Makefile
+# disable dblink on MaxOS as --exclude-libs and -Bstatic are not supported
+OS := $(shell uname -s)
+ifeq ($(OS),Darwin)
+$(error "dblink can't be built on Mac")
+endif
 
 MODULE_big = dblink
 OBJS	= dblink.o
 PG_CPPFLAGS = -I$(libpq_srcdir)
-SHLIB_LINK_INTERNAL = $(libpq)
+SHLIB_LINK_INTERNAL = -Wl,--exclude-libs=libpq.a -Wl,-Bstatic $(libpq) -Wl,-Bdynamic
 
 EXTENSION = dblink
 DATA = dblink--1.1.sql dblink--1.0--1.1.sql dblink--unpackaged--1.0.sql
@@ -27,3 +32,5 @@ top_builddir = ../..
 include $(top_builddir)/src/Makefile.global
 include $(top_srcdir)/contrib/contrib-global.mk
 endif
+
+REGRESS_OPTS += --init-file=$(top_builddir)/src/test/regress/init_file

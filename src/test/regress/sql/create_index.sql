@@ -222,6 +222,7 @@ SELECT count(*) FROM radix_text_tbl WHERE t ~>~  'Worth                         
 
 -- Now check the results from plain indexscan
 SET enable_seqscan = OFF;
+SET optimizer_enable_tablescan = OFF;
 SET enable_indexscan = ON;
 SET enable_bitmapscan = OFF;
 
@@ -563,6 +564,7 @@ SELECT count(*) FROM radix_text_tbl WHERE t ~>~  'Worth                         
 SELECT count(*) FROM radix_text_tbl WHERE t ~>~  'Worth                         St  ';
 
 RESET enable_seqscan;
+RESET optimizer_enable_tablescan;
 RESET enable_indexscan;
 RESET enable_bitmapscan;
 
@@ -573,6 +575,7 @@ RESET enable_bitmapscan;
 --
 
 SET enable_seqscan = OFF;
+SET optimizer_enable_tablescan = OFF;
 SET enable_indexscan = OFF;
 SET enable_bitmapscan = ON;
 
@@ -633,6 +636,7 @@ SELECT * FROM array_op_test WHERE i = '{NULL}' ORDER BY seqno;
 SELECT * FROM array_op_test WHERE i <@ '{NULL}' ORDER BY seqno;
 
 RESET enable_seqscan;
+RESET optimizer_enable_tablescan;
 RESET enable_indexscan;
 RESET enable_bitmapscan;
 
@@ -668,12 +672,12 @@ CREATE INDEX hash_f8_index ON hash_f8_heap USING hash (random float8_ops);
 -- Test functional index
 --
 CREATE TABLE func_index_heap (f1 text, f2 text);
-CREATE UNIQUE INDEX func_index_index on func_index_heap (textcat(f1,f2));
+CREATE INDEX func_index_index on func_index_heap (textcat(f1,f2));
 
 INSERT INTO func_index_heap VALUES('ABC','DEF');
 INSERT INTO func_index_heap VALUES('AB','CDEFG');
 INSERT INTO func_index_heap VALUES('QWE','RTY');
--- this should fail because of unique index:
+-- this should fail because of unique index: (In GPDB, the index isn't unique, so no error)
 INSERT INTO func_index_heap VALUES('ABCD', 'EF');
 -- but this shouldn't:
 INSERT INTO func_index_heap VALUES('QWERTY');
@@ -688,12 +692,12 @@ INSERT INTO func_index_heap VALUES('QWERTY');
 --
 DROP TABLE func_index_heap;
 CREATE TABLE func_index_heap (f1 text, f2 text);
-CREATE UNIQUE INDEX func_index_index on func_index_heap ((f1 || f2) text_ops);
+CREATE  INDEX func_index_index on func_index_heap ((f1 || f2) text_ops);
 
 INSERT INTO func_index_heap VALUES('ABC','DEF');
 INSERT INTO func_index_heap VALUES('AB','CDEFG');
 INSERT INTO func_index_heap VALUES('QWE','RTY');
--- this should fail because of unique index:
+-- this should fail because of unique index: (In GPDB, the index isn't unique, so no error)
 INSERT INTO func_index_heap VALUES('ABCD', 'EF');
 -- but this shouldn't:
 INSERT INTO func_index_heap VALUES('QWERTY');
@@ -710,27 +714,31 @@ create index on func_index_heap ((f1 || f2), (row(f1, f2)));
 -- Also try building functional, expressional, and partial indexes on
 -- tables that already contain data.
 --
-create unique index hash_f8_index_1 on hash_f8_heap(abs(random));
-create unique index hash_f8_index_2 on hash_f8_heap((seqno + 1), random);
-create unique index hash_f8_index_3 on hash_f8_heap(random) where seqno > 1000;
+create index hash_f8_index_1 on hash_f8_heap(abs(random));
+create index hash_f8_index_2 on hash_f8_heap((seqno + 1), random);
+create index hash_f8_index_3 on hash_f8_heap(random) where seqno > 1000;
 
 --
 -- Try some concurrent index builds
 --
 -- Unfortunately this only tests about half the code paths because there are
 -- no concurrent updates happening to the table at the same time.
-
-CREATE TABLE concur_heap (f1 text, f2 text);
+--
+-- Concurrent index building is not currently supported in Greenplum.
+--start_ignore
+CREATE TABLE concur_heap (f1 text, f2 text, dk text) distributed by (dk);
 -- empty table
 CREATE INDEX CONCURRENTLY concur_index1 ON concur_heap(f2,f1);
-INSERT INTO concur_heap VALUES  ('a','b');
-INSERT INTO concur_heap VALUES  ('b','b');
+INSERT INTO concur_heap VALUES  ('a','b', '1');
+INSERT INTO concur_heap VALUES  ('b','b', '1');
+INSERT INTO concur_heap VALUES  ('c','c', '2');
+INSERT INTO concur_heap VALUES  ('d','d', '3');
 -- unique index
-CREATE UNIQUE INDEX CONCURRENTLY concur_index2 ON concur_heap(f1);
+CREATE UNIQUE INDEX CONCURRENTLY concur_index2 ON concur_heap(dk, f1);
 -- check if constraint is set up properly to be enforced
-INSERT INTO concur_heap VALUES ('b','x');
+INSERT INTO concur_heap VALUES ('b','x', '1');
 -- check if constraint is enforced properly at build time
-CREATE UNIQUE INDEX CONCURRENTLY concur_index3 ON concur_heap(f2);
+CREATE UNIQUE INDEX CONCURRENTLY concur_index3 ON concur_heap(dk, f2);
 -- test that expression indexes and partial indexes work concurrently
 CREATE INDEX CONCURRENTLY concur_index4 on concur_heap(f2) WHERE f1='a';
 CREATE INDEX CONCURRENTLY concur_index5 on concur_heap(f2) WHERE f1='x';
@@ -783,6 +791,7 @@ DROP TABLE concur_temp;
 
 --
 -- Try some concurrent index drops
+-- Greenplum: The functionality of these tests is replicated in gp_index
 --
 DROP INDEX CONCURRENTLY "concur_index2";				-- works
 DROP INDEX CONCURRENTLY IF EXISTS "concur_index2";		-- notice
@@ -804,6 +813,7 @@ DROP INDEX CONCURRENTLY "concur_heap_expr_idx";
 
 DROP TABLE concur_heap;
 
+--end_ignore
 --
 -- Test ADD CONSTRAINT USING INDEX
 --
@@ -836,11 +846,12 @@ DROP TABLE cwi_test;
 -- Tests for IS NULL/IS NOT NULL with b-tree indexes
 --
 
-SELECT unique1, unique2 INTO onek_with_null FROM onek;
+CREATE TABLE onek_with_null AS SELECT unique1, unique2 FROM onek DISTRIBUTED BY (unique1);
 INSERT INTO onek_with_null (unique1,unique2) VALUES (NULL, -1), (NULL, NULL);
 CREATE UNIQUE INDEX onek_nulltest ON onek_with_null (unique2,unique1);
 
 SET enable_seqscan = OFF;
+SET optimizer_enable_tablescan = OFF;
 SET enable_indexscan = ON;
 SET enable_bitmapscan = ON;
 
@@ -909,6 +920,7 @@ SELECT unique1, unique2 FROM onek_with_null WHERE unique2 < 999
   ORDER BY unique2 DESC LIMIT 2;
 
 RESET enable_seqscan;
+RESET optimizer_enable_tablescan;
 RESET enable_indexscan;
 RESET enable_bitmapscan;
 
@@ -917,6 +929,11 @@ DROP TABLE onek_with_null;
 --
 -- Check bitmap index path planning
 --
+
+SET enable_seqscan = OFF;
+SET optimizer_enable_tablescan = OFF;
+SET enable_indexscan = ON;
+SET enable_bitmapscan = ON;
 
 EXPLAIN (COSTS OFF)
 SELECT * FROM tenk1
@@ -969,7 +986,13 @@ SELECT thousand, tenthous FROM tenk1
 WHERE thousand < 2 AND tenthous IN (1001,3000)
 ORDER BY thousand;
 
+RESET enable_seqscan;
+RESET optimizer_enable_tablescan;
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+
 SET enable_indexonlyscan = OFF;
+SET random_page_cost = 4; -- prefer index san.
 
 explain (costs off)
 SELECT thousand, tenthous FROM tenk1
@@ -980,6 +1003,7 @@ SELECT thousand, tenthous FROM tenk1
 WHERE thousand < 2 AND tenthous IN (1001,3000)
 ORDER BY thousand;
 
+RESET random_page_cost;
 RESET enable_indexonlyscan;
 
 --

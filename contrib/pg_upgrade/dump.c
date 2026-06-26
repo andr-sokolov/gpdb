@@ -13,6 +13,7 @@
 
 #include <sys/types.h>
 
+#include "greenplum/pg_upgrade_greenplum.h"
 
 void
 generate_old_dump(void)
@@ -22,9 +23,11 @@ generate_old_dump(void)
 	prep_status("Creating dump of global objects");
 
 	/* run new pg_dumpall binary for globals */
-	exec_prog(UTILITY_LOG_FILE, NULL, true,
-			  "\"%s/pg_dumpall\" %s --globals-only --quote-all-identifiers "
-			  "--binary-upgrade %s -f %s",
+	exec_prog(UTILITY_LOG_FILE, NULL, true, true,
+			  PG_OPTIONS_UTILITY_MODE
+			  "\"%s/pg_dumpall\" %s --schema-only --globals-only "
+			  "--resource-groups --resource-queues "
+			  "--quote-all-identifiers --binary-upgrade %s -f %s",
 			  new_cluster.bindir, cluster_conn_opts(&old_cluster),
 			  log_opts.verbose ? "--verbose" : "",
 			  GLOBALS_DUMP_FILE);
@@ -53,6 +56,7 @@ generate_old_dump(void)
 		snprintf(log_file_name, sizeof(log_file_name), DB_DUMP_LOG_FILE_MASK, old_db->db_oid);
 
 		parallel_exec_prog(log_file_name, NULL,
+				   PG_OPTIONS_UTILITY_MODE
 				   "\"%s/pg_dump\" %s --schema-only --quote-all-identifiers "
 					  "--binary-upgrade --format=custom %s --file=\"%s\" %s",
 						 new_cluster.bindir, cluster_conn_opts(&old_cluster),

@@ -19,11 +19,19 @@ MAJOR_VERSION= 4
 MINOR_VERSION= 10
 PATCHLEVEL=0
 
+# The frontend doesn't need everything that's in LIBS, some are backend only
+LIBS := $(filter-out -lresolv -lbz2, $(LIBS))
+# This program isn't interactive, so doesn't need these
+LIBS := $(filter-out -lreadline -ledit -ltermcap -lncurses -lcurses -lcurl -lssl -lcrypto -lz, $(LIBS))
+
 override CPPFLAGS := -I../include -I$(top_srcdir)/src/interfaces/ecpg/include \
 	-I. -I$(srcdir) -DMAJOR_VERSION=$(MAJOR_VERSION) \
 	-DMINOR_VERSION=$(MINOR_VERSION) -DPATCHLEVEL=$(PATCHLEVEL) \
 	 $(CPPFLAGS)
 
+ifeq ($(GCC), yes)
+override CFLAGS +=  $(PTHREAD_CFLAGS) -DECPG_COMPILE -Wno-unused-label -Wno-error
+endif
 override CFLAGS += $(PTHREAD_CFLAGS) -DECPG_COMPILE
 
 OBJS=	preproc.o pgc.o type.o ecpg.o output.o parser.o \
@@ -72,8 +80,10 @@ uninstall:
 
 clean distclean:
 	rm -f kwlookup.c *.o ecpg$(X)
+# garbage from partial builds
+	@rm -f y.tab.c y.tab.h preproc.tab.c preproc.tab.y preproc.tab.h
 # garbage from development
-	@rm -f core a.out
+	@rm -f core a.out *.output *.tab.c
 
 # `make distclean' must not remove preproc.y, preproc.c, preproc.h, or pgc.c
 # since we want to ship those files in the distribution for people with

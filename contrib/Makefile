@@ -5,28 +5,18 @@ top_builddir = ..
 include $(top_builddir)/src/Makefile.global
 
 SUBDIRS = \
-		adminpack	\
+		amcheck		\
 		auth_delay	\
 		auto_explain	\
 		btree_gin	\
-		btree_gist	\
-		chkpass		\
 		citext		\
-		cube		\
-		dblink		\
 		dict_int	\
 		dict_xsyn	\
 		dummy_seclabel	\
-		earthdistance	\
 		file_fdw	\
 		fuzzystrmatch	\
 		hstore		\
-		intagg		\
 		intarray	\
-		isn		\
-		lo		\
-		ltree		\
-		oid2name	\
 		pageinspect	\
 		passwordcheck	\
 		pg_archivecleanup \
@@ -45,18 +35,35 @@ SUBDIRS = \
 		pgrowlocks	\
 		pgstattuple	\
 		pg_xlogdump	\
-		postgres_fdw	\
 		seg		\
 		spi		\
-		tablefunc	\
 		tcn		\
 		test_decoding	\
 		test_parser	\
 		test_shm_mq	\
 		tsearch2	\
-		unaccent	\
-		vacuumlo	\
-		worker_spi
+		unaccent
+# GPDB_92_MERGE_FIXME: Why some files (especially Makefile) are missing under
+# these directories?
+#               seg         \
+#		tablefunc	\
+#		vacuumlo
+#		worker_spi 
+
+#disable dblink and postgres_fdw on Mac
+OS := $(shell uname -s)
+ifneq ($(OS),Darwin)
+SUBDIRS += \
+		dblink	\
+		postgres_fdw
+endif
+
+# Greenplum-specific additions (to ease merge pain).
+SUBDIRS += \
+		formatter \
+		formatter_fixedwidth \
+		extprotocol \
+		indexscan \
 
 ifeq ($(with_openssl),yes)
 SUBDIRS += sslinfo

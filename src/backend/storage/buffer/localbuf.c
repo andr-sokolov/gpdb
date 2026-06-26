@@ -109,6 +109,13 @@ LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
 	int			trycounter;
 	bool		found;
 
+	/*
+	 * Local buffers are used for temp tables in PostgreSQL.  As temp tables
+	 * use shared buffers in Greenplum, we shouldn't be useing local buffers
+	 * for anything.
+	 */
+	Assert(false);
+
 	INIT_BUFFERTAG(newTag, smgr->smgr_rnode.node, forkNum, blockNum);
 
 	/* Initialize local buffers if first request in this session */
@@ -201,6 +208,8 @@ LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
 		/* Find smgr relation for buffer */
 		oreln = smgropen(bufHdr->tag.rnode, MyBackendId);
 
+		// GPDB_93_MERGE_FIXME: is this TODO comment still relevant?
+		// UNDONE: Unfortunately, I think we write temp relations to the mirror...
 		PageSetChecksumInplace(localpage, bufHdr->tag.blockNum);
 
 		/* And write... */
@@ -303,6 +312,12 @@ DropRelFileNodeLocalBuffers(RelFileNode rnode, ForkNumber forkNum,
 {
 	int			i;
 
+	/*
+	 * Local buffers are used for temp tables in PostgreSQL.  As temp tables
+	 * use shared buffers in Greenplum, we shouldn't be useing local buffers
+	 * for anything.
+	 */
+	Assert(false);
 	for (i = 0; i < NLocBuffer; i++)
 	{
 		BufferDesc *bufHdr = &LocalBufferDescriptors[i];

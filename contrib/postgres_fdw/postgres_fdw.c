@@ -286,6 +286,7 @@ static void postgresExplainForeignModify(ModifyTableState *mtstate,
 static bool postgresAnalyzeForeignTable(Relation relation,
 							AcquireSampleRowsFunc *func,
 							BlockNumber *totalpages);
+static int greenplumCheckIsGreenplum(ForeignServer *server, UserMapping *user);
 
 /*
  * Helper functions
@@ -473,7 +474,8 @@ postgresGetForeignRelSize(PlannerInfo *root,
 													 fpinfo->local_conds,
 													 baserel->relid,
 													 JOIN_INNER,
-													 NULL);
+													 NULL,
+													 false);
 
 	cost_qual_eval(&fpinfo->local_conds_cost, fpinfo->local_conds, root);
 
@@ -1016,10 +1018,10 @@ postgresIterateForeignScan(ForeignScanState *node)
 	/*
 	 * Return the next tuple.
 	 */
-	ExecStoreTuple(fsstate->tuples[fsstate->next_tuple++],
-				   slot,
-				   InvalidBuffer,
-				   false);
+	ExecStoreHeapTuple(fsstate->tuples[fsstate->next_tuple++],
+					   slot,
+					   InvalidBuffer,
+					   false);
 
 	return slot;
 }
@@ -1668,8 +1670,19 @@ postgresIsForeignRelUpdatable(Relation rel)
 	/*
 	 * Currently "updatable" means support for INSERT, UPDATE and DELETE.
 	 */
-	return updatable ?
-		(1 << CMD_INSERT) | (1 << CMD_UPDATE) | (1 << CMD_DELETE) : 0;
+	if (!updatable)
+		return 0;
+
+	/*
+	 * Greenplum only supports INSERT, because UPDATE/DELETE SELECT requires
+	 * the hidden column gp_segment_id and the other "ModifyTable mixes
+	 * distributed and entry-only tables" issue.
+	 */
+	UserMapping *user = GetUserMapping(rel->rd_rel->relowner, table->serverid);
+	if (greenplumCheckIsGreenplum(server, user))
+		return (1 << CMD_INSERT);
+	else
+		return (1 << CMD_INSERT) | (1 << CMD_UPDATE) | (1 << CMD_DELETE);
 }
 
 /*
@@ -1787,7 +1800,8 @@ estimate_path_cost_size(PlannerInfo *root,
 										   local_join_conds,
 										   baserel->relid,
 										   JOIN_INNER,
-										   NULL);
+										   NULL,
+										   false);
 		local_sel *= fpinfo->local_conds_sel;
 
 		rows = clamp_row_est(rows * local_sel);
@@ -2307,7 +2321,7 @@ store_returning_result(PgFdwModifyState *fmstate,
 											fmstate->retrieved_attrs,
 											fmstate->temp_cxt);
 		/* tuple will be deleted when it is cleared from the slot */
-		ExecStoreTuple(newtup, slot, InvalidBuffer, true);
+		ExecStoreHeapTuple(newtup, slot, InvalidBuffer, true);
 	}
 	PG_CATCH();
 	{
@@ -2369,6 +2383,30 @@ postgresAnalyzeForeignTable(Relation relation,
 		if (PQntuples(res) != 1 || PQnfields(res) != 1)
 			elog(ERROR, "unexpected result from deparseAnalyzeSizeSql query");
 		*totalpages = strtoul(PQgetvalue(res, 0, 0), NULL, 10);
+		/* FIXME:
+		 * When totalpages is 0, we set it to be 1 instead. The reason is:
+		 * totalpages can be 0 even if the table is not empty when remote
+		 * totalpages is 1 and local BLCKSZ is bigger than the remote one.
+		 * Because the totlpages is computed by local BLCKSZ as follow:
+		 * (in function deparseAnalyzeSizeSql)
+		 * SELECT pg_catalog.pg_relation_size(::pg_catalog.regclass) / BLCKSZ
+		 * (the BLCKSZ is local BLCKSZ, and the relation size is cumputed in remote).
+		 * When totalpages is 0 and num of tuples is not 0, the Assert will
+		 * fail in function vac_update_relstats.
+		 *
+		 * Maybe it is not good to set the totalpages to be 1 when the table
+		 * is empty in actual, but as the totalpages is not correct when local
+		 * BLCKSZ is different with the remote one, we think it's ok to do this.
+		 *
+		 * We are trying to submit a patch to the upstream to fix this issue
+		 * by using remote BLCKSZ to compute the totalpages in the upstream
+		 * instead of local BLCKSZ. After the patch merged, we will cherry pick it here.
+		 */
+
+		if (*totalpages == 0)
+		{
+			*totalpages = 1;
+		}
 
 		PQclear(res);
 		res = NULL;
@@ -2738,4 +2776,30 @@ conversion_error_callback(void *arg)
 		errcontext("column \"%s\" of foreign table \"%s\"",
 				   NameStr(tupdesc->attrs[errpos->cur_attno - 1]->attname),
 				   RelationGetRelationName(errpos->rel));
+}
+
+static int
+greenplumCheckIsGreenplum(ForeignServer *server, UserMapping *user)
+{
+	PGconn     *conn;
+	PGresult   *res;
+	int                     ret;
+
+	char *query =  "SELECT version()";
+
+	conn = GetConnection(server, user, false);
+
+	res = pgfdw_exec_query(conn, query);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+		pgfdw_report_error(ERROR, res, conn, true, query);
+
+	if (PQntuples(res) == 0)
+		pgfdw_report_error(ERROR, res, conn, true, query);
+
+	ret = strstr(PQgetvalue(res, 0, 0), "Greenplum Database") ? 1 : 0;
+
+	PQclear(res);
+	ReleaseConnection(conn);
+
+	return ret;
 }
