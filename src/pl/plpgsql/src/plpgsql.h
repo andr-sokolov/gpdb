@@ -214,6 +214,7 @@ typedef struct PLpgSQL_expr
 	int			dno;
 	char	   *query;
 	SPIPlanPtr	plan;
+	bool		cachable;			/* true if plan can be cached */
 	Bitmapset  *paramnos;		/* all dnos referenced by this query */
 
 	/* function containing this expr (not set until we first parse query) */
@@ -224,8 +225,9 @@ typedef struct PLpgSQL_expr
 
 	/* fields for "simple expression" fast-path execution: */
 	Expr	   *expr_simple_expr;		/* NULL means not a simple expr */
+	Oid			expr_simple_type;
+	TransactionId	transaction_id;	/* used for clearing cached plan */
 	int			expr_simple_generation; /* plancache generation we checked */
-	Oid			expr_simple_type;		/* result type Oid, if simple */
 
 	/*
 	 * if expr is simple AND prepared in current transaction,
@@ -787,7 +789,7 @@ typedef struct PLpgSQL_execstate
 
 	/* temporary state for results from evaluation of query or expr */
 	SPITupleTable *eval_tuptable;
-	uint32		eval_processed;
+	uint64		eval_processed;
 	Oid			eval_lastoid;
 	ExprContext *eval_econtext; /* for executing simple expressions */
 	PLpgSQL_expr *cur_expr;		/* current query/expr being evaluated */

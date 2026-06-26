@@ -4,6 +4,7 @@
  *	  This file contains definitions for structures and
  *	  externs for functions used by frontend postgres applications.
  *
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -120,7 +121,16 @@ typedef enum
 	PQPING_OK,					/* server is accepting connections */
 	PQPING_REJECT,				/* server is alive but rejecting connections */
 	PQPING_NO_RESPONSE,			/* could not establish connection */
-	PQPING_NO_ATTEMPT			/* connection not attempted (bad params) */
+	PQPING_NO_ATTEMPT,			/* connection not attempted (bad params) */
+
+	/*
+	 * GPDB-specific additions, starting at 64 to avoid collisions with
+	 * upstream. (This is only somewhat arbitrary; values above 255 would
+	 * increase the size of the PGPing type, but values above 125 would also
+	 * conflict with Bash-specific signal codes. We take roughly half of what's
+	 * left.)
+	 */
+	PQPING_MIRROR_READY = 64,	/* mirror completed startup sequence */
 } PGPing;
 
 /* PGconn encapsulates a connection to the backend.
@@ -200,6 +210,10 @@ typedef struct _PQconninfoOption
 								 * hide value "D"  Debug option - don't show
 								 * by default */
 	int			dispsize;		/* Field size in characters for dialog	*/
+#ifndef FRONTEND  /* modules other than backend have this macro */
+	off_t		connofs;		/* Offset into PGconn struct, -1 if not there
+								 * (Greenplum specified) */
+#endif
 } PQconninfoOption;
 
 /* ----------------
@@ -231,6 +245,24 @@ typedef struct pgresAttDesc
 	int			typlen;			/* type size */
 	int			atttypmod;		/* type-specific modifier info */
 } PGresAttDesc;
+
+/* Greenplum specific struct */
+typedef struct
+{
+	Oid aorelid;
+#ifdef HAVE_INT64
+	int64 tupcount;
+#else
+#ifdef HAVE_LONG_INT_64
+	long int tupcount;
+#else
+	long long int tupcount;
+#endif
+#endif
+} PQaoRelTupCount;
+
+struct PartitionNode;
+struct HTAB;
 
 /* ----------------
  * Exported functions of libpq
@@ -292,6 +324,9 @@ extern void PQfreeCancel(PGcancel *cancel);
 
 /* issue a cancel request */
 extern int	PQcancel(PGcancel *cancel, char *errbuf, int errbufsize);
+
+/* issue a finsh request */
+extern int	PQrequestFinish(PGcancel *cancel, char *errbuf, int errbufsize);
 
 /* backwards compatible version of PQcancel; not thread-safe */
 extern int	PQrequestCancel(PGconn *conn);

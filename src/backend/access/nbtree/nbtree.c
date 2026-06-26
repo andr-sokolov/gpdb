@@ -22,6 +22,7 @@
 #include "access/nbtree.h"
 #include "access/relscan.h"
 #include "catalog/index.h"
+#include "catalog/pg_namespace.h"
 #include "commands/vacuum.h"
 #include "storage/indexfsm.h"
 #include "storage/ipc.h"
@@ -29,6 +30,9 @@
 #include "storage/smgr.h"
 #include "tcop/tcopprot.h"
 #include "utils/memutils.h"
+#include "utils/guc.h"
+
+#include "catalog/indexing.h"
 
 
 /* Working state for btbuild and its callback */
@@ -64,7 +68,7 @@ typedef struct
 
 
 static void btbuildCallback(Relation index,
-				HeapTuple htup,
+				ItemPointer tupleId,
 				Datum *values,
 				bool *isnull,
 				bool tupleIsAlive,
@@ -119,7 +123,7 @@ btbuild(PG_FUNCTION_ARGS)
 		buildstate.spool2 = _bt_spoolinit(heap, index, false, true);
 
 	/* do the heap scan */
-	reltuples = IndexBuildHeapScan(heap, index, indexInfo, true,
+	reltuples = IndexBuildScan(heap, index, indexInfo, true,
 								   btbuildCallback, (void *) &buildstate);
 
 	/* okay, all heap tuples are indexed */
@@ -164,7 +168,7 @@ btbuild(PG_FUNCTION_ARGS)
  */
 static void
 btbuildCallback(Relation index,
-				HeapTuple htup,
+				ItemPointer tupleId,
 				Datum *values,
 				bool *isnull,
 				bool tupleIsAlive,
@@ -175,7 +179,7 @@ btbuildCallback(Relation index,
 
 	/* form an index tuple and point it at the heap tuple */
 	itup = index_form_tuple(RelationGetDescr(index), values, isnull);
-	itup->t_tid = htup->t_self;
+	itup->t_tid = *tupleId;
 
 	/*
 	 * insert the index tuple into the appropriate spool file for subsequent
@@ -232,6 +236,221 @@ btbuildempty(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Post vacuum, iterate over all entries in index, check if the h_tid
+ * of each entry exists and is not dead.  For specific system tables,
+ * also ensure that the key in index entry matches the corresponding
+ * attribute in the heap tuple.
+ */
+void
+_bt_validate_vacuum(Relation irel, Relation hrel, TransactionId oldest_xmin)
+{
+	BlockNumber blkno;
+	BlockNumber num_pages;
+	Buffer ibuf = InvalidBuffer;
+	Buffer hbuf = InvalidBuffer;
+	Page ipage;
+	BTPageOpaque opaque;
+	IndexTuple itup;
+	HeapTupleData htup;
+	OffsetNumber maxoff,
+			minoff,
+			offnum;
+	Oid ioid,
+		hoid;
+	bool isnull;
+
+	blkno = BTREE_METAPAGE + 1;
+	num_pages = RelationGetNumberOfBlocks(irel);
+
+	elog(LOG, "btvalidatevacuum: index %s, heap %s",
+		 RelationGetRelationName(irel), RelationGetRelationName(hrel));
+
+	for (; blkno < num_pages; blkno++)
+	{
+		ibuf = ReadBuffer(irel, blkno);
+		ipage = BufferGetPage(ibuf);
+		opaque = (BTPageOpaque) PageGetSpecialPointer(ipage);
+		if (!PageIsNew(ipage))
+			_bt_checkpage(irel, ibuf);
+		if (P_ISLEAF(opaque))
+		{
+			minoff = P_FIRSTDATAKEY(opaque);
+			maxoff = PageGetMaxOffsetNumber(ipage);
+			for (offnum = minoff;
+				 offnum <= maxoff;
+				 offnum = OffsetNumberNext(offnum))
+			{
+				itup = (IndexTuple) PageGetItem(ipage,
+												PageGetItemId(ipage, offnum));
+				ItemPointerCopy(&itup->t_tid, &htup.t_self);
+				/*
+				 * TODO: construct a tid bitmap based on index tids
+				 * and fetch heap tids in order afterwards.  That will
+				 * also allow validating if a heap tid appears twice
+				 * in a unique index.
+				 */
+				/* GPDB_84_MERGE_FIXME:
+				 * This used to use the heap_release_fetch() function, but it
+				 * was removed in the upstream, as there were no remaining
+				 * calls to it in the upstream. I replaced it with
+				 * ReleaseBuffer() + heap_fetch(). That's functionally the
+				 * same, but it loses the performance advantage of the
+				 * combined heap_release_fetch() call. If you're running with
+				 * gp_indexcheck_vacuum, I hope you're not in a hurry!
+				 *
+				 * But it might be prudent to check how significant the
+				 * performance hit is in practice, and refactor if needed.
+				 * I wonder if we really need to use heap_fetch() here.
+				 * I think a simple ReadBuffer() + PageGetItem() would be
+				 * appropriate here.
+				 *
+				 * Or we could do the TID bitmap thing mentioned in above TODO
+				 * comment.
+				 */
+				if (hbuf != InvalidBuffer)
+					ReleaseBuffer(hbuf);
+				if (!heap_fetch(hrel, SnapshotAny, &htup, &hbuf, true, NULL))
+				{
+					elog(ERROR, "btvalidatevacuum: tid (%d,%d) from index %s "
+						 "not found in heap %s",
+						 ItemPointerGetBlockNumber(&itup->t_tid),
+						 ItemPointerGetOffsetNumber(&itup->t_tid),
+						 RelationGetRelationName(irel),
+						 RelationGetRelationName(hrel));
+				}
+				switch (HeapTupleSatisfiesVacuum(hrel, &htup, oldest_xmin, hbuf))
+				{
+					case HEAPTUPLE_RECENTLY_DEAD:
+					case HEAPTUPLE_LIVE:
+					case HEAPTUPLE_INSERT_IN_PROGRESS:
+					case HEAPTUPLE_DELETE_IN_PROGRESS:
+						/* these tuples are considered alive by vacuum */
+						break;
+					case HEAPTUPLE_DEAD:
+						elog(ERROR, "btvalidatevacuum: vacuum did not remove "
+							 "dead tuple (%d,%d) from heap %s and index %s",
+							 ItemPointerGetBlockNumber(&itup->t_tid),
+							 ItemPointerGetOffsetNumber(&itup->t_tid),
+							 RelationGetRelationName(hrel),
+							 RelationGetRelationName(irel));
+						break;
+					default:
+						elog(ERROR, "btvalidatevacuum: invalid visibility");
+						break;
+				}
+				switch(RelationGetRelid(irel))
+				{
+					case DatabaseOidIndexId:
+					case TypeOidIndexId:
+					case ClassOidIndexId:
+					case ConstraintOidIndexId:
+						hoid = HeapTupleGetOid(&htup);
+						ioid = index_getattr(itup, 1, RelationGetDescr(irel), &isnull);
+						if (hoid != ioid)
+						{
+							elog(ERROR,
+								 "btvalidatevacuum: index oid(%d) != heap oid(%d)"
+								 " tuple (%d,%d) index %s", ioid, hoid,
+								 ItemPointerGetBlockNumber(&itup->t_tid),
+								 ItemPointerGetOffsetNumber(&itup->t_tid),
+								 RelationGetRelationName(irel));
+						}
+						break;
+					default:
+						break;
+				}
+				if (RelationGetNamespace(irel) == PG_AOSEGMENT_NAMESPACE)
+				{
+					int32 isegno = index_getattr(itup, 1, RelationGetDescr(irel), &isnull);
+					int32 hsegno = heap_getattr(&htup, 1, RelationGetDescr(hrel), &isnull);
+					if (isegno != hsegno)
+					{
+						elog(ERROR,
+							 "btvalidatevacuum: index segno(%d) != heap segno(%d)"
+							 " tuple (%d,%d) index %s", isegno, hsegno,
+							 ItemPointerGetBlockNumber(&itup->t_tid),
+							 ItemPointerGetOffsetNumber(&itup->t_tid),
+							 RelationGetRelationName(irel));
+					}
+				}
+			}
+		}
+		if (BufferIsValid(ibuf))
+			ReleaseBuffer(ibuf);
+	}
+	if (BufferIsValid(hbuf))
+		ReleaseBuffer(hbuf);
+}
+
+/*
+ * For a newly inserted heap tid, check if an entry with this tid
+ * already exists in a unique index.  If it does, abort the inserting
+ * transaction.
+ */
+static void
+_bt_validate_tid(Relation irel, ItemPointer h_tid)
+{
+	BlockNumber blkno;
+	BlockNumber num_pages;
+	Buffer buf;
+	Page page;
+	BTPageOpaque opaque;
+	IndexTuple itup;
+	OffsetNumber maxoff,
+			minoff,
+			offnum;
+
+	elog(DEBUG1, "validating tid (%d,%d) for index (%s)",
+		 ItemPointerGetBlockNumber(h_tid), ItemPointerGetOffsetNumber(h_tid),
+		 RelationGetRelationName(irel));
+
+	blkno = BTREE_METAPAGE + 1;
+	num_pages = RelationGetNumberOfBlocks(irel);
+
+	for (; blkno < num_pages; blkno++)
+	{
+		buf = ReadBuffer(irel, blkno);
+		page = BufferGetPage(buf);
+		opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+		if (!PageIsNew(page))
+			_bt_checkpage(irel, buf);
+		if (P_ISLEAF(opaque))
+		{
+			minoff = P_FIRSTDATAKEY(opaque);
+			maxoff = PageGetMaxOffsetNumber(page);
+			for (offnum = minoff;
+				 offnum <= maxoff;
+				 offnum = OffsetNumberNext(offnum))
+			{
+				itup = (IndexTuple) PageGetItem(page,
+												PageGetItemId(page, offnum));
+				if (ItemPointerEquals(&itup->t_tid, h_tid))
+				{
+					Form_pg_attribute key_att = RelationGetDescr(irel)->attrs[0];
+					Oid key = InvalidOid;
+					bool isnull;
+					if (key_att->atttypid == OIDOID)
+					{
+						key = DatumGetInt32(
+								index_getattr(itup, 1, RelationGetDescr(irel), &isnull));
+						elog(ERROR, "found tid (%d,%d), %s (%d) already in index (%s)",
+							 ItemPointerGetBlockNumber(h_tid), ItemPointerGetOffsetNumber(h_tid),
+							 NameStr(key_att->attname), key, RelationGetRelationName(irel));
+					}
+					else
+					{
+						elog(ERROR, "found tid (%d,%d) already in index (%s)",
+							 ItemPointerGetBlockNumber(h_tid), ItemPointerGetOffsetNumber(h_tid),
+							 RelationGetRelationName(irel));
+					}
+				}
+			}
+		}
+		ReleaseBuffer(buf);
+	}
+}
+
+/*
  *	btinsert() -- insert an index tuple into a btree.
  *
  *		Descend the tree recursively, find the appropriate location for our
@@ -248,6 +467,14 @@ btinsert(PG_FUNCTION_ARGS)
 	IndexUniqueCheck checkUnique = (IndexUniqueCheck) PG_GETARG_INT32(5);
 	bool		result;
 	IndexTuple	itup;
+
+	if (checkUnique && (
+				(gp_indexcheck_insert == INDEX_CHECK_ALL && RelationIsHeap(heapRel)) ||
+				(gp_indexcheck_insert == INDEX_CHECK_SYSTEM &&
+				 PG_CATALOG_NAMESPACE == RelationGetNamespace(heapRel))))
+	{
+		_bt_validate_tid(rel, ht_ctid);
+	}
 
 	/* generate an index tuple */
 	itup = index_form_tuple(RelationGetDescr(rel), values, isnull);
@@ -337,16 +564,31 @@ btgettuple(PG_FUNCTION_ARGS)
 }
 
 /*
- * btgetbitmap() -- gets all matching tuples, and adds them to a bitmap
+ * btgetbitmap() -- construct a TIDBitmap.
  */
 Datum
 btgetbitmap(PG_FUNCTION_ARGS)
 {
 	IndexScanDesc scan = (IndexScanDesc) PG_GETARG_POINTER(0);
-	TIDBitmap  *tbm = (TIDBitmap *) PG_GETARG_POINTER(1);
+	Node	   *n = (Node *) PG_GETARG_POINTER(1);
+	TIDBitmap  *tbm;
 	BTScanOpaque so = (BTScanOpaque) scan->opaque;
 	int64		ntids = 0;
 	ItemPointer heapTid;
+
+	if (n == NULL)
+	{
+		/* XXX should we use less than work_mem for this? */
+		tbm = tbm_create(work_mem * 1024L);
+	}
+	else if (!IsA(n, TIDBitmap))
+	{
+		elog(ERROR, "non hash bitmap");
+	}
+	else
+	{
+		tbm = (TIDBitmap *)n;
+	}
 
 	/*
 	 * If we have any array keys, initialize them.
@@ -355,7 +597,7 @@ btgetbitmap(PG_FUNCTION_ARGS)
 	{
 		/* punt if we have any unsatisfiable array keys */
 		if (so->numArrayKeys < 0)
-			PG_RETURN_INT64(ntids);
+			PG_RETURN_POINTER(tbm);
 
 		_bt_start_array_keys(scan, ForwardScanDirection);
 	}
@@ -393,7 +635,7 @@ btgetbitmap(PG_FUNCTION_ARGS)
 		/* Now see if we have more array keys to deal with */
 	} while (so->numArrayKeys && _bt_advance_array_keys(scan, ForwardScanDirection));
 
-	PG_RETURN_INT64(ntids);
+	PG_RETURN_POINTER(tbm);
 }
 
 /*

@@ -3,6 +3,8 @@
  * parse_relation.c
  *	  parser support routines dealing with relations
  *
+ * Portions Copyright (c) 2006-2008, Greenplum inc
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -20,17 +22,23 @@
 #include "access/sysattr.h"
 #include "catalog/heap.h"
 #include "catalog/namespace.h"
+#include "catalog/catalog.h"
+#include "catalog/pg_proc_callback.h"
 #include "catalog/pg_type.h"
 #include "funcapi.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/relation.h"                 /* CdbRelColumnInfo */
+#include "optimizer/pathnode.h"             /* cdb_rte_find_pseudo_column() */
 #include "parser/parsetree.h"
 #include "parser/parse_relation.h"
 #include "parser/parse_type.h"
+#include "parser/parse_coerce.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
+#include "cdb/cdbvars.h"
 
 
 static RangeTblEntry *scanNameSpaceForRefname(ParseState *pstate,
@@ -340,7 +348,10 @@ searchRangeTableForRel(ParseState *pstate, RangeVar *relation)
 				rte->ctelevelsup + levelsup == ctelevelsup &&
 				strcmp(rte->ctename, refname) == 0)
 				return rte;
-			if (strcmp(rte->eref->aliasname, refname) == 0)
+
+			if (rte->eref != NULL &&
+                rte->eref->aliasname != NULL &&
+                strcmp(rte->eref->aliasname, refname) == 0)
 				return rte;
 		}
 	}
@@ -581,12 +592,29 @@ scanRTEForColumn(ParseState *pstate, RangeTblEntry *rte, char *colname,
 	 */
 	if (rte->rtekind == RTE_RELATION)
 	{
+		/* In GPDB, system columns like gp_segment_id, ctid, xmin/xmax seem to be
+		 * ambiguous for replicated table, replica in each segment has different
+		 * value of those columns, between sessions, different replicas are choosen
+		 * to provide data, so it's weird for users to see different system columns
+		 * between sessions. So for replicated table, we don't expose system columns
+		 * unless it's GP_ROLE_UTILITY for debug purpose.
+		 */
+		if (GpPolicyIsReplicated(GpPolicyFetch(rte->relid)) &&
+			Gp_role != GP_ROLE_UTILITY)
+			return result;
+
 		/* quick check to see if name could be a system column */
 		attnum = specialAttNum(colname);
 
 		/* In constraint check, no system column is allowed except tableOid */
+		/*
+		 * In GPDB, tableoid is not allowed either, because we've removed
+		 * HeapTupleData.t_tableOid field.
+		 * GPDB_94_MERGE_FIXME: Could we make that work somehow? Resurrect
+		 * t_tableOid, maybe? I think we'd need it for logical decoding as well.
+		 */
 		if (pstate->p_expr_kind == EXPR_KIND_CHECK_CONSTRAINT &&
-			attnum < InvalidAttrNumber && attnum != TableOidAttributeNumber)
+			attnum < InvalidAttrNumber /* && attnum != TableOidAttributeNumber */)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
 					 errmsg("system column \"%s\" reference in check constraint is invalid",
@@ -595,10 +623,17 @@ scanRTEForColumn(ParseState *pstate, RangeTblEntry *rte, char *colname,
 
 		if (attnum != InvalidAttrNumber)
 		{
-			/* now check to see if column actually is defined */
+			/*
+			 * Now check to see if column actually is defined.  Because of
+			 * an ancient oversight in DefineQueryRewrite, it's possible that
+			 * pg_attribute contains entries for system columns for a view,
+			 * even though views should not have such --- so we also check
+			 * the relkind.  This kluge will not be needed in 9.3 and later.
+			 */
 			if (SearchSysCacheExists2(ATTNUM,
 									  ObjectIdGetDatum(rte->relid),
-									  Int16GetDatum(attnum)))
+									  Int16GetDatum(attnum)) &&
+				get_rel_relkind(rte->relid) != RELKIND_VIEW)
 			{
 				var = make_var(pstate, rte, attnum, location);
 				/* Require read access to the column */
@@ -941,23 +976,29 @@ chooseScalarFunctionAlias(Node *funcexpr, char *funcname,
 /*
  * Open a table during parse analysis
  *
- * This is essentially just the same as heap_openrv(), except that it caters
- * to some parser-specific error reporting needs, notably that it arranges
- * to include the RangeVar's parse location in any resulting error.
- *
- * Note: properly, lockmode should be declared LOCKMODE not int, but that
- * would require importing storage/lock.h into parse_relation.h.  Since
- * LOCKMODE is typedef'd as int anyway, that seems like overkill.
+ * This is essentially the same as CdbOpenRelationRv, except that it caters
+ * to some parser-specific error reporting needs.
  */
 Relation
-parserOpenTable(ParseState *pstate, const RangeVar *relation, int lockmode)
+parserOpenTable(ParseState *pstate, const RangeVar *relation,
+				int lockmode, bool *lockUpgraded)
 {
 	Relation	rel;
 	ParseCallbackState pcbstate;
+	Oid			relid;
 
 	setup_parser_errposition_callback(&pcbstate, pstate, relation->location);
-	rel = heap_openrv_extended(relation, lockmode, true);
-	if (rel == NULL)
+
+	/* Look up the appropriate relation using namespace search */
+	relid = RangeVarGetRelid(relation, NoLock, true);
+	/*
+	 * CdbTryOpenRelation might return NULL (for example, if the table
+	 * is dropped by another transaction). Every time we invoke function
+	 * CdbTryOpenRelation, we should check if the return value is NULL.
+	 */
+	rel = CdbTryOpenRelation(relid, lockmode, lockUpgraded);
+
+	if (!RelationIsValid(rel))
 	{
 		if (relation->schemaname)
 			ereport(ERROR,
@@ -987,6 +1028,7 @@ parserOpenTable(ParseState *pstate, const RangeVar *relation, int lockmode)
 								relation->relname)));
 		}
 	}
+
 	cancel_parser_errposition_callback(&pcbstate);
 	return rel;
 }
@@ -1009,11 +1051,47 @@ addRangeTableEntry(ParseState *pstate,
 {
 	RangeTblEntry *rte = makeNode(RangeTblEntry);
 	char	   *refname = alias ? alias->aliasname : relation->relname;
-	LOCKMODE	lockmode;
+	LOCKMODE	lockmode = AccessShareLock;
+	LockingClause *locking;
 	Relation	rel;
+	ParseCallbackState pcbstate;
 
-	rte->rtekind = RTE_RELATION;
 	rte->alias = alias;
+	rte->rtekind = RTE_RELATION;
+
+	/*
+	 * CDB: lock promotion around the locking clause is a little different
+	 * from postgres to allow for required lock promotion for distributed
+	 * AO tables.
+	 * select for update should lock the whole table, we do it here.
+	 */
+	locking = getLockedRefname(pstate, refname);
+	if (locking)
+	{
+		if (locking->strength >= LCS_FORNOKEYUPDATE)
+		{
+			Oid relid;
+
+			relid = RangeVarGetRelid(relation, lockmode, false);
+
+			rel = try_heap_open(relid, NoLock, true);
+			if (!rel)
+				elog(ERROR, "open relation(%u) fail", relid);
+
+			if (rel->rd_rel->relkind == RELKIND_MATVIEW)
+				ereport(ERROR,
+						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+								errmsg("cannot lock rows in materialized view \"%s\"",
+									   RelationGetRelationName(rel))));
+
+			lockmode = IsSystemRelation(rel) ? RowExclusiveLock : ExclusiveLock;
+			heap_close(rel, NoLock);
+		}
+		else
+		{
+			lockmode = RowShareLock;
+		}
+	}
 
 	/*
 	 * Get the rel's OID.  This access also ensures that we have an up-to-date
@@ -1021,8 +1099,9 @@ addRangeTableEntry(ParseState *pstate,
 	 * to a rel in a statement, be careful to get the right access level
 	 * depending on whether we're doing SELECT FOR UPDATE/SHARE.
 	 */
-	lockmode = isLockedRefname(pstate, refname) ? RowShareLock : AccessShareLock;
-	rel = parserOpenTable(pstate, relation, lockmode);
+	setup_parser_errposition_callback(&pcbstate, pstate, relation->location);
+	rel = parserOpenTable(pstate, relation, lockmode, NULL);
+	cancel_parser_errposition_callback(&pcbstate);
 	rte->relid = RelationGetRelid(rel);
 	rte->relkind = rel->rd_rel->relkind;
 
@@ -1212,6 +1291,7 @@ addRangeTableEntryForFunction(ParseState *pstate,
 							  bool inFromCl)
 {
 	RangeTblEntry *rte = makeNode(RangeTblEntry);
+	Oid         funcDescribe = InvalidOid;
 	Alias	   *alias = rangefunc->alias;
 	Alias	   *eref;
 	char	   *aliasname;
@@ -1270,11 +1350,130 @@ addRangeTableEntryForFunction(ParseState *pstate,
 		rtfunc->funcparams = NULL;		/* not set until planning */
 
 		/*
+		 * If the function has TABLE value expressions in its arguments then it must
+		 * be planned as a TableFunctionScan instead of a normal FunctionScan.  We
+		 * mark this here because this is where we know that the function is being
+		 * used as a RangeTableEntry.
+		 */
+		if (funcexpr && IsA(funcexpr, FuncExpr))
+		{
+			FuncExpr		*func = (FuncExpr *) funcexpr;
+
+			if (func->args && IsA(func->args, List))
+			{
+				ListCell		*arg;
+
+				foreach(arg, (List*) func->args)
+				{
+					Node *n = (Node *) lfirst(arg);
+					if (IsA(n, TableValueExpr))
+					{
+						TableValueExpr *input = (TableValueExpr *) n;
+
+						/* 
+						 * Currently only support single TABLE value expression.
+						 *
+						 * Note: this shouldn't be possible given that we don't
+						 * allow it at function creation so the function parser
+						 * should have already errored due to type mismatch.
+						 */
+						Assert(IsA(input->subquery, Query));
+						if (rte->subquery != NULL)
+							ereport(ERROR, 
+									(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+									 errmsg("functions over multiple TABLE value "
+											"expressions not supported")));
+
+						/*
+						 * Convert RTE to a TableFunctionScan over the specified
+						 * input 
+						 */
+						rte->rtekind = RTE_TABLEFUNCTION;
+						rte->subquery = (Query *) input->subquery;
+
+						/* 
+						 * Mark function as a table function so that the second pass
+						 * check, parseCheckTableFunctions(), can correctly detect
+						 * that it is a valid TABLE value expression.
+						 */
+						func->is_tablefunc = true;
+
+						/*
+						 * We do not break from the loop here because we want to
+						 * keep looping to guard against multiple TableValueExpr
+						 * arguments.
+						 */
+					}
+				}
+			}
+		}
+
+		/*
 		 * Now determine if the function returns a simple or composite type.
 		 */
 		functypclass = get_expr_result_type(funcexpr,
 											&funcrettype,
 											&tupdesc);
+
+		/*
+		 * Handle dynamic type resolution for functions with DESCRIBE callbacks.
+		 */
+		/* GPDB_94_MERGE_FIXME: What happens if you have 'coldeflist', and a DESCRIBE callback? */
+		if (functypclass == TYPEFUNC_RECORD && IsA(funcexpr, FuncExpr))
+		{
+			FuncExpr *func = (FuncExpr *) funcexpr;
+			Datum     d;
+			int       i;
+
+			Insist(TypeSupportsDescribe(funcrettype));
+
+			funcDescribe = lookupProcCallback(func->funcid, PROMETHOD_DESCRIBE);
+			if (OidIsValid(funcDescribe))
+			{
+				FmgrInfo	flinfo;
+				FunctionCallInfoData fcinfo;
+
+				/*
+				 * Describe functions have the signature  d(internal) => internal
+				 * where the parameter is the untransformed FuncExpr node and the result
+				 * is a tuple descriptor. Its context is RangeTblFunction which has
+				 * funcuserdata field to store arbitrary binary data to transport
+				 * to executor.
+				 */
+				rtfunc->funcuserdata = NULL;
+				fmgr_info(funcDescribe, &flinfo);
+				InitFunctionCallInfoData(fcinfo, &flinfo, 1, InvalidOid, (Node *) rtfunc, NULL);
+				fcinfo.arg[0] = PointerGetDatum(funcexpr);
+				fcinfo.argnull[0] = false;
+
+				d = FunctionCallInvoke(&fcinfo);
+				if (fcinfo.isnull)
+					elog(ERROR, "function %u returned NULL", flinfo.fn_oid);
+				tupdesc = (TupleDesc) DatumGetPointer(d);
+
+				/* 
+				 * Might want to improve this API so the describe method return 
+				 * value is somehow verifiable 
+				 */
+				if (tupdesc != NULL)
+				{
+					functypclass = TYPEFUNC_COMPOSITE;
+					for (i = 0; i < tupdesc->natts; i++)
+					{
+						Form_pg_attribute attr = tupdesc->attrs[i];
+
+						rtfunc->funccolnames	= lappend(rtfunc->funccolnames,
+														  makeString(pstrdup(NameStr(attr->attname))));
+						rtfunc->funccoltypes	= lappend_oid(rtfunc->funccoltypes,
+														  attr->atttypid);
+						rtfunc->funccoltypmods = lappend_int(rtfunc->funccoltypmods,
+														  attr->atttypmod);
+						rtfunc->funccolcollations = lappend_oid(rtfunc->funccolcollations,
+															 attr->attcollation);
+					}
+				}
+			}
+		}
 
 		/*
 		 * A coldeflist is required if the function returns RECORD and hasn't
@@ -1556,6 +1755,9 @@ addRangeTableEntryForJoin(ParseState *pstate,
 	rte->joinaliasvars = aliasvars;
 	rte->alias = alias;
 
+	/* transform any Vars of type UNKNOWNOID if we can */
+	fixup_unknown_vars_in_exprlist(pstate, rte->joinaliasvars);
+
 	eref = alias ? (Alias *) copyObject(alias) : makeAlias("unnamed_join", NIL);
 	numaliases = list_length(eref->colnames);
 
@@ -1700,8 +1902,8 @@ addRangeTableEntryForCTE(ParseState *pstate,
  * Note: we pay no attention to whether it's FOR UPDATE vs FOR SHARE,
  * since the table-level lock is the same either way.
  */
-bool
-isLockedRefname(ParseState *pstate, const char *refname)
+LockingClause *
+getLockedRefname(ParseState *pstate, const char *refname)
 {
 	ListCell   *l;
 
@@ -1709,8 +1911,8 @@ isLockedRefname(ParseState *pstate, const char *refname)
 	 * If we are in a subquery specified as locked FOR UPDATE/SHARE from
 	 * parent level, then act as though there's a generic FOR UPDATE here.
 	 */
-	if (pstate->p_locked_from_parent)
-		return true;
+	if (pstate->p_lockclause_from_parent)
+		return pstate->p_lockclause_from_parent;
 
 	foreach(l, pstate->p_locking_clause)
 	{
@@ -1719,7 +1921,7 @@ isLockedRefname(ParseState *pstate, const char *refname)
 		if (lc->lockedRels == NIL)
 		{
 			/* all tables used in query */
-			return true;
+			return lc;
 		}
 		else
 		{
@@ -1731,11 +1933,139 @@ isLockedRefname(ParseState *pstate, const char *refname)
 				RangeVar   *thisrel = (RangeVar *) lfirst(l2);
 
 				if (strcmp(refname, thisrel->relname) == 0)
-					return true;
+					return lc;
 			}
 		}
 	}
-	return false;
+
+	return NULL;
+}
+
+/*
+ * isSimplyUpdatableRelation
+ *
+ * The oid must reference a normal, heap relation. This disallows
+ * AO, AO/CO, external tables, views, replicated table etc.
+ *
+ * If 'noerror' is true, function returns true/false. If 'noerror'
+ * is false, throws an error if the relation is not simply updatable.
+ */
+bool
+isSimplyUpdatableRelation(Oid relid, bool noerror)
+{
+	Relation rel;
+	bool return_value = true;
+
+	if (!OidIsValid(relid))
+	{
+		if (!noerror)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("Invalid oid: %d is not simply updatable", relid)));
+		return false;
+	}
+
+	rel = relation_open(relid, AccessShareLock);
+
+	do
+	{
+		/*
+		 * This should match the error message in rewriteManip.c,
+		 * so that you get the same error as in PostgreSQL.
+		 */
+		if (rel->rd_rel->relkind == RELKIND_VIEW)
+		{
+			if (!noerror)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("WHERE CURRENT OF on a view is not implemented")));
+			return_value = false;
+			break;
+		}
+
+		if (rel->rd_rel->relkind != RELKIND_RELATION)
+		{
+			if (!noerror)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("\"%s\" is not simply updatable",
+								RelationGetRelationName(rel))));
+			return_value = false;
+			break;
+		}
+
+		if (rel->rd_rel->relstorage != RELSTORAGE_HEAP)
+		{
+			if (!noerror)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("\"%s\" is not simply updatable",
+								RelationGetRelationName(rel))));
+			return_value = false;
+			break;
+		}
+
+		/*
+		 * A row in replicated table cannot be identified by (ctid + gp_segment_id)
+		 * in all replicas, for each row replica, the gp_segment_id is different,
+		 * the ctid is also not guaranteed to be the same, so it's not simply
+		 * updateable for CURRENT OF.
+		 */
+		if (GpPolicyIsReplicated(rel->rd_cdbpolicy))
+		{
+			if (!noerror)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("\"%s\" is not simply updatable",
+								RelationGetRelationName(rel))));
+			return_value = false;
+			break;
+		}
+	} while (0);
+
+	relation_close(rel, NoLock);
+	return return_value;
+}
+
+/*
+ * extractSimplyUpdatableRTEIndex
+ *  given a range table associated with a simply updatable range table,
+ *    return the desired RangeTblEntry
+ *
+ * NOTE: The range table *MUST* belong to a simply updatable query.
+ * 
+ * The semantics of a simply updatable query demand a range table consisting
+ * of exactly one logical table. Thus, for the simple case of a one-element
+ * range table, we quickly return the index for the lone RTE.
+ * However, we must also cope with inheritance, where an RTE requesting 
+ * inheritance may have been expanded out into its child relations. In this
+ * case, we seek to return the parent RTE.
+ */
+Index
+extractSimplyUpdatableRTEIndex(List *rtable) 
+{
+	Assert(list_length(rtable) > 0);
+	if (list_length(rtable) == 1)
+		return 1;
+
+	/* 
+	 * This better be an inheritance case. 
+	 * Find the RTE with inh = true. 
+	 * Furthermore, we Insist that no other RTEs have inh = true. 
+	 */
+	Index 			temp, ret = 0;
+	ListCell        *lc;
+	foreach_with_count (lc, rtable, temp)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+		if (rte->inh)
+		{
+			Insist(ret == 0);	/* to be simply updatable, there cannot be more than 1 parent table */
+			ret = temp + 1;		/* the temp counter is zero indexed */
+		}
+	}
+	Insist(ret != 0);
+	return ret;
 }
 
 /*
@@ -1864,6 +2194,7 @@ expandRTE(RangeTblEntry *rte, int rtindex, int sublevels_up,
 				}
 			}
 			break;
+		case RTE_TABLEFUNCTION:
 		case RTE_FUNCTION:
 			{
 				/* Function RTE */
@@ -2390,6 +2721,8 @@ expandRelAttrs(ParseState *pstate, RangeTblEntry *rte,
 char *
 get_rte_attribute_name(RangeTblEntry *rte, AttrNumber attnum)
 {
+    const char *name;
+
 	if (attnum == InvalidAttrNumber)
 		return "*";
 
@@ -2399,6 +2732,19 @@ get_rte_attribute_name(RangeTblEntry *rte, AttrNumber attnum)
 	if (rte->alias &&
 		attnum > 0 && attnum <= list_length(rte->alias->colnames))
 		return strVal(list_nth(rte->alias->colnames, attnum - 1));
+
+	/*
+	 * CDB: Pseudo columns have negative attribute numbers below the
+	 * lowest system attribute number.
+	 */
+	if (attnum <= FirstLowInvalidHeapAttributeNumber)
+	{
+		CdbRelColumnInfo   *rci = cdb_rte_find_pseudo_column(rte, attnum);
+
+		if (!rci)
+			goto bogus;
+		return rci->colname;
+	}
 
 	/*
 	 * If the RTE is a relation, go to the system catalogs not the
@@ -2412,13 +2758,28 @@ get_rte_attribute_name(RangeTblEntry *rte, AttrNumber attnum)
 	/*
 	 * Otherwise use the column name from eref.  There should always be one.
 	 */
-	if (attnum > 0 && attnum <= list_length(rte->eref->colnames))
+	if (rte->eref != NULL &&
+        attnum > 0 &&
+        attnum <= list_length(rte->eref->colnames))
 		return strVal(list_nth(rte->eref->colnames, attnum - 1));
 
+    /* CDB: Get name of sysattr even if relid is no good (e.g. SubqueryScan) */
+    if (attnum < 0 &&
+        attnum > FirstLowInvalidHeapAttributeNumber)
+    {
+		Form_pg_attribute att_tup = SystemAttributeDefinition(attnum, true);
+
+		return NameStr(att_tup->attname);
+    }
+
+bogus:
 	/* else caller gave us a bogus attnum */
-	elog(ERROR, "invalid attnum %d for rangetable entry %s",
-		 attnum, rte->eref->aliasname);
-	return NULL;				/* keep compiler quiet */
+    name = (rte->eref && rte->eref->aliasname) ? rte->eref->aliasname
+                                               : "*BOGUS*";
+    ereport(WARNING, (errcode(ERRCODE_INTERNAL_ERROR),
+                      errmsg_internal("invalid attnum %d for rangetable entry %s",
+                                      attnum, name) ));
+	return "*BOGUS*";
 }
 
 /*
@@ -2475,6 +2836,7 @@ get_rte_attribute_type(RangeTblEntry *rte, AttrNumber attnum,
 				*varcollid = exprCollation((Node *) te->expr);
 			}
 			break;
+		case RTE_TABLEFUNCTION:
 		case RTE_FUNCTION:
 			{
 				/* Function RTE */
@@ -2674,6 +3036,7 @@ get_rte_attribute_is_dropped(RangeTblEntry *rte, AttrNumber attnum)
 				result = (aliasvar == NULL);
 			}
 			break;
+		case RTE_TABLEFUNCTION:
 		case RTE_FUNCTION:
 			{
 				/* Function RTE */

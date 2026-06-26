@@ -7,6 +7,8 @@
  *	  pg_shadow and pg_group are now publicly accessible views on pg_authid.
  *
  *
+ * Portions Copyright (c) 2006-2010, Greenplum inc.
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -24,7 +26,7 @@
 #include "catalog/genbki.h"
 
 /*
- * The CATALOG definition has to refer to the type of rolvaliduntil as
+ * The CATALOG definition has to refer to the type of "rolvaliduntil" as
  * "timestamptz" (lower case) so that bootstrap mode recognizes it.  But
  * the C header files define this type as TimestampTz.  Since the field is
  * potentially-null and therefore can't be accessed directly from C code,
@@ -57,7 +59,17 @@ CATALOG(pg_authid,1260) BKI_SHARED_RELATION BKI_ROWTYPE_OID(2842) BKI_SCHEMA_MAC
 	/* remaining fields may be null; use heap_getattr to read them! */
 	text		rolpassword;	/* password, if any */
 	timestamptz rolvaliduntil;	/* password expiration time, if any */
+	/* GP added fields */
+	Oid			rolresqueue;	/* ID of resource queue for this role */
+	bool		rolcreaterextgpfd;	/* allowed to create readable gpfdist tbl?  */
+	bool		rolcreaterexthttp;	/* allowed to create readable http tbl?  */
+	bool		rolcreatewextgpfd;	/* allowed to create writable gpfdist tbl?  */
+	Oid			rolresgroup;		/* ID of resource group for this role  */
 } FormData_pg_authid;
+
+/* GPDB added foreign key definitions for gpcheckcat. */
+FOREIGN_KEY(rolresqueue REFERENCES pg_resqueue(oid));
+FOREIGN_KEY(rolresgroup REFERENCES pg_resgroup(oid));
 
 #undef timestamptz
 
@@ -69,31 +81,40 @@ CATALOG(pg_authid,1260) BKI_SHARED_RELATION BKI_ROWTYPE_OID(2842) BKI_SCHEMA_MAC
  */
 typedef FormData_pg_authid *Form_pg_authid;
 
+
 /* ----------------
  *		compiler constants for pg_authid
  * ----------------
  */
-#define Natts_pg_authid					11
-#define Anum_pg_authid_rolname			1
-#define Anum_pg_authid_rolsuper			2
-#define Anum_pg_authid_rolinherit		3
-#define Anum_pg_authid_rolcreaterole	4
-#define Anum_pg_authid_rolcreatedb		5
-#define Anum_pg_authid_rolcatupdate		6
-#define Anum_pg_authid_rolcanlogin		7
-#define Anum_pg_authid_rolreplication	8
-#define Anum_pg_authid_rolconnlimit		9
-#define Anum_pg_authid_rolpassword		10
-#define Anum_pg_authid_rolvaliduntil	11
+#define Natts_pg_authid						16
+#define Anum_pg_authid_rolname				1
+#define Anum_pg_authid_rolsuper				2
+#define Anum_pg_authid_rolinherit			3
+#define Anum_pg_authid_rolcreaterole		4
+#define Anum_pg_authid_rolcreatedb			5
+#define Anum_pg_authid_rolcatupdate			6
+#define Anum_pg_authid_rolcanlogin			7
+#define Anum_pg_authid_rolreplication		8
+#define Anum_pg_authid_rolconnlimit			9
+#define Anum_pg_authid_rolpassword			10
+#define Anum_pg_authid_rolvaliduntil		11
+#define Anum_pg_authid_rolresqueue			12
+#define Anum_pg_authid_rolcreaterextgpfd	13
+#define Anum_pg_authid_rolcreaterexthttp	14
+#define Anum_pg_authid_rolcreatewextgpfd	15
+#define Anum_pg_authid_rolresgroup			16
 
 /* ----------------
  *		initial contents of pg_authid
  *
  * The uppercase quantities will be replaced at initdb time with
  * user choices.
+ *
+ * add default queue DEFAULTRESQUEUE_OID 6055
+ * add default group ADMINRESGROUP_OID 6438
  * ----------------
  */
-DATA(insert OID = 10 ( "POSTGRES" t t t t t t t -1 _null_ _null_ ));
+DATA(insert OID = 10 ( "POSTGRES" t t t t t t t -1 _null_ _null_ 6055 t t t 6438 ));
 
 #define BOOTSTRAP_SUPERUSERID 10
 
