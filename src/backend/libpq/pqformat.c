@@ -357,7 +357,7 @@ pq_endmessage(StringInfo buf)
 void
 pq_begintypsend(StringInfo buf)
 {
-	initStringInfo(buf);
+	initStringInfoOfSize(buf, 16);
 	/* Reserve four bytes for the bytea length word */
 	appendStringInfoCharMacro(buf, '\0');
 	appendStringInfoCharMacro(buf, '\0');

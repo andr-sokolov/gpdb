@@ -76,6 +76,11 @@ lnext:
 		HTSU_Result test;
 		HeapTuple	copyTuple;
 
+		/* CDB: CTIDs were not fetched for distributed relation. */
+		if (erm->markType == ROW_MARK_TABLE_EXCLUSIVE ||
+			erm->markType == ROW_MARK_TABLE_SHARE)
+			continue;
+
 		/* clear any leftover test tuple for this rel */
 		if (node->lr_epqstate.estate != NULL)
 			EvalPlanQualSetTuple(&node->lr_epqstate, erm->rti, NULL);
@@ -133,7 +138,8 @@ lnext:
 
 		test = heap_lock_tuple(erm->relation, &tuple,
 							   estate->es_output_cid,
-							   lockmode, erm->noWait, true,
+							   lockmode,
+							   (erm->noWait ? LockTupleNoWait : LockTupleWait), true,
 							   &buffer, &hufd);
 		ReleaseBuffer(buffer);
 		switch (test)
@@ -163,6 +169,11 @@ lnext:
 					ereport(ERROR,
 							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 							 errmsg("could not serialize access due to concurrent update")));
+				if (ItemPointerIndicatesMovedPartitions(&hufd.ctid))
+					ereport(ERROR,
+							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+							 errmsg("tuple to be locked was already moved to another segment due to concurrent update")));
+
 				if (ItemPointerEquals(&hufd.ctid, &tuple.t_self))
 				{
 					/* Tuple was deleted, so don't return it */

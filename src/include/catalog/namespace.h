@@ -17,7 +17,6 @@
 #include "nodes/primnodes.h"
 #include "storage/lock.h"
 
-
 /*
  *	This structure holds a list of possible functions or operators
  *	found by namespace lookup.  Each function/operator is identified
@@ -52,6 +51,7 @@ typedef void (*RangeVarGetRelidCallback) (const RangeVar *relation, Oid relId,
 
 #define RangeVarGetRelid(relation, lockmode, missing_ok) \
 	RangeVarGetRelidExtended(relation, lockmode, missing_ok, false, NULL, NULL)
+
 
 extern Oid RangeVarGetRelidExtended(const RangeVar *relation,
 						 LOCKMODE lockmode, bool missing_ok, bool nowait,
@@ -111,6 +111,12 @@ extern void DeconstructQualifiedName(List *names,
 extern Oid	LookupNamespaceNoError(const char *nspname);
 extern Oid	LookupExplicitNamespace(const char *nspname, bool missing_ok);
 extern Oid	get_namespace_oid(const char *nspname, bool missing_ok);
+
+extern void DropTempTableNamespaceForResetSession(Oid namespaceOid);
+extern void SetTempNamespace(Oid namespaceOid, Oid toastNamespaceOid);
+extern Oid  ResetTempNamespace(void);
+extern bool TempNamespaceOidIsValid(void);  /* GPDB only:  used by cdbgang.c */
+extern void InitTempTableNamespace(void);
 
 extern Oid	LookupCreationNamespace(const char *nspname);
 extern void CheckSetNamespace(Oid oldNspOid, Oid nspOid, Oid classid,

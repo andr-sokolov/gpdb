@@ -38,6 +38,11 @@ CATALOG(pg_ts_template,3764)
 	regproc		tmpllexize;		/* base method of dictionary */
 } FormData_pg_ts_template;
 
+/* GPDB added foreign key definitions for gpcheckcat. */
+FOREIGN_KEY(tmplnamespace REFERENCES pg_namespace(oid));
+FOREIGN_KEY(tmplinit REFERENCES pg_proc(oid));
+FOREIGN_KEY(tmpllexize REFERENCES pg_proc(oid));
+
 typedef FormData_pg_ts_template *Form_pg_ts_template;
 
 /* ----------------

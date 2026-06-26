@@ -79,4 +79,6 @@ extern Oid LookupFuncNameTypeNames(List *funcname, List *argtypes,
 extern Oid LookupAggNameTypeNames(List *aggname, List *argtypes,
 					   bool noError);
 
+extern void parseCheckTableFunctions(ParseState *pstate, Query *qry);
+
 #endif   /* PARSE_FUNC_H */

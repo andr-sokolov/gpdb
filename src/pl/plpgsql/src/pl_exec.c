@@ -22,6 +22,7 @@
 #include "access/tupconvert.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
+#include "cdb/cdbvars.h"
 #include "executor/spi.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -189,7 +190,7 @@ static Datum exec_eval_expr(PLpgSQL_execstate *estate,
 			   bool *isNull,
 			   Oid *rettype);
 static int exec_run_select(PLpgSQL_execstate *estate,
-				PLpgSQL_expr *expr, long maxtuples, Portal *portalP);
+				PLpgSQL_expr *expr, int64 maxtuples, Portal *portalP);
 static int exec_for_query(PLpgSQL_execstate *estate, PLpgSQL_stmt_forq *stmt,
 			   Portal portal, bool prefetch_ok);
 static ParamListInfo setup_param_list(PLpgSQL_execstate *estate,
@@ -1565,8 +1566,8 @@ exec_stmt_getdiag(PLpgSQL_execstate *estate, PLpgSQL_stmt_getdiag *stmt)
 		{
 			case PLPGSQL_GETDIAG_ROW_COUNT:
 				exec_assign_value(estate, var,
-								  UInt32GetDatum(estate->eval_processed),
-								  INT4OID, &isnull);
+								  UInt64GetDatum(estate->eval_processed),
+								  INT8OID, &isnull);
 				break;
 
 			case PLPGSQL_GETDIAG_RESULT_OID:
@@ -2164,7 +2165,7 @@ exec_stmt_forc(PLpgSQL_execstate *estate, PLpgSQL_stmt_forc *stmt)
 	Assert(query);
 
 	if (query->plan == NULL)
-		exec_prepare_plan(estate, query, curvar->cursor_options);
+		exec_prepare_plan(estate, query, curvar->cursor_options | CURSOR_OPT_UPDATABLE);
 
 	/*
 	 * Set up ParamListInfo (hook function and possibly data values)
@@ -3236,14 +3237,17 @@ exec_prepare_plan(PLpgSQL_execstate *estate,
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("cannot COPY to/from client in PL/pgSQL")));
+				break;
 			case SPI_ERROR_TRANSACTION:
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("cannot begin/end transactions in PL/pgSQL"),
 						 errhint("Use a BEGIN block with an EXCEPTION clause instead.")));
+				break;
 			default:
 				elog(ERROR, "SPI_prepare_params failed for \"%s\": %s",
 					 expr->query, SPI_result_code_string(SPI_result));
+				break;
 		}
 	}
 	SPI_keepplan(plan);
@@ -3263,7 +3267,7 @@ exec_stmt_execsql(PLpgSQL_execstate *estate,
 				  PLpgSQL_stmt_execsql *stmt)
 {
 	ParamListInfo paramLI;
-	long		tcount;
+	int64		tcount;
 	int			rc;
 	PLpgSQL_expr *expr = stmt->sqlstmt;
 
@@ -3332,13 +3336,19 @@ exec_stmt_execsql(PLpgSQL_execstate *estate,
 
 	/*
 	 * Check for error, and set FOUND if appropriate (for historical reasons
-	 * we set FOUND only for certain query types).  Also Assert that we
-	 * identified the statement type the same as SPI did.
+	 * we set FOUND only for certain query types).
+	 *
+	 * Note: the command type indicated by return code might not match
+	 * mod_stmt, if there is an INSTEAD OF rule rewriting an UPDATE into an
+	 * INSERT, for example. In that case, the INSERT doesn't have canSetTag
+	 * set, mod_stmt is false, and SPI_execute_plan sets SPI_processed to
+	 * zero. We'll set FOUND to false here in that case. If the statement is
+	 * rewritten into a utility statement, however, FOUND is left unchanged.
+	 * Arguably that's a bug, but changing it now could break applications.
 	 */
 	switch (rc)
 	{
 		case SPI_OK_SELECT:
-			Assert(!stmt->mod_stmt);
 			exec_set_found(estate, (SPI_processed != 0));
 			break;
 
@@ -3348,13 +3358,11 @@ exec_stmt_execsql(PLpgSQL_execstate *estate,
 		case SPI_OK_INSERT_RETURNING:
 		case SPI_OK_UPDATE_RETURNING:
 		case SPI_OK_DELETE_RETURNING:
-			Assert(stmt->mod_stmt);
 			exec_set_found(estate, (SPI_processed != 0));
 			break;
 
 		case SPI_OK_SELINTO:
 		case SPI_OK_UTILITY:
-			Assert(!stmt->mod_stmt);
 			break;
 
 		case SPI_OK_REWRITTEN:
@@ -3373,15 +3381,18 @@ exec_stmt_execsql(PLpgSQL_execstate *estate,
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("cannot COPY to/from client in PL/pgSQL")));
+			break;
 		case SPI_ERROR_TRANSACTION:
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("cannot begin/end transactions in PL/pgSQL"),
 			errhint("Use a BEGIN block with an EXCEPTION clause instead.")));
+			break;
 
 		default:
 			elog(ERROR, "SPI_execute_plan_with_paramlist failed executing query \"%s\": %s",
 				 expr->query, SPI_result_code_string(rc));
+			break;
 	}
 
 	/* All variants should save result info for GET DIAGNOSTICS */
@@ -3392,7 +3403,7 @@ exec_stmt_execsql(PLpgSQL_execstate *estate,
 	if (stmt->into)
 	{
 		SPITupleTable *tuptab = SPI_tuptable;
-		uint32		n = SPI_processed;
+		uint64		n = SPI_processed;
 		PLpgSQL_rec *rec = NULL;
 		PLpgSQL_row *row = NULL;
 
@@ -3564,11 +3575,13 @@ exec_stmt_dynexecute(PLpgSQL_execstate *estate,
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("cannot COPY to/from client in PL/pgSQL")));
+			break;
 		case SPI_ERROR_TRANSACTION:
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("cannot begin/end transactions in PL/pgSQL"),
 			errhint("Use a BEGIN block with an EXCEPTION clause instead.")));
+			break;
 
 		default:
 			elog(ERROR, "SPI_execute failed executing query \"%s\": %s",
@@ -3584,7 +3597,7 @@ exec_stmt_dynexecute(PLpgSQL_execstate *estate,
 	if (stmt->into)
 	{
 		SPITupleTable *tuptab = SPI_tuptable;
-		uint32		n = SPI_processed;
+		uint64		n = SPI_processed;
 		PLpgSQL_rec *rec = NULL;
 		PLpgSQL_row *row = NULL;
 
@@ -3742,7 +3755,7 @@ exec_stmt_open(PLpgSQL_execstate *estate, PLpgSQL_stmt_open *stmt)
 		 */
 		query = stmt->query;
 		if (query->plan == NULL)
-			exec_prepare_plan(estate, query, stmt->cursor_options);
+			exec_prepare_plan(estate, query, stmt->cursor_options | CURSOR_OPT_UPDATABLE);
 	}
 	else if (stmt->dynquery != NULL)
 	{
@@ -3754,7 +3767,7 @@ exec_stmt_open(PLpgSQL_execstate *estate, PLpgSQL_stmt_open *stmt)
 										   stmt->dynquery,
 										   stmt->params,
 										   curname,
-										   stmt->cursor_options);
+										   stmt->cursor_options | CURSOR_OPT_UPDATABLE);
 
 		/*
 		 * If cursor variable was NULL, store the generated portal name in it
@@ -3810,7 +3823,7 @@ exec_stmt_open(PLpgSQL_execstate *estate, PLpgSQL_stmt_open *stmt)
 
 		query = curvar->cursor_explicit_expr;
 		if (query->plan == NULL)
-			exec_prepare_plan(estate, query, curvar->cursor_options);
+			exec_prepare_plan(estate, query, curvar->cursor_options | CURSOR_OPT_UPDATABLE);
 	}
 
 	/*
@@ -4338,6 +4351,13 @@ exec_assign_value(PLpgSQL_execstate *estate,
 						exec_eval_integer(estate,
 										  subscripts[nsubscripts - 1 - i],
 										  &subisnull);
+
+					if (estate->eval_tuptable != NULL)
+					{
+						SPI_freetuptable(estate->eval_tuptable);
+						estate->eval_tuptable = NULL;
+					}
+
 					if (subisnull)
 						ereport(ERROR,
 								(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
@@ -4851,7 +4871,7 @@ exec_eval_expr(PLpgSQL_execstate *estate,
  */
 static int
 exec_run_select(PLpgSQL_execstate *estate,
-				PLpgSQL_expr *expr, long maxtuples, Portal *portalP)
+				PLpgSQL_expr *expr, int64 maxtuples, Portal *portalP)
 {
 	ParamListInfo paramLI;
 	int			rc;
@@ -5581,7 +5601,6 @@ get_tuple_from_datum(Datum value)
 	/* Build a temporary HeapTuple control structure */
 	tmptup.t_len = HeapTupleHeaderGetDatumLength(td);
 	ItemPointerSetInvalid(&(tmptup.t_self));
-	tmptup.t_tableOid = InvalidOid;
 	tmptup.t_data = td;
 
 	/* Build a copy and return it */
@@ -5637,7 +5656,6 @@ exec_move_row_from_datum(PLpgSQL_execstate *estate,
 	/* Build a temporary HeapTuple control structure */
 	tmptup.t_len = HeapTupleHeaderGetDatumLength(td);
 	ItemPointerSetInvalid(&(tmptup.t_self));
-	tmptup.t_tableOid = InvalidOid;
 	tmptup.t_data = td;
 
 	/* Do the move */

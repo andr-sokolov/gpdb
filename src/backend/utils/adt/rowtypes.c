@@ -150,10 +150,13 @@ record_in(PG_FUNCTION_ARGS)
 	while (*ptr && isspace((unsigned char) *ptr))
 		ptr++;
 	if (*ptr++ != '(')
+	{
+		ReleaseTupleDesc(tupdesc);
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				 errmsg("malformed record literal: \"%s\"", string),
 				 errdetail("Missing left parenthesis.")));
+	}
 
 	initStringInfo(&buf);
 
@@ -177,11 +180,14 @@ record_in(PG_FUNCTION_ARGS)
 			if (*ptr == ',')
 				ptr++;
 			else
+			{
+				ReleaseTupleDesc(tupdesc);
 				/* *ptr must be ')' */
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 						 errmsg("malformed record literal: \"%s\"", string),
 						 errdetail("Too few columns.")));
+			}
 		}
 
 		/* Check for null: completely empty input means null */
@@ -201,19 +207,25 @@ record_in(PG_FUNCTION_ARGS)
 				char		ch = *ptr++;
 
 				if (ch == '\0')
+				{
+					ReleaseTupleDesc(tupdesc);
 					ereport(ERROR,
 							(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 							 errmsg("malformed record literal: \"%s\"",
 									string),
 							 errdetail("Unexpected end of input.")));
+				}
 				if (ch == '\\')
 				{
 					if (*ptr == '\0')
+					{
+						ReleaseTupleDesc(tupdesc);
 						ereport(ERROR,
 								(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 								 errmsg("malformed record literal: \"%s\"",
 										string),
 								 errdetail("Unexpected end of input.")));
+					}
 					appendStringInfoChar(&buf, *ptr++);
 				}
 				else if (ch == '\"')
@@ -261,18 +273,24 @@ record_in(PG_FUNCTION_ARGS)
 	}
 
 	if (*ptr++ != ')')
+	{
+		ReleaseTupleDesc(tupdesc);
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				 errmsg("malformed record literal: \"%s\"", string),
 				 errdetail("Too many columns.")));
+	}
 	/* Allow trailing whitespace */
 	while (*ptr && isspace((unsigned char) *ptr))
 		ptr++;
 	if (*ptr)
+	{
+		ReleaseTupleDesc(tupdesc);
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				 errmsg("malformed record literal: \"%s\"", string),
 				 errdetail("Junk after right parenthesis.")));
+	}
 
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 
@@ -323,7 +341,6 @@ record_out(PG_FUNCTION_ARGS)
 	/* Build a temporary HeapTuple control structure */
 	tuple.t_len = HeapTupleHeaderGetDatumLength(rec);
 	ItemPointerSetInvalid(&(tuple.t_self));
-	tuple.t_tableOid = InvalidOid;
 	tuple.t_data = rec;
 
 	/*
@@ -668,7 +685,6 @@ record_send(PG_FUNCTION_ARGS)
 	/* Build a temporary HeapTuple control structure */
 	tuple.t_len = HeapTupleHeaderGetDatumLength(rec);
 	ItemPointerSetInvalid(&(tuple.t_self));
-	tuple.t_tableOid = InvalidOid;
 	tuple.t_data = rec;
 
 	/*
@@ -817,11 +833,9 @@ record_cmp(FunctionCallInfo fcinfo)
 	/* Build temporary HeapTuple control structures */
 	tuple1.t_len = HeapTupleHeaderGetDatumLength(record1);
 	ItemPointerSetInvalid(&(tuple1.t_self));
-	tuple1.t_tableOid = InvalidOid;
 	tuple1.t_data = record1;
 	tuple2.t_len = HeapTupleHeaderGetDatumLength(record2);
 	ItemPointerSetInvalid(&(tuple2.t_self));
-	tuple2.t_tableOid = InvalidOid;
 	tuple2.t_data = record2;
 
 	/*
@@ -1055,11 +1069,9 @@ record_eq(PG_FUNCTION_ARGS)
 	/* Build temporary HeapTuple control structures */
 	tuple1.t_len = HeapTupleHeaderGetDatumLength(record1);
 	ItemPointerSetInvalid(&(tuple1.t_self));
-	tuple1.t_tableOid = InvalidOid;
 	tuple1.t_data = record1;
 	tuple2.t_len = HeapTupleHeaderGetDatumLength(record2);
 	ItemPointerSetInvalid(&(tuple2.t_self));
-	tuple2.t_tableOid = InvalidOid;
 	tuple2.t_data = record2;
 
 	/*
@@ -1314,11 +1326,15 @@ record_image_cmp(FunctionCallInfo fcinfo)
 	/* Build temporary HeapTuple control structures */
 	tuple1.t_len = HeapTupleHeaderGetDatumLength(record1);
 	ItemPointerSetInvalid(&(tuple1.t_self));
+#if 0
 	tuple1.t_tableOid = InvalidOid;
+#endif
 	tuple1.t_data = record1;
 	tuple2.t_len = HeapTupleHeaderGetDatumLength(record2);
 	ItemPointerSetInvalid(&(tuple2.t_self));
+#if 0
 	tuple2.t_tableOid = InvalidOid;
+#endif
 	tuple2.t_data = record2;
 
 	/*
@@ -1593,11 +1609,15 @@ record_image_eq(PG_FUNCTION_ARGS)
 	/* Build temporary HeapTuple control structures */
 	tuple1.t_len = HeapTupleHeaderGetDatumLength(record1);
 	ItemPointerSetInvalid(&(tuple1.t_self));
+#if 0
 	tuple1.t_tableOid = InvalidOid;
+#endif
 	tuple1.t_data = record1;
 	tuple2.t_len = HeapTupleHeaderGetDatumLength(record2);
 	ItemPointerSetInvalid(&(tuple2.t_self));
+#if 0
 	tuple2.t_tableOid = InvalidOid;
+#endif
 	tuple2.t_data = record2;
 
 	/*

@@ -8,8 +8,9 @@ subdir = src/backend/utils
 top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
-OBJS        = fmgrtab.o
-SUBDIRS     = adt cache error fmgr hash init mb misc mmgr resowner sort time
+OBJS        = fmgrtab.o session_state.o
+SUBDIRS     = adt cache error fmgr gdd hash init mb misc mmgr resowner \
+			   resgroup resscheduler sort time gpmon gp workfile_manager resource_manager hyperloglog
 
 # location of Catalog.pm
 catalogdir  = $(top_srcdir)/src/backend/catalog
@@ -24,8 +25,11 @@ $(SUBDIRS:%=%-recursive): fmgroids.h
 fmgroids.h: fmgrtab.c
 	touch $@
 
-fmgrtab.c: Gen_fmgrtab.pl $(catalogdir)/Catalog.pm $(top_srcdir)/src/include/catalog/pg_proc.h
-	$(PERL) -I $(catalogdir) $< $(top_srcdir)/src/include/catalog/pg_proc.h
+pg_proc_combined.h: $(catalogdir)/Catalog.pm $(top_srcdir)/src/include/catalog/pg_proc.h $(top_srcdir)/src/include/catalog/pg_proc_gp.h
+	cat $^ > $@
+
+fmgrtab.c: Gen_fmgrtab.pl pg_proc_combined.h
+	$(PERL) -I $(catalogdir) $< pg_proc_combined.h
 
 errcodes.h: $(top_srcdir)/src/backend/utils/errcodes.txt generate-errcodes.pl
 	$(PERL) $(srcdir)/generate-errcodes.pl $< > $@
@@ -48,6 +52,7 @@ endif
 # are not cleaned here.
 clean:
 	rm -f probes.h
+	rm -f pg_proc_combined.h
 
 maintainer-clean: clean
 	rm -f fmgroids.h fmgrtab.c errcodes.h

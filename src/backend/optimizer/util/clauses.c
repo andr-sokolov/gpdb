@@ -3,6 +3,8 @@
  * clauses.c
  *	  routines to manipulate qualification clauses
  *
+ * Portions Copyright (c) 2005-2008, Greenplum inc
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -65,6 +67,10 @@ typedef struct
 	List	   *active_fns;
 	Node	   *case_val;
 	bool		estimate;
+	bool		eval_stable_functions;
+	bool		recurse_queries; /* recurse into query structures */
+	bool		recurse_sublink_testexpr; /* recurse into sublink test expressions */
+	Size        max_size; /* max constant binary size in bytes, 0: no restrictions */
 } eval_const_expressions_context;
 
 typedef struct
@@ -117,6 +123,7 @@ static Expr *simplify_function(Oid funcid,
 				  Oid result_collid, Oid input_collid, List **args_p,
 				  bool funcvariadic, bool process_args, bool allow_non_const,
 				  eval_const_expressions_context *context);
+static bool large_const(Expr *expr, Size max_size);
 static List *expand_function_arguments(List *args, Oid result_type,
 						  HeapTuple func_tuple);
 static List *reorder_function_arguments(List *args, HeapTuple func_tuple);
@@ -139,14 +146,17 @@ static Node *substitute_actual_parameters(Node *expr, int nargs, List *args,
 static Node *substitute_actual_parameters_mutator(Node *node,
 							  substitute_actual_parameters_context *context);
 static void sql_inline_error_callback(void *arg);
-static Expr *evaluate_expr(Expr *expr, Oid result_type, int32 result_typmod,
-			  Oid result_collation);
 static Query *substitute_actual_srf_parameters(Query *expr,
 								 int nargs, List *args);
 static Node *substitute_actual_srf_parameters_mutator(Node *node,
 						  substitute_actual_srf_parameters_context *context);
 static bool tlist_matches_coltypelist(List *tlist, List *coltypelist);
+static bool contain_grouping_clause_walker(Node *node, void *context);
 
+/*
+ * Greenplum specific functions
+ */
+static bool should_eval_stable_functions(PlannerInfo *root);
 
 /*****************************************************************************
  *		OPERATOR clause functions
@@ -206,6 +216,38 @@ Node *
 get_rightop(const Expr *clause)
 {
 	const OpExpr *expr = (const OpExpr *) clause;
+
+	if (list_length(expr->args) >= 2)
+		return lsecond(expr->args);
+	else
+		return NULL;
+}
+
+/*
+ * get_leftscalararrayop
+ *
+ * Returns the left operand of a clause of the form (scalar op ANY/ALL (array))
+ */
+Node *
+get_leftscalararrayop(const Expr *clause)
+{
+	const ScalarArrayOpExpr *expr = (const ScalarArrayOpExpr *) clause;
+
+	if (expr->args != NIL)
+		return linitial(expr->args);
+	else
+		return NULL;
+}
+
+/*
+ * get_rightscalararrayop
+ *
+ * Returns the right operand in a clause of the form (scalar op ANY/ALL (array)).
+ */
+Node *
+get_rightscalararrayop(const Expr *clause)
+{
+	const ScalarArrayOpExpr *expr = (const ScalarArrayOpExpr *) clause;
 
 	if (list_length(expr->args) >= 2)
 		return lsecond(expr->args);
@@ -381,6 +423,12 @@ make_ands_implicit(Expr *clause)
 			 !((Const *) clause)->constisnull &&
 			 DatumGetBool(((Const *) clause)->constvalue))
 		return NIL;				/* constant TRUE input -> NIL list */
+	else if (IsA(clause, List))
+	{
+		/* already a list */
+		Assert(list_length((List *) clause) == 0 || !IsA(list_nth((List *) clause, 0), List));
+		return (List *) clause;
+	}
 	else
 		return list_make1(clause);
 }
@@ -392,7 +440,7 @@ make_ands_implicit(Expr *clause)
 
 /*
  * contain_agg_clause
- *	  Recursively search for Aggref nodes within a clause.
+ *	  Recursively search for Aggref nodes, GroupId, GroupingFunc within a clause.
  *
  *	  Returns true if any aggregate found.
  *
@@ -419,6 +467,10 @@ contain_agg_clause_walker(Node *node, void *context)
 		Assert(((Aggref *) node)->agglevelsup == 0);
 		return true;			/* abort the tree traversal and return true */
 	}
+
+	if (IsA(node, GroupId) || IsA(node, GroupingFunc))
+		return true;
+
 	Assert(!IsA(node, SubLink));
 	return expression_tree_walker(node, contain_agg_clause_walker, context);
 }
@@ -465,6 +517,9 @@ count_agg_clauses_walker(Node *node, count_agg_clauses_context *context)
 		Form_pg_aggregate aggform;
 		Oid			aggtransfn;
 		Oid			aggfinalfn;
+		Oid			aggcombinefn;
+		Oid			aggserialfn;
+		Oid			aggdeserialfn;
 		Oid			aggtranstype;
 		int32		aggtransspace;
 		QualCost	argcosts;
@@ -486,6 +541,9 @@ count_agg_clauses_walker(Node *node, count_agg_clauses_context *context)
 		aggform = (Form_pg_aggregate) GETSTRUCT(aggTuple);
 		aggtransfn = aggform->aggtransfn;
 		aggfinalfn = aggform->aggfinalfn;
+		aggcombinefn = aggform->aggcombinefn;
+		aggserialfn = aggform->aggserialfn;
+		aggdeserialfn = aggform->aggdeserialfn;
 		aggtranstype = aggform->aggtranstype;
 		aggtransspace = aggform->aggtransspace;
 		ReleaseSysCache(aggTuple);
@@ -494,6 +552,47 @@ count_agg_clauses_walker(Node *node, count_agg_clauses_context *context)
 		costs->numAggs++;
 		if (aggref->aggorder != NIL || aggref->aggdistinct != NIL)
 			costs->numOrderedAggs++;
+
+		/*
+		 * The PostgreSQL 'numOrderedAggs' field includes DISTINCT aggregates,
+		 * too, but cdbgroup.c handles DISTINCT aggregates differently, and
+		 * needs to know if there are any purely ordered aggs, not counting
+		 * DISTINCT aggs.
+		 */
+		if (aggref->aggorder != NIL)
+			costs->numPureOrderedAggs++;
+
+		if (aggref->aggdistinct != NIL)
+		{
+			ListCell *lc;
+
+			foreach(lc, aggref->args)
+			{
+				TargetEntry *tle = (TargetEntry *) lfirst(lc);
+
+				if ( !list_member(costs->dqaArgs, tle->expr) )
+					costs->dqaArgs = lappend(costs->dqaArgs, tle->expr);
+			}
+		}
+
+		/*
+		 * If there is no combine function, then partial aggregation is
+		 * not possible. (Note: This is slightly different from the hasNonPartial
+		 * flag in upstream: hasNonPartial is set to 'false', also when there are
+		 * any distinct aggregates, but hasNonCombine is strictly about whether
+		 * every aggregate has a combine function.
+		 */
+		if (!OidIsValid(aggcombinefn))
+			costs->hasNonCombine = true; /* Nope! */
+
+		/*
+		 * If we have any aggs with transtype INTERNAL then we must check
+		 * whether they have serialization/deserialization functions; if
+		 * not, we can't serialize partial-aggregation results.
+		 */
+		if (aggtranstype == INTERNALOID &&
+				 (!OidIsValid(aggserialfn) || !OidIsValid(aggdeserialfn)))
+			costs->hasNonSerial = true;
 
 		/* add component function execution costs to appropriate totals */
 		costs->transCost.per_tuple += get_func_cost(aggtransfn) * cpu_operator_cost;
@@ -592,6 +691,17 @@ count_agg_clauses_walker(Node *node, count_agg_clauses_context *context)
 			else
 				costs->transitionSpace += ALLOCSET_DEFAULT_INITSIZE;
 		}
+
+		/*
+		 * Complain if the aggregate's arguments contain any aggregates;
+		 * nested agg functions are semantically nonsensical.  Aggregates in
+		 * the FILTER clause are detected in transformAggregateCall().
+		 */
+		if (contain_agg_clause((Node *) aggref->args) ||
+			contain_agg_clause((Node *) aggref->aggorder))
+			ereport(ERROR,
+					(errcode(ERRCODE_GROUPING_ERROR),
+					 errmsg("aggregate function calls cannot be nested")));
 
 		/*
 		 * We assume that the parser checked that there are no aggregates (of
@@ -855,6 +965,16 @@ contain_mutable_functions_walker(Node *node, void *context)
 {
 	if (node == NULL)
 		return false;
+
+    /* the functions in predtest.c handle expressions and
+     * RestrictInfo objects -- so make this function handle
+     * them too for convenience */
+    if (IsA(node, RestrictInfo))
+    {
+        RestrictInfo * info = (RestrictInfo *) node;
+        return contain_mutable_functions_walker((Node*)info->clause, context);
+    }
+
 	if (IsA(node, FuncExpr))
 	{
 		FuncExpr   *expr = (FuncExpr *) node;
@@ -1089,6 +1209,17 @@ contain_volatile_functions_walker(Node *node, void *context)
 								 contain_volatile_functions_walker,
 								 context, 0);
 	}
+	else if (IsA(node, RestrictInfo))
+	{
+		/*
+		 * We need to handle RestrictInfo, a case that uses this
+		 * is that replicated table with a volatile restriction.
+		 * We have to find the pattern and turn it into singleQE.
+		 */
+		RestrictInfo * info = (RestrictInfo *) node;
+		return contain_volatile_functions_walker((Node*)info->clause, context);
+	}
+
 	return expression_tree_walker(node, contain_volatile_functions_walker,
 								  context);
 }
@@ -1646,9 +1777,10 @@ find_nonnullable_rels_walker(Node *node, bool top_level)
 	}
 	else if (IsA(node, ScalarArrayOpExpr))
 	{
+		/* Strict if it's "foo op ANY array" and op is strict */
 		ScalarArrayOpExpr *expr = (ScalarArrayOpExpr *) node;
 
-		if (is_strict_saop(expr, true))
+		if (expr->useOr && op_strict(expr->opno))
 			result = find_nonnullable_rels_walker((Node *) expr->args, false);
 	}
 	else if (IsA(node, BoolExpr))
@@ -2139,6 +2271,51 @@ is_strict_saop(ScalarArrayOpExpr *expr, bool falseOK)
 }
 
 
+
+typedef struct
+{
+	char		exec_location;
+} check_execute_on_functions_context;
+
+static bool
+check_execute_on_functions_walker(Node *node,
+								  check_execute_on_functions_context *context)
+{
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, FuncExpr))
+	{
+		FuncExpr   *expr = (FuncExpr *) node;
+		char		exec_location;
+
+		exec_location = func_exec_location(expr->funcid);
+		if (exec_location != PROEXECLOCATION_ANY && exec_location != context->exec_location)
+		{
+			if (context->exec_location != PROEXECLOCATION_ANY)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot mix EXECUTE ON MASTER and EXECUTE ON ALL SEGMENTS functions in same query level")));
+			context->exec_location = exec_location;
+		}
+		/* fall through to check args */
+	}
+	return expression_tree_walker(node, check_execute_on_functions_walker, context);
+}
+
+
+char
+check_execute_on_functions(Node *clause)
+{
+	check_execute_on_functions_context context;
+
+	context.exec_location = PROEXECLOCATION_ANY;
+
+	check_execute_on_functions_walker(clause, &context);
+
+	return context.exec_location;
+}
+
 /*****************************************************************************
  *		Check for "pseudo-constant" clauses
  *****************************************************************************/
@@ -2348,6 +2525,107 @@ rowtype_field_matches(Oid rowtypeid, int fieldnum,
 }
 
 
+/**
+ * fold_constants
+ *
+ * Recurses into query tree and folds all constant expressions.
+ */
+
+Query *
+fold_constants(PlannerInfo *root, Query *q, ParamListInfo boundParams, Size max_size)
+{
+	eval_const_expressions_context context;
+
+	context.root = root;
+	context.boundParams = boundParams;
+	context.active_fns = NIL;	/* nothing being recursively simplified */
+	context.case_val = NULL;	/* no CASE being examined */
+	context.estimate = false;	/* safe transformations only */
+	context.recurse_queries = true; /* recurse into query structures */
+	context.recurse_sublink_testexpr = false; /* do not recurse into sublink test expressions */
+
+	context.max_size = max_size;
+	
+	context.eval_stable_functions = should_eval_stable_functions(root);
+
+	return (Query *) query_or_expression_tree_mutator
+						(
+						(Node *) q,
+						eval_const_expressions_mutator,
+						&context,
+						0
+						);
+}
+
+/*
+ * Transform a small array constant to an ArrayExpr.
+ *
+ * This is used by ORCA, to transform the array argument of a ScalarArrayExpr
+ * into an ArrayExpr. If a ScalarArrayExpr has an ArrayExpr argument, ORCA can
+ * perform some optimizations - partition pruning at least - by first expanding
+ * the ArrayExpr into its disjunctive normal form and then deriving constraints
+ * based on the elements in the ArrayExpr. It doesn't currently know how to
+ * extract elements from an Array const, however, so to enable those
+ * optimizations in ORCA, we convert Array Consts into corresponding
+ * ArrayExprs.
+ *
+ * If the argument is not an array constant return the original Const unmodified.
+ * We convert an array const of any size to ArrayExpr. ORCA can use it to derive
+ * statistics.
+ */
+Expr *
+transform_array_Const_to_ArrayExpr(Const *c)
+{
+	Oid			elemtype;
+	int16		elemlen;
+	bool		elembyval;
+	char		elemalign;
+	int			nelems;
+	Datum	   *elems;
+	bool	   *nulls;
+	ArrayType  *ac;
+	ArrayExpr *aexpr;
+	int			i;
+
+	Assert(IsA(c, Const));
+
+	/* Does it look like the right kind of an array Const? */
+	if (c->constisnull)
+		return (Expr *) c;	/* NULL const */
+
+	elemtype = get_element_type(c->consttype);
+	if (elemtype == InvalidOid)
+		return (Expr *) c;	/* not an array */
+
+	ac = DatumGetArrayTypeP(c->constvalue);
+	nelems = ArrayGetNItems(ARR_NDIM(ac), ARR_DIMS(ac));
+
+	/* All set, extract the elements, and an ArrayExpr to hold them. */
+	get_typlenbyvalalign(elemtype, &elemlen, &elembyval, &elemalign);
+	deconstruct_array(ac, elemtype, elemlen, elembyval, elemalign,
+					  &elems, &nulls, &nelems);
+
+	aexpr = makeNode(ArrayExpr);
+	aexpr->array_typeid = c->consttype;
+	aexpr->element_typeid = elemtype;
+	aexpr->multidims = false;
+	aexpr->location = c->location;
+
+	for (i = 0; i < nelems; i++)
+	{
+		aexpr->elements = lappend(aexpr->elements,
+								  makeConst(elemtype,
+											-1,
+											c->constcollid,
+											elemlen,
+											elems[i],
+											nulls[i],
+											elembyval));
+	}
+
+	return (Expr *) aexpr;
+}
+
 /*--------------------
  * eval_const_expressions
  *
@@ -2398,6 +2676,11 @@ eval_const_expressions(PlannerInfo *root, Node *node)
 	context.active_fns = NIL;	/* nothing being recursively simplified */
 	context.case_val = NULL;	/* no CASE being examined */
 	context.estimate = false;	/* safe transformations only */
+	context.recurse_queries = false; /* do not recurse into query structures */
+	context.recurse_sublink_testexpr = true;
+	context.max_size = 0;
+	context.eval_stable_functions = should_eval_stable_functions(root);
+
 	return eval_const_expressions_mutator(node, &context);
 }
 
@@ -2429,6 +2712,10 @@ estimate_expression_value(PlannerInfo *root, Node *node)
 	context.active_fns = NIL;	/* nothing being recursively simplified */
 	context.case_val = NULL;	/* no CASE being examined */
 	context.estimate = true;	/* unsafe transformations OK */
+	context.recurse_queries = false; /* do not recurse into query structures */
+	context.recurse_sublink_testexpr = true;
+	context.max_size = 0;
+
 	return eval_const_expressions_mutator(node, &context);
 }
 
@@ -2538,6 +2825,7 @@ eval_const_expressions_mutator(Node *node,
 				newexpr->winref = expr->winref;
 				newexpr->winstar = expr->winstar;
 				newexpr->winagg = expr->winagg;
+				newexpr->windistinct = expr->windistinct;
 				newexpr->location = expr->location;
 
 				return (Node *) newexpr;
@@ -3200,6 +3488,40 @@ eval_const_expressions_mutator(Node *node,
 				else
 					return copyObject(node);
 			}
+		case T_ScalarArrayOpExpr:
+			{
+				ScalarArrayOpExpr *saop;
+				Node *scalar;
+				Node *values;
+
+				saop = (ScalarArrayOpExpr *) expression_tree_mutator(node, eval_const_expressions_mutator,
+																	 (void *) context);
+
+				Assert( IsA(saop, ScalarArrayOpExpr));
+				Assert( list_length(saop->args) == 2);
+
+				scalar = (Node *) linitial(saop->args);
+				values = (Node *) lsecond(saop->args);
+
+				if ( IsA(scalar, Const) && IsA(values, Const))
+				{
+					Node *result = (Node *) evaluate_expr( (Expr *) saop, BOOLOID, -1, InvalidOid);
+					Assert(IsA(result, Const));
+					return result;
+				}
+
+				/* note a couple things:
+				 *
+				 * 1) If values is not a constant (it could be an ArrayExpr) then that means
+				 *    the ArrayExpr could not be reduced to a constant ...
+				 * 2) We could further improve this by, for OR scalar array ops, extract only the Const values
+				 *    from the array and make a constant out of those to evaluate.  If it evaluates to true then
+				 *    we can return true, otherwise we can return a new ScalarArrayOpExpr with values being
+				 *    only the non-Const values.  This seems overkill: I think      a in (1,2,3,x,y,z)    is rare
+				 */
+
+				return (Node *) saop; /* this has been walked and is a new one */
+			}
 		case T_ArrayExpr:
 			{
 				ArrayExpr  *arrayexpr = (ArrayExpr *) node;
@@ -3521,6 +3843,32 @@ eval_const_expressions_mutator(Node *node,
 			break;
 		default:
 			break;
+	}
+
+	/* prevent recursion into sublinks */
+	if (IsA(node, SubLink) && !context->recurse_sublink_testexpr)
+	{
+		SubLink    *sublink = (SubLink *) node;
+		SubLink    *newnode = copyObject(sublink);
+
+		/*
+		 * Also invoke the mutator on the sublink's Query node, so it
+		 * can recurse into the sub-query if it wants to.
+		 */
+		newnode->subselect = (Node *) query_tree_mutator((Query *) sublink->subselect, eval_const_expressions_mutator, (void*) context, 0);
+		return (Node *) newnode;
+	}
+
+	/* recurse into query structure if requested */
+	if (IsA(node, Query) && context->recurse_queries)
+	{
+		return (Node *)
+					query_tree_mutator
+					(
+					(Query *) node,
+					eval_const_expressions_mutator,
+					(void *) context,
+					0);
 	}
 
 	/*
@@ -3882,6 +4230,12 @@ simplify_function(Oid funcid, Oid result_type, int32 result_typmod,
 								args, funcvariadic,
 								func_tuple, context);
 
+	if (large_const(newexpr, context->max_size))
+	{
+		// folded expression prohibitively large
+		newexpr = NULL;
+	}
+
 	if (!newexpr && allow_non_const && OidIsValid(func_form->protransform))
 	{
 		/*
@@ -4136,6 +4490,35 @@ recheck_cast_function_args(List *args, Oid result_type, HeapTuple func_tuple)
 }
 
 /*
+ * large_const: check if given expression is a Const expression larger than
+ * the given size
+ *
+ */
+static bool
+large_const(Expr *expr, Size max_size)
+{
+	if (NULL == expr || 0 == max_size)
+	{
+		return false;
+	}
+	
+	if (!IsA(expr, Const))
+	{
+		return false;
+	}
+	
+	Const *const_expr = (Const *) expr;
+	
+	if (const_expr->constisnull)
+	{
+		return false;
+	}
+	
+	Size size = datumGetSize(const_expr->constvalue, const_expr->constbyval, const_expr->constlen);
+	return size > max_size;
+}
+
+/*
  * evaluate_function: try to pre-evaluate a function call
  *
  * We can do this if the function is strict and has any constant-null inputs
@@ -4219,6 +4602,11 @@ evaluate_function(Oid funcid, Oid result_type, int32 result_typmod,
 		 /* okay */ ;
 	else if (context->estimate && funcform->provolatile == PROVOLATILE_STABLE)
 		 /* okay */ ;
+	else if (context->eval_stable_functions && funcform->provolatile == PROVOLATILE_STABLE)
+	{
+		/* okay, but we cannot reuse this plan */
+		context->root->glob->oneoffPlan = true;
+	}
 	else
 		return NULL;
 
@@ -4649,7 +5037,7 @@ sql_inline_error_callback(void *arg)
  * We use the executor's routine ExecEvalExpr() to avoid duplication of
  * code and ensure we get the same result as the executor would get.
  */
-static Expr *
+Expr *
 evaluate_expr(Expr *expr, Oid result_type, int32 result_typmod,
 			  Oid result_collation)
 {
@@ -5083,6 +5471,346 @@ substitute_actual_srf_parameters_mutator(Node *node,
 }
 
 /*
+ * flatten_join_alias_var_optimizer
+ *	  Replace Vars that reference JOIN outputs with references to the original
+ *	  relation variables instead.
+ */
+Query *
+flatten_join_alias_var_optimizer(Query *query, int queryLevel)
+{
+	Query *queryNew = (Query *) copyObject(query);
+
+	/* Create a PlannerInfo data structure for this subquery */
+	PlannerInfo *root = makeNode(PlannerInfo);
+	root->parse = queryNew;
+	root->query_level = queryLevel;
+
+	root->glob = makeNode(PlannerGlobal);
+	root->glob->boundParams = NULL;
+	root->glob->subplans = NIL;
+	root->glob->subroots = NIL;
+	root->glob->finalrtable = NIL;
+	root->glob->relationOids = NIL;
+	root->glob->invalItems = NIL;
+	root->glob->transientPlan = false;
+	root->glob->nParamExec = 0;
+
+	root->config = DefaultPlannerConfig();
+
+	root->parent_root = NULL;
+	root->planner_cxt = CurrentMemoryContext;
+	root->init_plans = NIL;
+
+	root->list_cteplaninfo = NIL;
+	root->join_info_list = NIL;
+	root->append_rel_list = NIL;
+
+	root->hasJoinRTEs = false;
+
+	ListCell *plc = NULL;
+	foreach(plc, queryNew->rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(plc);
+
+		if (rte->rtekind == RTE_JOIN)
+		{
+			root->hasJoinRTEs = true;
+			if (IS_OUTER_JOIN(rte->jointype))
+			{
+				break;
+			}
+		}
+	}
+
+	/*
+	 * Flatten join alias for expression in
+	 * 1. targetlist
+	 * 2. returningList
+	 * 3. having qual
+	 * 4. scatterClause
+	 * 5. limit offset
+	 * 6. limit count
+	 * 
+	 * We flatten the above expressions since these entries may be moved during the query 
+	 * normalization step before algebrization. In contrast, the planner flattens alias 
+	 * inside quals to allow predicates involving such vars to be pushed down. 
+	 * 
+	 * Here we ignore the flattening of quals due to the following reasons:
+	 * 1. we assume that the function will be called before Query->DXL translation:
+	 * 2. the quals never gets moved from old query to the new top-level query in the 
+	 * query normalization phase before algebrization. In other words, the quals hang of 
+	 * the same query structure that is now the new derived table.
+	 * 3. the algebrizer can resolve the abiquity of join aliases in quals since we maintain 
+	 * all combinations of <query level, varno, varattno> to DXL-ColId during Query->DXL translation.
+	 * 
+	 */
+
+	List *targetList = queryNew->targetList;
+	if (NIL != targetList)
+	{
+		queryNew->targetList = (List *) flatten_join_alias_vars(root, (Node *) targetList);
+		pfree(targetList);
+	}
+
+	List * returningList = queryNew->returningList;
+	if (NIL != returningList)
+	{
+		queryNew->returningList = (List *) flatten_join_alias_vars(root, (Node *) returningList);
+		pfree(returningList);
+	}
+
+	Node *havingQual = queryNew->havingQual;
+	if (NULL != havingQual)
+	{
+		queryNew->havingQual = flatten_join_alias_vars(root, havingQual);
+		pfree(havingQual);
+	}
+
+	List *scatterClause = queryNew->scatterClause;
+	if (NIL != scatterClause)
+	{
+		queryNew->scatterClause = (List *) flatten_join_alias_vars(root, (Node *) scatterClause);
+		pfree(scatterClause);
+	}
+
+	Node *limitOffset = queryNew->limitOffset;
+	if (NULL != limitOffset)
+	{
+		queryNew->limitOffset = flatten_join_alias_vars(root, limitOffset);
+		pfree(limitOffset);
+	}
+
+	List *windowClause = queryNew->windowClause;
+	if (NIL != queryNew->windowClause)
+	{
+		ListCell *l;
+
+		foreach (l, windowClause)
+		{
+			WindowClause *wc = (WindowClause *) lfirst(l);
+
+			if (wc == NULL)
+				continue;
+
+			if (wc->startOffset)
+				wc->startOffset = flatten_join_alias_vars(root, wc->startOffset);
+
+			if (wc->endOffset)
+				wc->endOffset = flatten_join_alias_vars(root, wc->endOffset);
+		}
+	}
+
+	Node *limitCount = queryNew->limitCount;
+	if (NULL != limitCount)
+	{
+		queryNew->limitCount = flatten_join_alias_vars(root, limitCount);
+		pfree(limitCount);
+	}
+
+    return queryNew;
+}
+
+/* 
+ * Does grp contain GroupingClause or not? Useful for indentifying use of
+ * ROLLUP, CUBE and grouping sets.
+ */
+bool
+contain_extended_grouping(List *grp)
+{
+	return contain_grouping_clause_walker((Node *)grp, NULL);
+}
+
+static bool
+contain_grouping_clause_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	else if (IsA(node, GroupingClause))
+		return true;			/* abort the tree traversal and return true */
+	
+	Assert(!IsA(node, SubLink));
+	return expression_tree_walker(node, contain_grouping_clause_walker, 
+								  context);
+}
+
+/*
+ * is_grouping_extension -
+ *     Return true if a given grpsets contain multiple grouping sets.
+ *
+ * This function also returns false when a query has a single unique
+ * groupig set appearing multiple times.
+ */
+bool
+is_grouping_extension(CanonicalGroupingSets *grpsets)
+{
+	if (grpsets == NULL ||
+		grpsets->ngrpsets == 0)
+		return false;
+
+	if (grpsets->ngrpsets == 1)
+		return false;
+
+	return true;
+}
+
+/**
+ * Returns true if the equality operator with the given opno
+ *   values is a true equality operator (unlike some of the
+ *   box/rectangle/etc. types which implement 'goofy' operators).
+ *
+ * This function currently only knows about built-in types, and is
+ *   conservative with regard to which it returns true for (only
+ *     ones which have been verified to work the right way).
+ */
+bool is_builtin_true_equality_between_same_type(int opno)
+{
+	switch (opno)
+	{
+	case BitEqualOperator:
+	case BooleanEqualOperator:
+	case BPCharEqualOperator:
+	case CashEqualOperator:
+	case CharEqualOperator:
+	case CidEqualOperator:
+	case DateEqualOperator:
+	case Float4EqualOperator:
+	case Float8EqualOperator:
+	case Int2EqualOperator:
+	case Int4EqualOperator:
+	case Int8EqualOperator:
+	case IntervalEqualOperator:
+	case NameEqualOperator:
+	case NumericEqualOperator:
+	case OidEqualOperator:
+	case RelTimeEqualOperator:
+	case TextEqualOperator:
+	case TIDEqualOperator:
+	case TimeEqualOperator:
+	case TimestampEqualOperator:
+	case TimestampTZEqualOperator:
+	case TimeTZEqualOperator:
+	case XidEqualOperator:
+		return true;
+
+	default:
+		return false;
+	}
+}
+
+/**
+ * Returns true if the equality operator with the given opno
+ *   values is an equality operator, with same type on both sides
+ *  (unlike int24 equality) AND the type being compare is greenplum hashable
+ *
+ *
+ * Note that this function is conservative with regard to when it returns true:
+ *   it is okay to have some greenplum hashtable types that don't have entries here
+ *   (this function may return false even if this is a comparison between
+ *        a greenplum hashable type and itself
+ *
+ * Note also that i think it might be possible for this to return true even
+ *   if the operands of the operator are not themselves greenplum hashable,
+ *   because of type conversion or something.  I'm not 100% sure on that.
+ */
+bool
+is_builtin_greenplum_hashable_equality_between_same_type(int opno)
+{
+    switch(opno)
+    {
+        case BitEqualOperator:
+        case BooleanEqualOperator:
+        case BPCharEqualOperator:
+        case CashEqualOperator:
+        case CharEqualOperator:
+        case DateEqualOperator:
+        case Float4EqualOperator:
+        case Float8EqualOperator:
+        case Int2EqualOperator:
+        case Int4EqualOperator:
+        case Int8EqualOperator:
+        case IntervalEqualOperator:
+        case NameEqualOperator:
+        case NumericEqualOperator:
+        case OidEqualOperator:
+        case RelTimeEqualOperator:
+        case TextEqualOperator:
+        case TIDEqualOperator:
+        case TimeEqualOperator:
+        case TimestampEqualOperator:
+        case TimestampTZEqualOperator:
+        case TimeTZEqualOperator:
+
+        /* these new ones were added to list for MPP-7858 */
+        case AbsTimeEqualOperator:
+        case ByteaEqualOperator:
+        case InetEqualOperator: /* for inet and cidr */
+        case MacAddrEqualOperator:
+        case TIntervalEqualOperator:
+        case VarbitEqualOperator:
+            return true;
+
+/*
+        these types are greenplum hashable but haven't checked the semantics of these types function
+        case ACLITEMOID:
+        case ANYARRAYOID: 
+        case INT2VECTOROID: 
+        case OIDVECTOROID: 
+        case REGPROCOID: 
+        case REGPROCEDUREOID: 
+        case REGOPEROID: 
+        case REGOPERATOROID: 
+        case REGCLASSOID: 
+        case REGTYPEOID: 
+  */
+        default:
+
+        return false;
+    }
+}
+
+/**
+ * Structs and Methods to support searching of matching subexpressions.
+ */
+
+typedef struct subexpression_matching_context
+{
+	Expr *needle;	/* This is the expression being searched */
+} subexpression_matching_context;
+
+/**
+ * expression_matching_walker checks if the expression 'needle' in context is a sub-expression of hayStack.
+ */
+static bool subexpression_matching_walker(Node *hayStack, void *context)
+{
+	Assert(context);
+	subexpression_matching_context *ctx = (subexpression_matching_context *) context;
+	Assert(ctx->needle);
+
+	if (!hayStack)
+	{
+		return false;
+	}
+
+	if (equal(ctx->needle, hayStack))
+	{
+		return true;
+	}
+
+	return expression_tree_walker(hayStack, subexpression_matching_walker, (void *) context);
+}
+
+/**
+ * Method checks if expr1 is a subexpression of expr2.
+ * For example, expr1 = (x + 2) and expr = (x + 2 ) * 100 + 20 would return true.
+ */
+bool subexpression_match(Expr *expr1, Expr *expr2)
+{
+	subexpression_matching_context ctx;
+	ctx.needle = expr1;
+	return subexpression_matching_walker((Node *) expr2, (void *) &ctx);
+}
+
+/*
  * Check whether a SELECT targetlist emits the specified column types,
  * to see if it's safe to inline a function returning record.
  *
@@ -5123,4 +5851,31 @@ tlist_matches_coltypelist(List *tlist, List *coltypelist)
 		return false;			/* too few tlist items */
 
 	return true;
+}
+
+/*
+ * If this expression is part of a query, and the query isn't a simple
+ * "SELECT foo()" style query with no actual tables involved, then we
+ * also aggressively evaluate stable functions, in addition to immutable
+ * ones. Such plans cannot be reused, and therefore need to be re-planned
+ * on every execution, but it can be a big win if it allows partition
+ * elimination to happen. That's considered a good tradeoff in GPDB, as
+ * typical queries are long-running.
+ */
+static bool
+should_eval_stable_functions(PlannerInfo *root)
+{
+	/*
+	 * Without PlannerGlobal, we cannot mark the plan as a `oneoffPlan`
+	 */
+	if (root == NULL) return false;
+	if (root->glob == NULL) return false;
+
+	/*
+	 * If the query has no range table, then there is no reason to need to
+	 * pre-evaluate stable functions, as the output cannot be used as part
+	 * of static partition elimination, unless the query is part of a
+	 * subquery.
+	 */
+	return root->parse->rtable || root->query_level > 1;
 }

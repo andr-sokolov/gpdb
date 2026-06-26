@@ -28,6 +28,7 @@
 #define BITS_PER_BITMAPWORD 32
 typedef uint32 bitmapword;		/* must be an unsigned type */
 typedef int32 signedbitmapword; /* must be the matching signed type */
+#define BITS_PER_BITMAPWORD_LOG2    5
 
 typedef struct Bitmapset
 {
@@ -60,6 +61,7 @@ typedef enum
 
 extern Bitmapset *bms_copy(const Bitmapset *a);
 extern bool bms_equal(const Bitmapset *a, const Bitmapset *b);
+extern int bms_compare(const Bitmapset *a, const Bitmapset *b);
 extern Bitmapset *bms_make_singleton(int x);
 extern void bms_free(Bitmapset *a);
 
@@ -93,5 +95,18 @@ extern int	bms_next_member(const Bitmapset *a, int prevbit);
 
 /* support for hashtables using Bitmapsets as keys: */
 extern uint32 bms_hash_value(const Bitmapset *a);
+
+/* 
+ * returns true iff the bitmap is sufficently large that
+ * it stores the bit for member x
+ */
+extern bool bms_covers_member(const Bitmapset *a, int x);
+
+/* 
+ * Extend the bitmap a to have at least wc number of words.
+ * If wc is smaller than the bitmap a, the bitmap a
+ * is returned
+ */
+extern Bitmapset *bms_resize(Bitmapset *a, int wc);
 
 #endif   /* BITMAPSET_H */
