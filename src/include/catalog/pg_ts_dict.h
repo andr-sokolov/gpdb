@@ -42,6 +42,11 @@ CATALOG(pg_ts_dict,3600)
 #endif
 } FormData_pg_ts_dict;
 
+/* GPDB added foreign key definitions for gpcheckcat. */
+FOREIGN_KEY(dictnamespace REFERENCES pg_namespace(oid));
+FOREIGN_KEY(dictowner REFERENCES pg_authid(oid));
+FOREIGN_KEY(dicttemplate REFERENCES pg_ts_template(oid));
+
 typedef FormData_pg_ts_dict *Form_pg_ts_dict;
 
 /* ----------------

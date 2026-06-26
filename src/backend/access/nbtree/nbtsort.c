@@ -82,7 +82,7 @@
  */
 struct BTSpool
 {
-	Tuplesortstate *sortstate;	/* state data for tuplesort.c */
+	void *sortstate;	/* state data for tuplesort.c */
 	Relation	heap;
 	Relation	index;
 	bool		isunique;

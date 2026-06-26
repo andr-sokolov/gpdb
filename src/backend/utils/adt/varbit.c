@@ -31,6 +31,7 @@
 
 #include "postgres.h"
 
+#include "access/hash.h"
 #include "access/htup_details.h"
 #include "libpq/pqformat.h"
 #include "nodes/nodeFuncs.h"
@@ -1732,10 +1733,6 @@ bitposition(PG_FUNCTION_ARGS)
 				{
 					mask2 = end_mask << (BITS_PER_BYTE - is);
 					is_match = mask2 == 0;
-#if 0
-					elog(DEBUG4, "S. %d %d em=%2x sm=%2x r=%d",
-						 i, is, end_mask, mask2, is_match);
-#endif
 					break;
 				}
 				cmp = *s << (BITS_PER_BYTE - is);
@@ -1861,4 +1858,12 @@ bitgetbit(PG_FUNCTION_ARGS)
 		PG_RETURN_INT32(1);
 	else
 		PG_RETURN_INT32(0);
+}
+
+Datum
+bithash(PG_FUNCTION_ARGS)
+{
+	VarBit	   *arg1 = PG_GETARG_VARBIT_P(0);
+
+	return hash_any(VARBITS(arg1), VARBITBYTES(arg1));
 }

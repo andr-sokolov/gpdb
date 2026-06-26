@@ -51,6 +51,14 @@
 #include "utils/rel.h"
 #include "utils/tqual.h"
 
+#include "access/transam.h"
+#include "cdb/cdbpartition.h"
+#include "cdb/cdbvars.h"
+#include "executor/execDML.h"
+#include "parser/parsetree.h"
+#include "utils/lsyscache.h"
+#include "utils/snapmgr.h"
+
 
 /*
  * Verify that the tuples to be produced by INSERT or UPDATE match the
@@ -158,31 +166,103 @@ ExecProcessReturning(ProjectionInfo *projectReturning,
  *		and insert appropriate tuples into the index relations.
  *
  *		Returns RETURNING result if any, otherwise NULL.
+ *
+ * If the target table is partitioned, the input tuple in 'parentslot'
+ * is in the shape required for the parent table. This function will
+ * look up the ResultRelInfo of the target partition, and form a
+ * tuple suitable for the target partition. (It can be different, if
+ * there are dropped columns in the parent, but not the partition,
+ * for example.)
+ *
  * ----------------------------------------------------------------
  */
-static TupleTableSlot *
-ExecInsert(TupleTableSlot *slot,
+TupleTableSlot *
+ExecInsert(TupleTableSlot *parentslot,
 		   TupleTableSlot *planSlot,
 		   EState *estate,
-		   bool canSetTag)
+		   bool canSetTag,
+		   PlanGenerator planGen,
+		   bool isUpdate,
+		   Oid	tupleOid)
 {
-	HeapTuple	tuple;
 	ResultRelInfo *resultRelInfo;
 	Relation	resultRelationDesc;
 	Oid			newId;
 	List	   *recheckIndexes = NIL;
 
+	bool		rel_is_heap = false;
+	ItemPointerData lastTid;
+	Oid			tuple_oid = tupleOid;
+	ProjectionInfo *projectReturning;
+	TupleTableSlot *slot;
+
 	/*
-	 * get the heap tuple out of the tuple table slot, making sure we have a
-	 * writable copy
+	 * RETURNING is only present in the parent ResultRelInfo, so stash
+	 * that before looking up the ResultRelInfo of the target partition.
 	 */
-	tuple = ExecMaterializeSlot(slot);
+	projectReturning = estate->es_result_relation_info->ri_projectReturning;
 
 	/*
 	 * get information on the (current) result relation
 	 */
-	resultRelInfo = estate->es_result_relation_info;
+	if (estate->es_result_partitions)
+	{
+		resultRelInfo = slot_get_partition(parentslot, estate);
+
+		/*
+		 * Check whether the user provided the correct leaf part only if required.
+		 * For isUpdate, the check for resultRelInfo equals to target partitioned relation id
+		 * has been done by checkPartitionUpdate before. So we don't need to check again here.
+		 */
+		if (!dml_ignore_target_partition_check && !isUpdate)
+		{
+			Assert(NULL != estate->es_result_partitions->part &&
+					NULL != resultRelInfo->ri_RelationDesc);
+
+			List *resultRelations = estate->es_plannedstmt->resultRelations;
+			/*
+			 * Only inheritance can generate multiple result relations and inheritance
+			 * is not compatible with partitions. As we are in inserting in partitioned
+			 * table, we should not have more than one resultRelation
+			 */
+			Assert(list_length(resultRelations) == 1);
+			/* We only have one resultRelations entry where the user originally intended to insert */
+			int rteIdxForUserRel = linitial_int(resultRelations);
+			Assert (rteIdxForUserRel > 0);
+			Oid userProvidedRel = InvalidOid;
+
+			if (1 == rteIdxForUserRel)
+			{
+				/* Optimization for typical case */
+				userProvidedRel = ((RangeTblEntry *) estate->es_plannedstmt->rtable->head->data.ptr_value)->relid;
+			}
+			else
+			{
+				userProvidedRel = getrelid(rteIdxForUserRel, estate->es_plannedstmt->rtable);
+			}
+
+			/* Error out if user provides a leaf partition that does not match with our calculated partition */
+			if (userProvidedRel != estate->es_result_partitions->part->parrelid &&
+				userProvidedRel != resultRelInfo->ri_RelationDesc->rd_id)
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_CHECK_VIOLATION),
+						 errmsg("trying to insert row into wrong partition"),
+						 errdetail("Expected partition: %s, provided partition: %s.",
+							resultRelInfo->ri_RelationDesc->rd_rel->relname.data,
+							estate->es_result_relation_info->ri_RelationDesc->rd_rel->relname.data)));
+			}
+		}
+		estate->es_result_relation_info = resultRelInfo;
+	}
+	else
+	{
+		resultRelInfo = estate->es_result_relation_info;
+	}
+
 	resultRelationDesc = resultRelInfo->ri_RelationDesc;
+
+	rel_is_heap = RelationIsHeap(resultRelationDesc);
 
 	/*
 	 * If the result relation has OIDs, force the tuple's OID to zero so that
@@ -195,13 +275,33 @@ ExecInsert(TupleTableSlot *slot,
 	 * rows, this'd be the place to do it.  For the moment, we make a point of
 	 * doing this before calling triggers, so that a user-supplied trigger
 	 * could hack the OID if desired.
+	 *
+	 * GPDB: In PostgreSQL, here we set the Oid in the HeapTuple, which is a
+	 * local copy at this point. But in GPDB, we don't materialize the tuple
+	 * yet, so we keep the Oid in a local variable for now, and only set it in
+	 * the tuple just before the call to heap_insert().
 	 */
 	if (resultRelationDesc->rd_rel->relhasoids)
-		HeapTupleSetOid(tuple, InvalidOid);
+	{
+		/*
+		 * But if this is really an UPDATE, try to preserve the old OID.
+		 */
+		if (isUpdate && tuple_oid == InvalidOid)
+		{
+			HeapTuple trigtup = ExecMaterializeSlot(parentslot);
+
+			tuple_oid = HeapTupleGetOid(trigtup);
+		}
+	}
+
+	slot = reconstructMatchingTupleSlot(parentslot, resultRelInfo);
+
+	Assert(slot != NULL);
 
 	/* BEFORE ROW INSERT Triggers */
 	if (resultRelInfo->ri_TrigDesc &&
-		resultRelInfo->ri_TrigDesc->trig_insert_before_row)
+		resultRelInfo->ri_TrigDesc->trig_insert_before_row &&
+		!isUpdate)
 	{
 		slot = ExecBRInsertTriggers(estate, resultRelInfo, slot);
 
@@ -209,7 +309,15 @@ ExecInsert(TupleTableSlot *slot,
 			return NULL;
 
 		/* trigger might have changed tuple */
-		tuple = ExecMaterializeSlot(slot);
+		if (resultRelationDesc->rd_rel->relhasoids)
+		{
+			if (TupHasHeapTuple(slot))
+			{
+				HeapTuple trigtup = TupGetHeapTuple(slot);
+
+				tuple_oid = HeapTupleGetOid(trigtup);
+			}
+		}
 	}
 
 	/* INSTEAD OF ROW INSERT Triggers */
@@ -220,9 +328,6 @@ ExecInsert(TupleTableSlot *slot,
 
 		if (slot == NULL)		/* "do nothing" */
 			return NULL;
-
-		/* trigger might have changed tuple */
-		tuple = ExecMaterializeSlot(slot);
 
 		newId = InvalidOid;
 	}
@@ -239,15 +344,60 @@ ExecInsert(TupleTableSlot *slot,
 		if (slot == NULL)		/* "do nothing" */
 			return NULL;
 
-		/* FDW might have changed tuple */
-		tuple = ExecMaterializeSlot(slot);
-
 		/*
 		 * AFTER ROW Triggers or RETURNING expressions might reference the
 		 * tableoid column, so initialize t_tableOid before evaluating them.
 		 */
-		tuple->t_tableOid = RelationGetRelid(resultRelationDesc);
+		slot->tts_tableOid = RelationGetRelid(resultRelationDesc);
 
+		/*
+		 * There might be Triggers on the remote table
+		 * which modifiy the values, so we need to update
+		 * parentslot, otherwise, the RETURNING expressions
+		 * will work on incorrect data.
+		 *
+		 * And, GPDB doesn't support a foreign table
+		 * as a partition table, so the parentslot's
+		 * and slot's tuple descriptors are supposed
+		 * to be the same.
+		 *
+		 * when resultRelInfo->ri_partInsertMap is NULL, it means
+		 * the partition table's tuple descriptor is same as the
+		 * parent's.
+		 */
+		if (projectReturning)
+		{
+			Assert( NULL == resultRelInfo->ri_partInsertMap);
+
+			/* The values in slot may have been updated by FDW or
+			 * not, anyway we update the parentslot here.
+			 */
+			int         natts = slot->tts_tupleDescriptor->natts;
+			slot_getallattrs(slot);
+			Datum *values = slot_get_values(slot);
+			bool *isnull = slot_get_isnull(slot);
+
+			/* make sure the parentslot is clear */
+			ExecClearTuple(parentslot);
+
+			/* update parentslot */
+			memcpy(parentslot->PRIVATE_tts_values, values, natts * sizeof(Datum));
+			memcpy(parentslot->PRIVATE_tts_isnull, isnull, natts * sizeof(bool));
+
+			/* mark parentslot as containing a virtual tuple */
+			ExecStoreVirtualTuple(parentslot);
+
+			/* set parentslot's tableoid and ctid */
+			parentslot->tts_tableOid = slot->tts_tableOid;
+			/*
+			 * We need to check if the slot has a valid ctid when it has a HeapTuple
+			 * before calling slot_get_ctid, otherwise the Assert in slot_get_ctid will fail
+			 */
+			if (TupHasHeapTuple(slot) && ItemPointerIsValid((&(slot->PRIVATE_tts_heaptuple->t_self))))
+			{
+				slot_set_ctid(parentslot, slot_get_ctid(slot));
+			}
+		}
 		newId = InvalidOid;
 	}
 	else
@@ -256,7 +406,9 @@ ExecInsert(TupleTableSlot *slot,
 		 * Constraints might reference the tableoid column, so initialize
 		 * t_tableOid before evaluating them.
 		 */
+#if 0
 		tuple->t_tableOid = RelationGetRelid(resultRelationDesc);
+#endif
 
 		/*
 		 * Check the constraints of the tuple
@@ -267,29 +419,53 @@ ExecInsert(TupleTableSlot *slot,
 		/*
 		 * insert the tuple
 		 *
-		 * Note: heap_insert returns the tid (location) of the new tuple in
-		 * the t_self field.
+		 * Note: heap_insert returns the tid (location) of the new tuple in the
+		 * t_self field.
 		 */
-		newId = heap_insert(resultRelationDesc, tuple,
-							estate->es_output_cid, 0, NULL);
+		{
+			HeapTuple tuple;
+
+			Insist(rel_is_heap);
+
+			/*
+			 * get the heap tuple out of the tuple table slot, making sure we have a
+			 * writable copy. (heap_insert() will scribble on the tuple)
+			 */
+			tuple = ExecMaterializeSlot(slot);
+			if (resultRelationDesc->rd_rel->relhasoids)
+				HeapTupleSetOid(tuple, tuple_oid);
+
+			newId = heap_insert(resultRelationDesc,
+								tuple,
+								estate->es_output_cid, 0, NULL,
+								GetCurrentTransactionId());
+			lastTid = tuple->t_self;
+		}
 
 		/*
 		 * insert index entries for tuple
 		 */
 		if (resultRelInfo->ri_NumIndices > 0)
-			recheckIndexes = ExecInsertIndexTuples(slot, &(tuple->t_self),
+			recheckIndexes = ExecInsertIndexTuples(slot, &lastTid,
 												   estate);
 	}
-
 	if (canSetTag)
 	{
 		(estate->es_processed)++;
 		estate->es_lastoid = newId;
-		setLastTid(&(tuple->t_self));
+		setLastTid(&lastTid);
 	}
 
+	slot->tts_tableOid = RelationGetRelid(resultRelationDesc);
+
 	/* AFTER ROW INSERT Triggers */
-	ExecARInsertTriggers(estate, resultRelInfo, tuple, recheckIndexes);
+	if (resultRelInfo->ri_TrigDesc &&
+		resultRelInfo->ri_TrigDesc->trig_insert_after_row &&
+		!isUpdate)
+	{
+		HeapTuple tuple = ExecMaterializeSlot(slot);
+		ExecARInsertTriggers(estate, resultRelInfo, tuple, recheckIndexes);
+	}
 
 	list_free(recheckIndexes);
 
@@ -298,9 +474,9 @@ ExecInsert(TupleTableSlot *slot,
 		ExecWithCheckOptions(resultRelInfo, slot, estate);
 
 	/* Process RETURNING if present */
-	if (resultRelInfo->ri_projectReturning)
-		return ExecProcessReturning(resultRelInfo->ri_projectReturning,
-									slot, planSlot);
+	if (projectReturning)
+		return ExecProcessReturning(projectReturning,
+									parentslot, planSlot);
 
 	return NULL;
 }
@@ -320,16 +496,22 @@ ExecInsert(TupleTableSlot *slot,
  *		passed to foreign table triggers; it is NULL when the foreign
  *		table has no relevant triggers.
  *
+ *		In GPDB, DELETE can be part of an update operation when
+ *		there is a preceding SplitUpdate node.
+ *
  *		Returns RETURNING result if any, otherwise NULL.
  * ----------------------------------------------------------------
  */
-static TupleTableSlot *
+TupleTableSlot *
 ExecDelete(ItemPointer tupleid,
+		   int32 segid,
 		   HeapTuple oldtuple,
 		   TupleTableSlot *planSlot,
 		   EPQState *epqstate,
 		   EState *estate,
-		   bool canSetTag)
+		   bool canSetTag,
+		   PlanGenerator planGen,
+		   bool isUpdate)
 {
 	ResultRelInfo *resultRelInfo;
 	Relation	resultRelationDesc;
@@ -338,23 +520,64 @@ ExecDelete(ItemPointer tupleid,
 	TupleTableSlot *slot = NULL;
 
 	/*
+	 * Sanity check the distribution of the tuple to prevent
+	 * potential data corruption in case users manipulate data
+	 * incorrectly (e.g. insert data on incorrect segment through
+	 * utility mode) or there is bug in code, etc.
+	 */
+	if (segid != GpIdentity.segindex)
+		elog(ERROR,
+			 "distribution key of the tuple (%u, %u) doesn't belong to "
+			 "current segment (actually from seg%d)",
+			 BlockIdGetBlockNumber(&(tupleid->ip_blkid)),
+			 tupleid->ip_posid,
+			 segid);
+
+	/*
 	 * get information on the (current) result relation
 	 */
-	resultRelInfo = estate->es_result_relation_info;
+	if (estate->es_result_partitions && planGen == PLANGEN_OPTIMIZER)
+	{
+		Assert(estate->es_result_partitions->part->parrelid);
+
+#ifdef USE_ASSERT_CHECKING
+		Oid parent = estate->es_result_partitions->part->parrelid;
+#endif
+
+		/* Obtain part for current tuple. */
+		resultRelInfo = slot_get_partition(planSlot, estate);
+		estate->es_result_relation_info = resultRelInfo;
+
+#ifdef USE_ASSERT_CHECKING
+		Oid part = RelationGetRelid(resultRelInfo->ri_RelationDesc);
+#endif
+
+		Assert(parent != part);
+	}
+	else
+	{
+		resultRelInfo = estate->es_result_relation_info;
+	}
 	resultRelationDesc = resultRelInfo->ri_RelationDesc;
 
-	/* BEFORE ROW DELETE Triggers */
-	if (resultRelInfo->ri_TrigDesc &&
-		resultRelInfo->ri_TrigDesc->trig_delete_before_row)
+	if (planGen == PLANGEN_PLANNER)
 	{
-		bool		dodelete;
+		/* BEFORE ROW DELETE Triggers */
+		if (resultRelInfo->ri_TrigDesc &&
+			resultRelInfo->ri_TrigDesc->trig_delete_before_row &&
+			!isUpdate)
+		{
+			bool		dodelete;
 
-		dodelete = ExecBRDeleteTriggers(estate, epqstate, resultRelInfo,
-										tupleid, oldtuple);
+			dodelete = ExecBRDeleteTriggers(estate, epqstate, resultRelInfo,
+											tupleid, oldtuple);
 
-		if (!dodelete)			/* "do nothing" */
-			return NULL;
+			if (!dodelete)			/* "do nothing" */
+				return NULL;
+		}
 	}
+
+	bool isHeapTable = RelationIsHeap(resultRelationDesc);
 
 	/* INSTEAD OF ROW DELETE Triggers */
 	if (resultRelInfo->ri_TrigDesc &&
@@ -363,6 +586,7 @@ ExecDelete(ItemPointer tupleid,
 		bool		dodelete;
 
 		Assert(oldtuple != NULL);
+
 		dodelete = ExecIRDeleteTriggers(estate, resultRelInfo, oldtuple);
 
 		if (!dodelete)			/* "do nothing" */
@@ -370,8 +594,6 @@ ExecDelete(ItemPointer tupleid,
 	}
 	else if (resultRelInfo->ri_FdwRoutine)
 	{
-		HeapTuple	tuple;
-
 		/*
 		 * delete from foreign table: let the FDW do it
 		 *
@@ -395,10 +617,10 @@ ExecDelete(ItemPointer tupleid,
 		 * RETURNING expressions might reference the tableoid column, so
 		 * initialize t_tableOid before evaluating them.
 		 */
-		if (slot->tts_isempty)
+		if (slot->PRIVATE_tts_flags & TTS_ISEMPTY)
 			ExecStoreAllNullTuple(slot);
-		tuple = ExecMaterializeSlot(slot);
-		tuple->t_tableOid = RelationGetRelid(resultRelationDesc);
+
+		slot->tts_tableOid = RelationGetRelid(resultRelationDesc);
 	}
 	else
 	{
@@ -412,11 +634,15 @@ ExecDelete(ItemPointer tupleid,
 		 * mode transactions.
 		 */
 ldelete:;
+		if (!isHeapTable)
+			elog(ERROR, "invalid relation type");
+
 		result = heap_delete(resultRelationDesc, tupleid,
 							 estate->es_output_cid,
 							 estate->es_crosscheck_snapshot,
 							 true /* wait for commit */ ,
-							 &hufd);
+							 &hufd,
+							 isUpdate);
 		switch (result)
 		{
 			case HeapTupleSelfUpdated:
@@ -452,6 +678,34 @@ ldelete:;
 							 errhint("Consider using an AFTER trigger instead of a BEFORE trigger to propagate changes to other rows.")));
 
 				/* Else, already deleted by self; nothing to do */
+
+				/*-------
+				 * In an scenario in which R(a,b) and S(a,b) have
+				 *        R               S
+				 *    ________         ________
+				 *     (1, 1)           (1, 2)
+				 *                      (1, 7)
+				 *
+				 *  An update query such as:
+				 *   UPDATE R SET a = S.b  FROM S WHERE R.b = S.a;
+				 *
+				 *  will have an non-deterministic output. The tuple in R
+				 * can be updated to (2,1) or (7,1).
+				 * Since the introduction of SplitUpdate, these queries will
+				 * send multiple requests to delete the same tuple. Therefore,
+				 * in order to avoid a non-deterministic output,
+				 * an error is reported in such scenario.
+				 *
+				 * ORCA requires this check as it does not support multiple
+				 * updates to a row by the same query
+				 *-------
+				*/
+				if (isUpdate)
+				{
+					ereport(ERROR,
+							(errcode(ERRCODE_IN_FAILED_SQL_TRANSACTION ),
+							 errmsg("multiple updates to a row by the same query is not allowed")));
+				}
 				return NULL;
 
 			case HeapTupleMayBeUpdated:
@@ -462,6 +716,30 @@ ldelete:;
 					ereport(ERROR,
 							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 							 errmsg("could not serialize access due to concurrent update")));
+				if (ItemPointerIndicatesMovedPartitions(&hufd.ctid))
+					ereport(ERROR,
+							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+							 errmsg("tuple to be %s was already moved to another segment due to concurrent update",
+									isUpdate ? "updated" : "deleted")));
+
+				/*
+				 * If DELETE operator is generated by SplitUpdate node (SplitUpdate
+				 * node is generated for updating the distributed keys), we raise an error.
+				 *
+				 * The root cause is SplitUpdate will split the origin tuple
+				 * to two tuples, one is for deleting and the other one
+				 * is for inserting. we can skip the deleting tuple if we
+				 * found the tuple is updated concurrently by another
+				 * transaction, but it is difficult to skip the inserting
+				 * tuple, so it will leads to more tuples after updating.
+				 */
+				if (isUpdate)
+				{
+					ereport(ERROR,
+							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE ),
+							 errmsg("concurrent updates distribution keys on the same row is not allowed")));
+				}
+
 				if (!ItemPointerEquals(tupleid, &hufd.ctid))
 				{
 					TupleTableSlot *epqslot;
@@ -500,11 +778,27 @@ ldelete:;
 	if (canSetTag)
 		(estate->es_processed)++;
 
-	/* AFTER ROW DELETE Triggers */
-	ExecARDeleteTriggers(estate, resultRelInfo, tupleid, oldtuple);
+	/*
+	 * Note: Normally one would think that we have to delete index tuples
+	 * associated with the heap tuple now...
+	 *
+	 * ... but in POSTGRES, we have no need to do this because VACUUM will
+	 * take care of it later.  We can't delete index tuples immediately
+	 * anyway, since the tuple is still visible to other transactions.
+	 */
+
+	if (planGen == PLANGEN_PLANNER && !isUpdate)
+	{
+		/* AFTER ROW DELETE Triggers */
+		ExecARDeleteTriggers(estate, resultRelInfo, tupleid, oldtuple);
+	}
 
 	/* Process RETURNING if present */
-	if (resultRelInfo->ri_projectReturning)
+	/*
+	 * In a split update, the processed rows are returned by the INSERT
+	 * of the new row, not the DELETE of the old one.
+	 */
+	if (resultRelInfo->ri_projectReturning && !isUpdate)
 	{
 		/*
 		 * We have to put the target tuple into a slot, which means first we
@@ -538,7 +832,7 @@ ldelete:;
 
 			if (slot->tts_tupleDescriptor != RelationGetDescr(resultRelationDesc))
 				ExecSetSlotDescriptor(slot, RelationGetDescr(resultRelationDesc));
-			ExecStoreTuple(&deltuple, slot, InvalidBuffer, false);
+			ExecStoreHeapTuple(&deltuple, slot, InvalidBuffer, false);
 		}
 
 		rslot = ExecProcessReturning(resultRelInfo->ri_projectReturning,
@@ -558,6 +852,182 @@ ldelete:;
 	}
 
 	return NULL;
+}
+
+/*
+ * Check if the tuple being updated will stay in the same part and throw ERROR
+ * if not.  This check is especially necessary for default partition that has
+ * no constraint on it.  partslot is the tuple being updated, and
+ * resultRelInfo is the target relation of this update.  Call this only
+ * estate has valid es_result_partitions.
+ */
+static void
+checkPartitionUpdate(EState *estate, TupleTableSlot *partslot,
+					 ResultRelInfo *resultRelInfo)
+{
+	Relation	resultRelationDesc = resultRelInfo->ri_RelationDesc;
+	AttrNumber	max_attr;
+	Datum	   *values = NULL;
+	bool	   *nulls = NULL;
+	TupleDesc	tupdesc = NULL;
+	Oid			parentRelid;
+	Oid			targetid;
+
+	Assert(estate->es_partition_state != NULL &&
+		   estate->es_partition_state->accessMethods != NULL);
+	if (!estate->es_partition_state->accessMethods->part_cxt)
+		estate->es_partition_state->accessMethods->part_cxt =
+			GetPerTupleExprContext(estate)->ecxt_per_tuple_memory;
+
+	Assert(PointerIsValid(estate->es_result_partitions));
+
+	/*
+	 * As opposed to INSERT, resultRelation here is the same child part
+	 * as scan origin.  However, the partition selection is done with the
+	 * parent partition's attribute numbers, so if this result (child) part
+	 * has physically-different attribute numbers due to dropped columns,
+	 * we should map the child attribute numbers to the parent's attribute
+	 * numbers to perform the partition selection.
+	 * EState doesn't have the parent relation information at the moment,
+	 * so we have to do a hard job here by opening it and compare the
+	 * tuple descriptors.  If we find we need to map attribute numbers,
+	 * max_partition_attr could also be bogus for this child part,
+	 * so we end up materializing the whole columns using slot_getallattrs().
+	 * The purpose of this code is just to prevent the tuple from
+	 * incorrectly staying in default partition that has no constraint
+	 * (parts with constraint will throw an error if the tuple is changing
+	 * partition keys to out of part value anyway.)  It's a bit overkill
+	 * to do this complicated logic just for this purpose, which is necessary
+	 * with our current partitioning design, but I hope some day we can
+	 * change this so that we disallow phyisically-different tuple descriptor
+	 * across partition.
+	 */
+	parentRelid = estate->es_result_partitions->part->parrelid;
+
+	/*
+	 * I don't believe this is the case currently, but we check the parent relid
+	 * in case the updating partition has changed since the last time we opened it.
+	 */
+	if (resultRelInfo->ri_PartitionParent &&
+		parentRelid != RelationGetRelid(resultRelInfo->ri_PartitionParent))
+	{
+		resultRelInfo->ri_PartCheckTupDescMatch = 0;
+		if (resultRelInfo->ri_PartCheckMap != NULL)
+			pfree(resultRelInfo->ri_PartCheckMap);
+		if (resultRelInfo->ri_PartitionParent)
+			relation_close(resultRelInfo->ri_PartitionParent, AccessShareLock);
+	}
+
+	/*
+	 * Check this at the first pass only to avoid repeated catalog access.
+	 */
+	if (resultRelInfo->ri_PartCheckTupDescMatch == 0 &&
+		parentRelid != RelationGetRelid(resultRelInfo->ri_RelationDesc))
+	{
+		Relation	parentRel;
+		TupleDesc	resultTupdesc, parentTupdesc;
+
+		/*
+		 * We are on a child part, let's see the tuple descriptor looks like
+		 * the parent's one.  Probably this won't cause deadlock because
+		 * DML should have opened the parent table with appropriate lock.
+		 */
+		parentRel = relation_open(parentRelid, AccessShareLock);
+		resultTupdesc = RelationGetDescr(resultRelationDesc);
+		parentTupdesc = RelationGetDescr(parentRel);
+		if (!equalTupleDescs(resultTupdesc, parentTupdesc, false))
+		{
+			AttrMap		   *map;
+			MemoryContext	oldcontext;
+
+			/* Tuple looks different.  Construct attribute mapping. */
+			oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
+			map_part_attrs(resultRelationDesc, parentRel, &map, true);
+			MemoryContextSwitchTo(oldcontext);
+
+			/* And save it for later use. */
+			resultRelInfo->ri_PartCheckMap = map;
+
+			resultRelInfo->ri_PartCheckTupDescMatch = -1;
+		}
+		else
+			resultRelInfo->ri_PartCheckTupDescMatch = 1;
+
+		resultRelInfo->ri_PartitionParent = parentRel;
+		/* parentRel will be closed as part of ResultRelInfo cleanup */
+	}
+
+	if (resultRelInfo->ri_PartCheckMap != NULL)
+	{
+		Datum	   *parent_values;
+		bool	   *parent_nulls;
+		Relation	parentRel = resultRelInfo->ri_PartitionParent;
+		TupleDesc	parentTupdesc;
+		AttrMap	   *map;
+
+		Assert(parentRel != NULL);
+		parentTupdesc = RelationGetDescr(parentRel);
+
+		/*
+		 * We need to map the attribute numbers to parent's one, to
+		 * select the would-be destination relation, since all partition
+		 * rules are based on the parent relation's tuple descriptor.
+		 * max_partition_attr can be bogus as well, so don't use it.
+		 */
+		slot_getallattrs(partslot);
+		values = slot_get_values(partslot);
+		nulls = slot_get_isnull(partslot);
+		parent_values = palloc(parentTupdesc->natts * sizeof(Datum));
+		parent_nulls = palloc0(parentTupdesc->natts * sizeof(bool));
+
+		map = resultRelInfo->ri_PartCheckMap;
+		reconstructTupleValues(map, values, nulls, partslot->tts_tupleDescriptor->natts,
+							   parent_values, parent_nulls, parentTupdesc->natts);
+
+		/* Now we have values/nulls in parent's view. */
+		values = parent_values;
+		nulls = parent_nulls;
+		tupdesc = RelationGetDescr(parentRel);
+	}
+	else
+	{
+		/*
+		 * map == NULL means we can just fetch values/nulls from the
+		 * current slot.
+		 */
+		Assert(nulls == NULL && tupdesc == NULL);
+		max_attr = estate->es_partition_state->max_partition_attr;
+		slot_getsomeattrs(partslot, max_attr);
+		/* values/nulls pointing to partslot's array. */
+		values = slot_get_values(partslot);
+		nulls = slot_get_isnull(partslot);
+		tupdesc = partslot->tts_tupleDescriptor;
+	}
+
+	/* And select the destination relation that this tuple would go to. */
+	targetid = selectPartition(estate->es_result_partitions, values,
+							   nulls, tupdesc,
+							   estate->es_partition_state->accessMethods);
+
+	/* Free up if we allocated mapped attributes. */
+	if (values != slot_get_values(partslot))
+	{
+		Assert(nulls != slot_get_isnull(partslot));
+		pfree(values);
+		pfree(nulls);
+	}
+
+	if (!OidIsValid(targetid))
+		ereport(ERROR,
+				(errcode(ERRCODE_NO_PARTITION_FOR_PARTITIONING_KEY),
+				 errmsg("no partition for partitioning key")));
+
+	if (RelationGetRelid(resultRelationDesc) != targetid)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("moving tuple from partition \"%s\" to partition \"%s\" not supported",
+						get_rel_name(RelationGetRelid(resultRelationDesc)),
+						get_rel_name(targetid))));
 }
 
 /* ----------------------------------------------------------------
@@ -582,8 +1052,9 @@ ldelete:;
  *		Returns RETURNING result if any, otherwise NULL.
  * ----------------------------------------------------------------
  */
-static TupleTableSlot *
+TupleTableSlot *
 ExecUpdate(ItemPointer tupleid,
+		   int32 segid,
 		   HeapTuple oldtuple,
 		   TupleTableSlot *slot,
 		   TupleTableSlot *planSlot,
@@ -591,12 +1062,27 @@ ExecUpdate(ItemPointer tupleid,
 		   EState *estate,
 		   bool canSetTag)
 {
-	HeapTuple	tuple;
 	ResultRelInfo *resultRelInfo;
 	Relation	resultRelationDesc;
 	HTSU_Result result;
 	HeapUpdateFailureData hufd;
 	List	   *recheckIndexes = NIL;
+	ItemPointerData lastTid;
+	bool		wasHotUpdate;
+
+	/*
+	 * Sanity check the distribution of the tuple to prevent
+	 * potential data corruption in case users manipulate data
+	 * incorrectly (e.g. insert data on incorrect segment through
+	 * utility mode) or there is bug in code, etc.
+	 */
+	if (segid != GpIdentity.segindex)
+		elog(ERROR,
+			 "distribution key of the tuple (%u, %u) doesn't belong to "
+			 "current segment (actually from seg%d)",
+			 BlockIdGetBlockNumber(&(tupleid->ip_blkid)),
+			 tupleid->ip_posid,
+			 segid);
 
 	/*
 	 * abort the operation if not running transactions
@@ -605,16 +1091,16 @@ ExecUpdate(ItemPointer tupleid,
 		elog(ERROR, "cannot UPDATE during bootstrap");
 
 	/*
-	 * get the heap tuple out of the tuple table slot, making sure we have a
-	 * writable copy
-	 */
-	tuple = ExecMaterializeSlot(slot);
-
-	/*
 	 * get information on the (current) result relation
 	 */
 	resultRelInfo = estate->es_result_relation_info;
 	resultRelationDesc = resultRelInfo->ri_RelationDesc;
+
+	bool		rel_is_heap = RelationIsHeap(resultRelationDesc);
+
+	/* see if this update would move the tuple to a different partition */
+	if (estate->es_result_partitions)
+		checkPartitionUpdate(estate, slot, resultRelInfo);
 
 	/* BEFORE ROW UPDATE Triggers */
 	if (resultRelInfo->ri_TrigDesc &&
@@ -625,9 +1111,6 @@ ExecUpdate(ItemPointer tupleid,
 
 		if (slot == NULL)		/* "do nothing" */
 			return NULL;
-
-		/* trigger might have changed tuple */
-		tuple = ExecMaterializeSlot(slot);
 	}
 
 	/* INSTEAD OF ROW UPDATE Triggers */
@@ -641,7 +1124,6 @@ ExecUpdate(ItemPointer tupleid,
 			return NULL;
 
 		/* trigger might have changed tuple */
-		tuple = ExecMaterializeSlot(slot);
 	}
 	else if (resultRelInfo->ri_FdwRoutine)
 	{
@@ -656,14 +1138,11 @@ ExecUpdate(ItemPointer tupleid,
 		if (slot == NULL)		/* "do nothing" */
 			return NULL;
 
-		/* FDW might have changed tuple */
-		tuple = ExecMaterializeSlot(slot);
-
 		/*
 		 * AFTER ROW Triggers or RETURNING expressions might reference the
 		 * tableoid column, so initialize t_tableOid before evaluating them.
 		 */
-		tuple->t_tableOid = RelationGetRelid(resultRelationDesc);
+		slot->tts_tableOid = RelationGetRelid(resultRelationDesc);
 	}
 	else
 	{
@@ -673,7 +1152,9 @@ ExecUpdate(ItemPointer tupleid,
 		 * Constraints might reference the tableoid column, so initialize
 		 * t_tableOid before evaluating them.
 		 */
+#if 0
 		tuple->t_tableOid = RelationGetRelid(resultRelationDesc);
+#endif
 
 		/*
 		 * Check the constraints of the tuple
@@ -697,11 +1178,24 @@ lreplace:;
 		 * needed for referential integrity updates in transaction-snapshot
 		 * mode transactions.
 		 */
-		result = heap_update(resultRelationDesc, tupleid, tuple,
-							 estate->es_output_cid,
-							 estate->es_crosscheck_snapshot,
-							 true /* wait for commit */ ,
-							 &hufd, &lockmode);
+		if (!rel_is_heap)
+			elog(ERROR, "invalid relation type");
+
+		{
+			HeapTuple tuple;
+
+			tuple = ExecMaterializeSlot(slot);
+
+			result = heap_update(resultRelationDesc, tupleid, tuple,
+						 estate->es_output_cid,
+						 estate->es_crosscheck_snapshot,
+						 true /* wait for commit */ ,
+						 &hufd, &lockmode);
+
+			lastTid = tuple->t_self;
+			wasHotUpdate = HeapTupleIsHeapOnly(tuple) != 0;
+		}
+
 		switch (result)
 		{
 			case HeapTupleSelfUpdated:
@@ -746,7 +1240,11 @@ lreplace:;
 					ereport(ERROR,
 							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 							 errmsg("could not serialize access due to concurrent update")));
-				if (!ItemPointerEquals(tupleid, &hufd.ctid))
+				if (ItemPointerIndicatesMovedPartitions(&hufd.ctid))
+					ereport(ERROR,
+							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+							 errmsg("tuple to be updated was already moved to another segment due to concurrent update")));
+		if (!ItemPointerEquals(tupleid, &hufd.ctid))
 				{
 					TupleTableSlot *epqslot;
 
@@ -761,7 +1259,6 @@ lreplace:;
 					{
 						*tupleid = hufd.ctid;
 						slot = ExecFilterJunk(resultRelInfo->ri_junkFilter, epqslot);
-						tuple = ExecMaterializeSlot(slot);
 						goto lreplace;
 					}
 				}
@@ -789,8 +1286,8 @@ lreplace:;
 		 *
 		 * If it's a HOT update, we mustn't insert new index entries.
 		 */
-		if (resultRelInfo->ri_NumIndices > 0 && !HeapTupleIsHeapOnly(tuple))
-			recheckIndexes = ExecInsertIndexTuples(slot, &(tuple->t_self),
+		if (resultRelInfo->ri_NumIndices > 0 && !wasHotUpdate)
+			recheckIndexes = ExecInsertIndexTuples(slot, &lastTid,
 												   estate);
 	}
 
@@ -798,8 +1295,15 @@ lreplace:;
 		(estate->es_processed)++;
 
 	/* AFTER ROW UPDATE Triggers */
-	ExecARUpdateTriggers(estate, resultRelInfo, tupleid, oldtuple, tuple,
+	if (resultRelInfo->ri_TrigDesc &&
+		resultRelInfo->ri_TrigDesc->trig_update_after_row &&
+		rel_is_heap)
+	{
+		HeapTuple tuple = ExecMaterializeSlot(slot);
+
+		ExecARUpdateTriggers(estate, resultRelInfo, tupleid, oldtuple, tuple,
 						 recheckIndexes);
+	}
 
 	list_free(recheckIndexes);
 
@@ -879,6 +1383,7 @@ ExecModifyTable(ModifyTableState *node)
 	ResultRelInfo *resultRelInfo;
 	PlanState  *subplanstate;
 	JunkFilter *junkfilter;
+	AttrNumber  segid_attno;
 	TupleTableSlot *slot;
 	TupleTableSlot *planSlot;
 	ItemPointer tupleid = NULL;
@@ -907,6 +1412,11 @@ ExecModifyTable(ModifyTableState *node)
 	if (node->mt_done)
 		return NULL;
 
+	if (Gp_role == GP_ROLE_EXECUTE && !Gp_is_writer)
+	{
+		elog(ERROR, "INSERT/UPDATE/DELETE must be executed by a writer segworker group");
+	}
+
 	/*
 	 * On first call, fire BEFORE STATEMENT triggers before proceeding.
 	 */
@@ -920,6 +1430,7 @@ ExecModifyTable(ModifyTableState *node)
 	resultRelInfo = node->resultRelInfo + node->mt_whichplan;
 	subplanstate = node->mt_plans[node->mt_whichplan];
 	junkfilter = resultRelInfo->ri_junkFilter;
+	segid_attno = resultRelInfo->ri_segid_attno;
 
 	/*
 	 * es_result_relation_info must point to the currently active result
@@ -954,10 +1465,11 @@ ExecModifyTable(ModifyTableState *node)
 			node->mt_whichplan++;
 			if (node->mt_whichplan < node->mt_nplans)
 			{
-				resultRelInfo++;
+				estate->es_result_relation_info = estate->es_result_relations + node->mt_whichplan;
+				resultRelInfo = estate->es_result_relation_info;
 				subplanstate = node->mt_plans[node->mt_whichplan];
-				junkfilter = resultRelInfo->ri_junkFilter;
-				estate->es_result_relation_info = resultRelInfo;
+				junkfilter = estate->es_result_relation_info->ri_junkFilter;
+				segid_attno = estate->es_result_relation_info->ri_segid_attno;
 				EvalPlanQualSetPlan(&node->mt_epqstate, subplanstate->plan,
 									node->mt_arowmarks[node->mt_whichplan]);
 				continue;
@@ -968,6 +1480,33 @@ ExecModifyTable(ModifyTableState *node)
 
 		EvalPlanQualSetSlot(&node->mt_epqstate, planSlot);
 		slot = planSlot;
+
+		/*
+		 * Find and check gp_segment_id if needed. Run it before executing
+		 * junkfilter since that code removes all junk attributes (including
+		 * the gp_segment_id attribute) in the end.
+		 */
+		int32 segid = GpIdentity.segindex;
+		if (AttributeNumberIsValid(segid_attno) && (operation == CMD_UPDATE || operation == CMD_DELETE))
+		{
+			char		relkind;
+			Datum		datum;
+			bool		isNull;
+
+			relkind = resultRelInfo->ri_RelationDesc->rd_rel->relkind;
+			if (relkind == RELKIND_RELATION || relkind == RELKIND_MATVIEW)
+			{
+				datum = ExecGetJunkAttribute(slot,
+											 segid_attno,
+											 &isNull);
+				/* shouldn't ever get a null result... */
+				if (isNull)
+					elog(ERROR, "gp_segment_id is NULL for unknown reason");
+
+				segid = DatumGetInt32(datum);
+
+			}
+		}
 
 		oldtuple = NULL;
 		if (junkfilter != NULL)
@@ -1025,10 +1564,11 @@ ExecModifyTable(ModifyTableState *node)
 						HeapTupleHeaderGetDatumLength(oldtupdata.t_data);
 					ItemPointerSetInvalid(&(oldtupdata.t_self));
 					/* Historically, view triggers see invalid t_tableOid. */
+#if 0
 					oldtupdata.t_tableOid =
 						(relkind == RELKIND_VIEW) ? InvalidOid :
 						RelationGetRelid(resultRelInfo->ri_RelationDesc);
-
+#endif
 					oldtuple = &oldtupdata;
 				}
 				else
@@ -1045,20 +1585,76 @@ ExecModifyTable(ModifyTableState *node)
 		switch (operation)
 		{
 			case CMD_INSERT:
-				slot = ExecInsert(slot, planSlot, estate, node->canSetTag);
+				slot = ExecInsert(slot, planSlot, estate, node->canSetTag,
+								  PLANGEN_PLANNER,
+								  false /* isUpdate */, InvalidOid /* tupleOid */);
 				break;
 			case CMD_UPDATE:
-				slot = ExecUpdate(tupleid, oldtuple, slot, planSlot,
-								&node->mt_epqstate, estate, node->canSetTag);
+				{
+					int			action;
+					bool		isnull;
+					int			actionColIdx;
+					int			tupleoidColIdx;
+
+					actionColIdx = node->mt_action_col_idxes[node->mt_whichplan];
+					tupleoidColIdx = node->mt_oid_col_idxes[node->mt_whichplan];
+
+					/* It is planned as not split update mode */
+					if (actionColIdx <= 0)
+					{
+						slot = ExecUpdate(tupleid, segid,
+										  oldtuple, slot, planSlot,
+										  &node->mt_epqstate, estate,
+										  node->canSetTag);
+						break;
+					}
+
+					action = DatumGetUInt32(slot_getattr(planSlot, actionColIdx, &isnull));
+					Assert(!isnull);
+
+					if (DML_INSERT == action)
+					{
+						Oid		tupleOid = InvalidOid;
+
+						if (tupleoidColIdx != 0)
+						{
+							bool			isnull;
+
+							tupleOid = slot_getattr(planSlot, tupleoidColIdx, &isnull);
+						}
+
+						if (estate->es_result_partitions)
+							checkPartitionUpdate(estate, slot, estate->es_result_relation_info);
+
+						slot = ExecInsert(slot, planSlot, estate, node->canSetTag,
+										  PLANGEN_PLANNER, true /* isUpdate */, tupleOid);
+					}
+					else /* DML_DELETE */
+					{
+						slot = ExecDelete(tupleid, segid, oldtuple, planSlot,
+										  &node->mt_epqstate, estate, false,
+										  PLANGEN_PLANNER, true /* isUpdate */);
+					}
+				}
 				break;
 			case CMD_DELETE:
-				slot = ExecDelete(tupleid, oldtuple, planSlot,
-								&node->mt_epqstate, estate, node->canSetTag);
+				slot = ExecDelete(tupleid, segid, oldtuple, planSlot,
+								  &node->mt_epqstate, estate, node->canSetTag,
+								  PLANGEN_PLANNER, false /* isUpdate */);
 				break;
 			default:
 				elog(ERROR, "unknown operation");
 				break;
 		}
+
+		/*
+		 * If the target is a partitioned table, ExecInsert / ExecUpdate /
+		 * ExecDelete might have changed es_result_relation_info to point to
+		 * a partition, instead of the top-level table. Reset it. (It would
+		 * be more tidy if those functions cleaned up after themselves, but
+		 * it's more robust to do it here just once.)
+		 */
+		estate->es_result_relation_info = resultRelInfo;
 
 		/*
 		 * If we got a RETURNING result, return it to caller.  We'll continue
@@ -1077,7 +1673,9 @@ ExecModifyTable(ModifyTableState *node)
 	/*
 	 * We're done, but fire AFTER STATEMENT triggers before exiting.
 	 */
-	fireASTriggers(node);
+	/* In GPDB, don't fire statement triggers in reader processes */
+	if (Gp_role != GP_ROLE_EXECUTE || Gp_is_writer)
+		fireASTriggers(node);
 
 	node->mt_done = true;
 
@@ -1120,10 +1718,35 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 	mtstate->resultRelInfo = estate->es_result_relations + node->resultRelIndex;
 	mtstate->mt_arowmarks = (List **) palloc0(sizeof(List *) * nplans);
 	mtstate->mt_nplans = nplans;
-
 	/* set up epqstate with dummy subplan data for the moment */
 	EvalPlanQualInit(&mtstate->mt_epqstate, estate, NULL, NIL, node->epqParam);
-	mtstate->fireBSTriggers = true;
+
+	if (CMD_UPDATE == operation)
+	{
+		Assert(list_length(node->ctid_col_idxes) == nplans);
+		Assert(list_length(node->action_col_idxes) == nplans);
+		Assert(list_length(node->oid_col_idxes) == nplans);
+
+		mtstate->mt_action_col_idxes = (AttrNumber *) palloc0 (sizeof(AttrNumber) * list_length(node->action_col_idxes));
+		mtstate->mt_ctid_col_idxes = (AttrNumber *) palloc0 (sizeof(AttrNumber) * list_length(node->ctid_col_idxes));
+		mtstate->mt_oid_col_idxes = (AttrNumber *) palloc0 (sizeof(AttrNumber) * list_length(node->oid_col_idxes));
+
+		i = 0;
+		foreach(l, node->action_col_idxes)
+			mtstate->mt_action_col_idxes[i++] = lfirst_int(l);
+
+		i = 0;
+		foreach(l, node->ctid_col_idxes)
+			mtstate->mt_ctid_col_idxes[i++] = lfirst_int(l);
+
+		i = 0;
+		foreach(l, node->oid_col_idxes)
+			mtstate->mt_oid_col_idxes[i++] = lfirst_int(l);
+	}
+
+	/* GPDB: Don't fire statement-triggers in QE reader processes */
+	if (Gp_role != GP_ROLE_EXECUTE || Gp_is_writer)
+		mtstate->fireBSTriggers = true;
 
 	/*
 	 * call ExecInitNode on each of the plans to be executed and save the
@@ -1272,12 +1895,44 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 	{
 		PlanRowMark *rc = (PlanRowMark *) lfirst(l);
 		ExecRowMark *erm;
+		bool		isdistributed = false;
 
 		Assert(IsA(rc, PlanRowMark));
 
 		/* ignore "parent" rowmarks; they are irrelevant at runtime */
 		if (rc->isParent)
 			continue;
+
+		/*
+		 * Like in preprocess_targetlist, ignore distributed tables.
+		 */
+		/*
+		 * GPDB_91_MERGE_FIXME: we are largely just ignoring locking altogether.
+		 * Perhaps that's OK as long as we take a full table lock on any UPDATEs
+		 * or DELETEs. But sure doesn't seem right. Can we do better?
+		 */
+		{
+			RangeTblEntry *rte = rt_fetch(rc->rti, estate->es_plannedstmt->rtable);
+
+			if (rte->rtekind == RTE_RELATION)
+			{
+				Relation relation = heap_open(rte->relid, NoLock);
+				if (GpPolicyIsPartitioned(relation->rd_cdbpolicy))
+					isdistributed = true;
+				heap_close(relation, NoLock);
+				if (isdistributed)
+					continue;
+			}
+		}
+		if (Gp_role == GP_ROLE_EXECUTE)
+		{
+			/*
+			 * In the executor, we don't have information on which tables are
+			 * distributed. Assume that everything is; we wouldn't be running this
+			 * slice on an entry table otherwise.
+			 */
+			continue;
+		}
 
 		/* find ExecRowMark (same for all subplans) */
 		erm = ExecFindRowMark(estate, rc->rti);
@@ -1366,6 +2021,8 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 						j->jf_junkAttNo = ExecFindJunkAttribute(j, "ctid");
 						if (!AttributeNumberIsValid(j->jf_junkAttNo))
 							elog(ERROR, "could not find junk ctid column");
+
+						resultRelInfo->ri_segid_attno = ExecFindJunkAttribute(j, "gp_segment_id");
 					}
 					else if (relkind == RELKIND_FOREIGN_TABLE)
 					{
@@ -1412,9 +2069,17 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 	 * before earlier ones.  This ensures that we don't throw away RETURNING
 	 * rows that need to be seen by a later CTE subplan.
 	 */
-	if (!mtstate->canSetTag)
-		estate->es_auxmodifytables = lcons(mtstate,
-										   estate->es_auxmodifytables);
+	if (Gp_role == GP_ROLE_EXECUTE || Gp_role == GP_ROLE_UTILITY)
+	{
+		/*
+		 * We do not need this unless in executor or with utility role. Note
+		 * This was added for the data modifying CTE feature but there are other
+		 * cases could run into this also.
+		 */
+		if (!mtstate->canSetTag)
+			estate->es_auxmodifytables = lcons(mtstate,
+											   estate->es_auxmodifytables);
+	}
 
 	return mtstate;
 }
@@ -1475,4 +2140,23 @@ ExecReScanModifyTable(ModifyTableState *node)
 	 * semantics of that would be a bit debatable anyway.
 	 */
 	elog(ERROR, "ExecReScanModifyTable is not implemented");
+}
+
+void
+ExecSquelchModifyTable(ModifyTableState *node)
+{
+	/*
+	 * ModifyTable nodes must run to completion when asked to Squelch so
+	 * that we don't risk losing modifications which should be performed
+	 * regardless of any LIMIT's or other forms for projections which could
+	 * end up causing a squelch to happen.
+	 */
+	for (;;)
+	{
+		TupleTableSlot *result;
+
+		result = ExecModifyTable(node);
+		if (!result)
+			break;
+	}
 }

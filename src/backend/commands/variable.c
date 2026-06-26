@@ -21,6 +21,7 @@
 #include "access/htup_details.h"
 #include "access/xact.h"
 #include "catalog/pg_authid.h"
+#include "cdb/cdbvars.h"
 #include "commands/variable.h"
 #include "miscadmin.h"
 #include "utils/acl.h"
@@ -585,6 +586,24 @@ void
 assign_XactIsoLevel(const char *newval, void *extra)
 {
 	XactIsoLevel = *((int *) extra);
+	/*
+	 * GPDB_91_MERGE_FIXME: Prior to PostgreSQL 9.1, serializable isolation was
+	 * implemented as read committed.  True serializable isolation level is
+	 * supported as of PostgreSQL 9.1.  However, Greenplum lacks the support to
+	 * detect serialization conflicts using predicate locks at cluster level.
+	 * Until that support is implemented, let's keep old behavior by falling
+	 * back to repeatable read. Also, for similar reasons guc
+	 * transaction_deferrable is not dispatched to QE's as no use
+	 * currently. When serializable is fixed make sure to fix dispatching of the
+	 * transaction_deferrable guc via DtxContextInfo similar to
+	 * transaction_isolation.
+	 */
+	if (XactIsoLevel == XACT_SERIALIZABLE)
+	{
+		elog(LOG, "serializable isolation requested, falling back to "
+			 "repeatable read until serializable is supported in Greenplum");
+		XactIsoLevel = XACT_REPEATABLE_READ;
+	}
 }
 
 const char *
@@ -606,6 +625,22 @@ show_XactIsoLevel(void)
 	}
 }
 
+bool
+check_DefaultXactIsoLevel(int *newval, void **extra, GucSource source)
+{
+	/*
+	 * As the fixme in assign_XactIsoLevel, DefaultXactIsoLevel also need
+	 * to fallback from 'serializable' to 'repeatable read'
+	 */
+	if (*newval == XACT_SERIALIZABLE)
+	{
+		elog(LOG, "default serializable isolation requested, falling back to "
+				  "repeatable read until serializable is supported in Greenplum");
+		*newval = XACT_REPEATABLE_READ;
+	}
+
+	return true;
+}
 /*
  * SET TRANSACTION [NOT] DEFERRABLE
  */

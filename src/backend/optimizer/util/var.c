@@ -11,6 +11,8 @@
  *
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2006-2008, Greenplum inc
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  *
  *
  * IDENTIFICATION
@@ -20,12 +22,15 @@
  */
 #include "postgres.h"
 
+#include "access/htup.h"
 #include "access/sysattr.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/prep.h"
 #include "optimizer/var.h"
+#include "optimizer/walkers.h"
 #include "parser/parsetree.h"
 #include "rewrite/rewriteManip.h"
+#include "utils/lsyscache.h"
 
 
 typedef struct
@@ -63,8 +68,9 @@ typedef struct
 {
 	PlannerInfo *root;
 	int			sublevels_up;
-	bool		possible_sublink;		/* could aliases include a SubLink? */
-	bool		inserted_sublink;		/* have we inserted a SubLink? */
+	bool		possible_sublink;		    /* could aliases include a SubLink? */
+	bool		inserted_sublink;	     	/* have we inserted a SubLink? */
+	Node      **root_parse_rtable_arrray;   /* array form of root->parse->rtable */
 } flatten_join_alias_vars_context;
 
 static bool pull_varnos_walker(Node *node,
@@ -80,7 +86,87 @@ static bool pull_var_clause_walker(Node *node,
 static Node *flatten_join_alias_vars_mutator(Node *node,
 								flatten_join_alias_vars_context *context);
 static Relids alias_relid_set(PlannerInfo *root, Relids relids);
+static Node **rtable_to_array(List *rtable);
 
+/*
+ * cdb_walk_vars
+ *	  Invoke callback function on each Var and/or Aggref node in an expression.
+ *    If a callback returns true, no further nodes are visited, and true is
+ *    returned.  Otherwise after visiting all nodes, false is returned.
+ *
+ * Will recurse into sublinks.	Also, may be invoked directly on a Query.
+ */
+typedef struct Cdb_walk_vars_context
+{
+    Cdb_walk_vars_callback_Var      	callback_var;
+    Cdb_walk_vars_callback_Aggref   	callback_aggref;
+    Cdb_walk_vars_callback_CurrentOf    callback_currentof;
+    Cdb_walk_vars_callback_placeholdervar callback_placeholdervar;
+    void                           	   *context;
+    int                             	sublevelsup;
+} Cdb_walk_vars_context;
+
+static bool
+cdb_walk_vars_walker(Node *node, void *wvwcontext)
+{
+    Cdb_walk_vars_context  *ctx = (Cdb_walk_vars_context *)wvwcontext;
+
+	if (node == NULL)
+		return false;
+
+    if (IsA(node, Var) &&
+        ctx->callback_var != NULL)
+		return ctx->callback_var((Var *)node, ctx->context, ctx->sublevelsup);
+
+    if (IsA(node, Aggref) &&
+        ctx->callback_aggref != NULL)
+        return ctx->callback_aggref((Aggref *)node, ctx->context, ctx->sublevelsup);
+
+    if (IsA(node, CurrentOfExpr) &&
+        ctx->callback_currentof != NULL)
+        return ctx->callback_currentof((CurrentOfExpr *)node, ctx->context, ctx->sublevelsup);
+	
+    if (IsA(node, PlaceHolderVar) &&
+        ctx->callback_placeholdervar != NULL)
+        return ctx->callback_placeholdervar((PlaceHolderVar *)node, ctx->context, ctx->sublevelsup);
+	
+    if (IsA(node, Query))
+	{
+		bool    b;
+
+		/* Recurse into subselects */
+		ctx->sublevelsup++;
+		b = query_tree_walker((Query *)node, cdb_walk_vars_walker, ctx, 0);
+		ctx->sublevelsup--;
+		return b;
+	}
+	return expression_tree_walker(node, cdb_walk_vars_walker, ctx);
+}                               /* cdb_walk_vars_walker */
+
+bool
+cdb_walk_vars(Node                         *node,
+              Cdb_walk_vars_callback_Var    callback_var,
+              Cdb_walk_vars_callback_Aggref callback_aggref,
+              Cdb_walk_vars_callback_CurrentOf callback_currentof,
+              Cdb_walk_vars_callback_placeholdervar callback_placeholdervar,
+              void                         *context,
+              int                           levelsup)
+{
+	Cdb_walk_vars_context   ctx;
+
+    ctx.callback_var = callback_var;
+    ctx.callback_aggref = callback_aggref;
+    ctx.callback_currentof = callback_currentof;
+    ctx.callback_placeholdervar = callback_placeholdervar;
+    ctx.context = context;
+    ctx.sublevelsup = levelsup;
+
+	/*
+	 * Must be prepared to start with a Query or a bare expression tree; if
+	 * it's a Query, we don't want to increment levelsdown.
+	 */
+	return query_or_expression_tree_walker(node, cdb_walk_vars_walker, &ctx, 0);
+}                               /* cdb_walk_vars */
 
 /*
  * pull_varnos
@@ -92,24 +178,11 @@ static Relids alias_relid_set(PlannerInfo *root, Relids relids);
  * references to the desired rtable level!	But when we find a completed
  * SubPlan, we only need to look at the parameters passed to the subplan.
  */
+
 Relids
 pull_varnos(Node *node)
 {
-	pull_varnos_context context;
-
-	context.varnos = NULL;
-	context.sublevels_up = 0;
-
-	/*
-	 * Must be prepared to start with a Query or a bare expression tree; if
-	 * it's a Query, we don't want to increment sublevels_up.
-	 */
-	query_or_expression_tree_walker(node,
-									pull_varnos_walker,
-									(void *) &context,
-									0);
-
-	return context.varnos;
+	return pull_varnos_of_level(node, 0);
 }
 
 /*
@@ -136,6 +209,16 @@ pull_varnos_of_level(Node *node, int levelsup)
 
 	return context.varnos;
 }
+
+/*
+ * CDB
+ */
+Relids
+pull_upper_varnos(Node *node)
+{
+	return pull_varnos_of_level(node, 1);
+}
+
 
 static bool
 pull_varnos_walker(Node *node, pull_varnos_context *context)
@@ -252,6 +335,45 @@ pull_varattnos_walker(Node *node, pull_varattnos_context *context)
 								  (void *) context);
 }
 
+static bool
+contain_ctid_var_reference_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var))
+	{
+		Var		   *var = (Var *) node;
+		Index		scanrelid = *((Index *) context);
+
+		if (var->varno == scanrelid &&
+			var->varattno == SelfItemPointerAttributeNumber &&
+			(int)var->varlevelsup == 0)
+		{
+			return true;		/* abort the tree traversal and return true */
+		}
+	}
+	return expression_tree_walker(node, contain_ctid_var_reference_walker, context);
+}
+
+bool
+contain_ctid_var_reference(Scan *scan)
+{
+	Index	   scanrelid = scan->scanrelid;
+
+	/* Check if targetlist contains a var node referencing the ctid column */
+	if (expression_tree_walker((Node *) scan->plan.targetlist,
+							   contain_ctid_var_reference_walker,
+							   &scanrelid))
+		return true;
+
+	/* Check if qual contains a var node referencing the ctid column */
+	if (expression_tree_walker((Node *) scan->plan.qual,
+							   contain_ctid_var_reference_walker,
+							   &scanrelid))
+		return true;
+
+	return false;
+}
 
 /*
  * pull_vars_of_level
@@ -492,6 +614,67 @@ locate_var_of_level_walker(Node *node,
 								  (void *) context);
 }
 
+/*
+ * contain_vars_of_level_or_above
+ *	  Recursively scan a clause to discover whether it contains any Var or
+ *    Aggref nodes of the specified query level or above.  For example,
+ *    pass 1 to detect all nonlocal Vars.
+ *
+ *	  Returns true if any such Var found.
+ *
+ * Will recurse into sublinks.	Also, may be invoked directly on a Query.
+ */
+static bool
+contain_vars_of_level_or_above_cbVar(Var *var, void *unused, int sublevelsup)
+{
+	if ((int)var->varlevelsup >= sublevelsup)
+		return true;		    /* abort tree traversal and return true */
+    return false;
+}
+
+static bool
+contain_vars_of_level_or_above_cbAggref(Aggref *aggref, void *unused, int sublevelsup)
+{
+	if ((int)aggref->agglevelsup >= sublevelsup)
+        return true;
+
+    /* visit aggregate's args */
+	return cdb_walk_vars((Node *)aggref->args,
+                         contain_vars_of_level_or_above_cbVar,
+                         contain_vars_of_level_or_above_cbAggref,
+						 NULL,
+                         NULL,
+                         NULL, // GPDB_84_MERGE_FIXME: Can arguments of Aggref contain PlaceHolderVars ?
+                         sublevelsup);
+}
+
+bool
+contain_vars_of_level_or_above_cbPlaceHolderVar(PlaceHolderVar *placeholdervar, void *unused, int sublevelsup)
+{
+	if(placeholdervar->phlevelsup >= sublevelsup)
+		return true;
+
+	/* visit placeholder's contained expression */
+	return cdb_walk_vars((Node*)placeholdervar->phexpr,
+						 contain_vars_of_level_or_above_cbVar,
+						 contain_vars_of_level_or_above_cbAggref,
+						 NULL,
+						 contain_vars_of_level_or_above_cbPlaceHolderVar,
+						 NULL,
+						 sublevelsup);
+}
+
+bool
+contain_vars_of_level_or_above(Node *node, int levelsup)
+{
+	return cdb_walk_vars(node,
+                         contain_vars_of_level_or_above_cbVar,
+                         contain_vars_of_level_or_above_cbAggref,
+						 NULL,
+                         contain_vars_of_level_or_above_cbPlaceHolderVar,
+                         NULL,
+                         levelsup);
+}
 
 /*
  * pull_var_clause
@@ -624,6 +807,17 @@ flatten_join_alias_vars(PlannerInfo *root, Node *node)
 	/* if hasSubLinks is already true, no need to work hard */
 	context.inserted_sublink = root->parse->hasSubLinks;
 
+	/*
+	 * The following funcation call flatten_join_alias_vars_mutator()
+	 * will walk the expr and it will frequently access root
+	 * parse tree's rtable using list_nth. When the rtable is huge,
+	 * performance is poor. Here we cache the rtable list into array
+	 * to achieve random access to speed up a lot when rtable is huge.
+	 * See Github issue https://github.com/greenplum-db/gpdb/issues/11379
+	 * for details.
+	 */
+	context.root_parse_rtable_arrray = rtable_to_array(root->parse->rtable);
+
 	return flatten_join_alias_vars_mutator(node, &context);
 }
 
@@ -642,7 +836,7 @@ flatten_join_alias_vars_mutator(Node *node,
 		/* No change unless Var belongs to a JOIN of the target level */
 		if (var->varlevelsup != context->sublevels_up)
 			return node;		/* no need to copy, really */
-		rte = rt_fetch(var->varno, context->root->parse->rtable);
+		rte = (RangeTblEntry *) (context->root_parse_rtable_arrray[var->varno-1]);
 		if (rte->rtekind != RTE_JOIN)
 			return node;
 		if (var->varattno == InvalidAttrNumber)
@@ -788,4 +982,24 @@ alias_relid_set(PlannerInfo *root, Relids relids)
 	}
 	bms_free(tmprelids);
 	return result;
+}
+
+/*
+ * Turn parse tree's rtable to array.
+ * This can speed up a lot when it uses list_nth
+ * very often and the rtable is huge.
+ */
+static Node **
+rtable_to_array(List *rtable)
+{
+	ListCell   *lc;
+	int         i;
+	Node      **arr = (Node **)palloc(sizeof(Node*) * list_length(rtable));
+
+	foreach_with_count(lc, rtable, i)
+	{
+		arr[i] = (Node *) lfirst(lc);
+	}
+
+	return arr;
 }

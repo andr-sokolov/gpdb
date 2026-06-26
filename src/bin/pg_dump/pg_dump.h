@@ -3,6 +3,8 @@
  * pg_dump.h
  *	  Common header file for the pg_dump utility
  *
+ * Portions Copyright (c) 2005-2010, Greenplum inc
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -15,6 +17,8 @@
 #define PG_DUMP_H
 
 #include "postgres_fe.h"
+#include "pqexpbuffer.h"
+#include "libpq-fe.h"
 
 /*
  * pg_dump uses two different mechanisms for identifying database objects:
@@ -108,10 +112,13 @@ typedef enum
 	DO_DEFAULT_ACL,
 	DO_BLOB,
 	DO_BLOB_DATA,
+	DO_TYPE_STORAGE_OPTIONS,
 	DO_PRE_DATA_BOUNDARY,
 	DO_POST_DATA_BOUNDARY,
 	DO_EVENT_TRIGGER,
-	DO_REFRESH_MATVIEW
+	DO_REFRESH_MATVIEW,
+
+	DO_BINARY_UPGRADE
 } DumpableObjectType;
 
 typedef struct _dumpableObject
@@ -127,6 +134,11 @@ typedef struct _dumpableObject
 	int			nDeps;			/* number of valid dependencies */
 	int			allocDeps;		/* allocated size of dependencies[] */
 } DumpableObject;
+
+typedef struct _binaryupgradeinfo
+{
+	DumpableObject dobj;
+} BinaryUpgradeInfo;
 
 typedef struct _namespaceInfo
 {
@@ -167,6 +179,32 @@ typedef struct _typeInfo
 	int			nDomChecks;
 	struct _constraintInfo *domChecks;
 } TypeInfo;
+
+typedef struct _typeCache
+{
+	DumpableObject dobj;
+
+	Oid			typnsp;
+
+	Oid			arraytypoid;
+	char	   *arraytypname;
+	Oid			arraytypnsp;
+} TypeCache;
+
+typedef struct _typeStorageOptions
+{
+	DumpableObject dobj;
+
+	/*
+	 * Note: dobj.name is the pg_type.typname entry.  format_type() might
+	 * produce something different than typname
+	 */
+	char     *typnamespace;
+	char     *typoptions; /* storage options */
+	char     *rolname;		/* name of owner, or empty string */
+} TypeStorageOptions;
+
+
 
 typedef struct _shellTypeInfo
 {
@@ -234,6 +272,7 @@ typedef struct _tableInfo
 	char	   *rolname;		/* name of owner, or empty string */
 	char	   *relacl;
 	char		relkind;
+	char		relstorage;
 	char		relpersistence; /* relation persistence */
 	bool		relispopulated; /* relation is populated */
 	char		relreplident;	/* replica identifier */
@@ -290,6 +329,8 @@ typedef struct _tableInfo
 	int			numParents;		/* number of (immediate) parent tables */
 	struct _tableInfo **parents;	/* TableInfos of immediate parents */
 	struct _tableDataInfo *dataObj;		/* TableDataInfo, if dumping its data */
+	Oid			parrelid;			/* external partition's parent oid */
+	bool		parparent;		/* true if the table is partition parent */
 	int			numTriggers;	/* number of triggers for table */
 	struct _triggerInfo *triggers;		/* array of TriggerInfo structs */
 } TableInfo;
@@ -513,7 +554,7 @@ extern char g_opaque_type[10];	/* name for the opaque type */
 struct Archive;
 typedef struct Archive Archive;
 
-extern TableInfo *getSchemaData(Archive *, int *numTablesPtr);
+extern TableInfo *getSchemaData(Archive *, int *numTablesPtr, int binary_upgrade);
 
 typedef enum _OidOptions
 {
@@ -523,6 +564,7 @@ typedef enum _OidOptions
 	zeroAsNone = 8
 } OidOptions;
 
+extern void DetectChildConstraintDropped(TableInfo *tbinfo, PQExpBuffer q); /* GPDB only */
 extern void AssignDumpId(DumpableObject *dobj);
 extern DumpId createDumpId(void);
 extern DumpId getMaxDumpId(void);
@@ -532,6 +574,8 @@ extern void getDumpableObjects(DumpableObject ***objs, int *numObjs);
 
 extern void addObjectDependency(DumpableObject *dobj, DumpId refId);
 extern void removeObjectDependency(DumpableObject *dobj, DumpId refId);
+
+extern DumpableObject *findObjectByOid(Oid oid, DumpableObject **indexArray, int numObjs);
 
 extern TableInfo *findTableByOid(Oid oid);
 extern TypeInfo *findTypeByOid(Oid oid);
@@ -552,7 +596,9 @@ extern void parseOidArray(const char *str, Oid *array, int arraysize);
 extern void sortDumpableObjects(DumpableObject **objs, int numObjs,
 					DumpId preBoundaryId, DumpId postBoundaryId);
 extern void sortDumpableObjectsByTypeName(DumpableObject **objs, int numObjs);
+#if 0 /* GPDB_100_MERGE_FIXME: we don't support pre-7.3 dumps. */
 extern void sortDumpableObjectsByTypeOid(DumpableObject **objs, int numObjs);
+#endif
 extern void sortDataAndIndexObjectsBySize(DumpableObject **objs, int numObjs);
 
 /*
@@ -593,5 +639,11 @@ extern void getExtensionMembership(Archive *fout, ExtensionInfo extinfo[],
 extern void processExtensionTables(Archive *fout, ExtensionInfo extinfo[],
 					   int numExtensions);
 extern EventTriggerInfo *getEventTriggers(Archive *fout, int *numEventTriggers);
+/* START MPP ADDITION */
+extern TypeStorageOptions *getTypeStorageOptions(Archive *fout, int *numTypes);
+extern BinaryUpgradeInfo *getBinaryUpgradeObjects(void);
+
+/* END MPP ADDITION */
+
 
 #endif   /* PG_DUMP_H */

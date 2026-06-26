@@ -115,6 +115,7 @@ typedef struct _restoreOptions
 	int			no_security_labels;		/* Skip security label entries */
 	char	   *superuser;		/* Username to use as superuser */
 	char	   *use_role;		/* Issue SET ROLE to this */
+	int			postdataSchemaRestore;
 	int			dropSchema;
 	int			if_exists;
 	const char *filename;
@@ -153,7 +154,8 @@ typedef struct _restoreOptions
 	bool		single_txn;
 
 	bool	   *idWanted;		/* array showing which dump IDs to emit */
-	int			binary_upgrade;
+
+	int			binary_upgrade;	/* GPDB: restoring for a binary upgrade */
 } RestoreOptions;
 
 typedef void (*SetupWorkerPtr) (Archive *AH, RestoreOptions *ropt);
@@ -167,7 +169,8 @@ extern void ConnectDatabase(Archive *AH,
 				const char *pghost,
 				const char *pgport,
 				const char *username,
-				enum trivalue prompt_password);
+				enum trivalue prompt_password,
+				bool binary_upgrade);
 extern void DisconnectDatabase(Archive *AHX);
 extern PGconn *GetConnection(Archive *AHX);
 
@@ -182,6 +185,8 @@ extern void ArchiveEntry(Archive *AHX,
 			 const char *dropStmt, const char *copyStmt,
 			 const DumpId *deps, int nDeps,
 			 DataDumperPtr dumpFn, void *dumpArg);
+
+extern void AmendArchiveEntry(Archive *AHX, DumpId dumpId, const char *defn);
 
 /* Called to write *data* to the archive */
 extern void WriteData(Archive *AH, const void *data, size_t dLen);

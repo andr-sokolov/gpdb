@@ -19,14 +19,16 @@
 /*
  * toasting.c prototypes
  */
-extern void NewRelationCreateToastTable(Oid relOid, Datum reloptions);
+extern void NewRelationCreateToastTable(Oid relOid, Datum reloptions,
+									   bool is_part_child, bool is_part_parent);
 extern void NewHeapCreateToastTable(Oid relOid, Datum reloptions,
-						LOCKMODE lockmode);
+									LOCKMODE lockmode,
+									bool is_part_child, bool is_part_parent);
 extern void AlterTableCreateToastTable(Oid relOid, Datum reloptions,
-						   LOCKMODE lockmode);
+									   LOCKMODE lockmode,
+									   bool is_part_child, bool is_part_parent);
 extern void BootstrapToastTable(char *relName,
 					Oid toastOid, Oid toastIndexOid);
-
 
 /*
  * This macro is just to keep the C compiler from spitting up on the
@@ -46,6 +48,7 @@ extern void BootstrapToastTable(char *relName,
  */
 
 /* normal catalogs */
+DECLARE_TOAST(pg_extension, 5510, 5511);
 DECLARE_TOAST(pg_attrdef, 2830, 2831);
 DECLARE_TOAST(pg_constraint, 2832, 2833);
 DECLARE_TOAST(pg_description, 2834, 2835);
@@ -62,5 +65,18 @@ DECLARE_TOAST(pg_shdescription, 2846, 2847);
 DECLARE_TOAST(pg_db_role_setting, 2966, 2967);
 #define PgDbRoleSettingToastTable 2966
 #define PgDbRoleSettingToastIndex 2967
+
+/* relation id: 5036 - gp_segment_configuration 20101122 */
+DECLARE_TOAST(gp_segment_configuration, 6092, 6093);
+#define GpSegmentConfigToastTable	6092
+#define GpSegmentConfigToastIndex	6093
+/* relation id: 6220 - pg_type_encoding 20110727 */
+DECLARE_TOAST(pg_type_encoding, 6222, 6223);
+#define PgTypeEncodingToastTable	6222
+#define PgTypeEncodingToastIndex	6223
+/* relation id: 9903 - pg_partition_encoding 20110814 */
+DECLARE_TOAST(pg_partition_encoding, 9905, 9906);
+#define PgPartitionEncodingToastTable	9905
+#define PgPartitionEncodingToastIndex	9906
 
 #endif   /* TOASTING_H */

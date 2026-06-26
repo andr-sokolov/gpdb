@@ -20,22 +20,6 @@
 #include "lib/stringinfo.h"
 #include "libpq/libpq-be.h"
 
-/* ----------------
- * PQArgBlock
- *		Information (pointer to array of this structure) required
- *		for the PQfn() call.  (This probably ought to go somewhere else...)
- * ----------------
- */
-typedef struct
-{
-	int			len;
-	int			isint;
-	union
-	{
-		int		   *ptr;		/* can't use void (dec compiler barfs)	 */
-		int			integer;
-	}			u;
-} PQArgBlock;
 
 /*
  * External functions.
@@ -53,6 +37,7 @@ extern void TouchSocketFiles(void);
 extern void RemoveSocketFiles(void);
 extern void pq_init(void);
 extern void pq_comm_reset(void);
+extern void pq_comm_close_fatal(void);                                  /* GPDB only */
 extern int	pq_getbytes(char *s, size_t len);
 extern int	pq_getstring(StringInfo s);
 extern void pq_startmsgread(void);
@@ -70,6 +55,7 @@ extern int	pq_putmessage(char msgtype, const char *s, size_t len);
 extern void pq_putmessage_noblock(char msgtype, const char *s, size_t len);
 extern void pq_startcopyout(void);
 extern void pq_endcopyout(bool errorAbort);
+extern bool pq_waitForDataUsingSelect(void);                /* GPDB only */
 
 /*
  * prototypes for functions in be-secure.c

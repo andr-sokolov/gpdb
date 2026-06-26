@@ -14,29 +14,39 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
+#include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/xact.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/objectaccess.h"
+#include "catalog/oid_dispatch.h"
+#include "catalog/pg_depend.h"
 #include "catalog/pg_language.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_proc_callback.h"
 #include "catalog/pg_proc_fn.h"
 #include "catalog/pg_type.h"
+#include "catalog/pg_rewrite.h"
 #include "executor/functions.h"
 #include "funcapi.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
+#include "parser/parse_expr.h"
 #include "parser/parse_type.h"
 #include "tcop/pquery.h"
 #include "tcop/tcopprot.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
+#include "utils/tqual.h"
+#include "cdb/cdbvars.h"
 
 
 Datum		fmgr_internal_validator(PG_FUNCTION_ARGS);
@@ -73,6 +83,7 @@ ProcedureCreate(const char *procedureName,
 				Oid proowner,
 				Oid languageObjectId,
 				Oid languageValidator,
+				Oid describeFuncOid,
 				const char *prosrc,
 				const char *probin,
 				bool isAgg,
@@ -88,7 +99,9 @@ ProcedureCreate(const char *procedureName,
 				List *parameterDefaults,
 				Datum proconfig,
 				float4 procost,
-				float4 prorows)
+				float4 prorows,
+				char prodataaccess,
+				char proexeclocation)
 {
 	Oid			retval;
 	int			parameterCount;
@@ -370,6 +383,8 @@ ProcedureCreate(const char *procedureName,
 	else
 		nulls[Anum_pg_proc_proconfig - 1] = true;
 	/* proacl will be determined later */
+	values[Anum_pg_proc_prodataaccess - 1] = CharGetDatum(prodataaccess);
+	values[Anum_pg_proc_proexeclocation - 1] = CharGetDatum(proexeclocation);
 
 	rel = heap_open(ProcedureRelationId, RowExclusiveLock);
 	tupDesc = RelationGetDescr(rel);
@@ -386,13 +401,14 @@ ProcedureCreate(const char *procedureName,
 		Form_pg_proc oldproc = (Form_pg_proc) GETSTRUCT(oldtup);
 		Datum		proargnames;
 		bool		isnull;
+		Oid oldOid = HeapTupleGetOid(oldtup);
 
 		if (!replace)
 			ereport(ERROR,
 					(errcode(ERRCODE_DUPLICATE_FUNCTION),
 			errmsg("function \"%s\" already exists with same argument types",
 				   procedureName)));
-		if (!pg_proc_ownercheck(HeapTupleGetOid(oldtup), proowner))
+		if (!pg_proc_ownercheck(oldOid, proowner))
 			aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_PROC,
 						   procedureName);
 
@@ -424,7 +440,7 @@ ProcedureCreate(const char *procedureName,
 			if (olddesc == NULL && newdesc == NULL)
 				 /* ok, both are runtime-defined RECORDs */ ;
 			else if (olddesc == NULL || newdesc == NULL ||
-					 !equalTupleDescs(olddesc, newdesc))
+					 !equalTupleDescs(olddesc, newdesc, true))
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
 					errmsg("cannot change return type of existing function"),
@@ -529,7 +545,54 @@ ProcedureCreate(const char *procedureName,
 			}
 		}
 
-		/* Can't change aggregate or window-function status, either */
+		/*
+		 * Cannot add a describe callback to a function that has views defined
+		 * on it.  This restriction is for the same set of reasons that we 
+		 * cannot change the return type of existing functions.
+		 */
+		if (OidIsValid(describeFuncOid))
+		{
+			Relation	depRel;
+			ScanKeyData key[3];
+			SysScanDesc scan;
+			HeapTuple   depTup;
+
+			depRel = heap_open(DependRelationId, AccessShareLock);
+
+			/*
+			 * This is equivalent to:
+			 *
+			 * SELECT * FROM pg_depend
+			 * WHERE refclassid = :1 AND refobjid = :2 AND classid = :3
+			 */
+			ScanKeyInit(&key[0],
+						Anum_pg_depend_refclassid,
+						BTEqualStrategyNumber, F_OIDEQ,
+						ObjectIdGetDatum(ProcedureRelationId));
+			ScanKeyInit(&key[1],
+						Anum_pg_depend_refobjid,
+						BTEqualStrategyNumber, F_OIDEQ,
+						ObjectIdGetDatum(oldOid));
+
+			scan = systable_beginscan(depRel, DependReferenceIndexId, true,
+									  NULL, 2, key);
+
+			while (HeapTupleIsValid(depTup = systable_getnext(scan)))
+			{
+				Form_pg_depend depData = (Form_pg_depend) GETSTRUCT(depTup);
+				if (depData->classid == RewriteRelationId)
+				{
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+							 errmsg("cannot add DESCRIBE callback to function used in view(s)")));
+				}
+			}
+			systable_endscan(scan);
+
+			heap_close(depRel, AccessShareLock);
+		}
+
+		/* Can't change aggregate or window status, either */
 		if (oldproc->proisagg != isAgg)
 		{
 			if (oldproc->proisagg)
@@ -600,7 +663,10 @@ ProcedureCreate(const char *procedureName,
 	 * shared dependencies do *not* need to change, and we leave them alone.)
 	 */
 	if (is_update)
+	{
 		deleteDependencyRecordsFor(ProcedureRelationId, retval, true);
+		deleteProcCallbacks(retval);
+	}
 
 	myself.classId = ProcedureRelationId;
 	myself.objectId = retval;
@@ -623,6 +689,16 @@ ProcedureCreate(const char *procedureName,
 	referenced.objectId = returnType;
 	referenced.objectSubId = 0;
 	recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+
+	/* dependency on describe function */
+	if (OidIsValid(describeFuncOid))
+	{
+		referenced.classId = ProcedureRelationId;
+		referenced.objectId = describeFuncOid;
+		referenced.objectSubId = 0;
+		recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+		addProcCallback(retval, describeFuncOid, PROMETHOD_DESCRIBE);
+	}
 
 	/* dependency on parameter types */
 	for (i = 0; i < allParamCount; i++)
@@ -972,7 +1048,7 @@ function_parse_error_transpose(const char *prosrc)
 	}
 
 	/* We can get the original query text from the active portal (hack...) */
-	Assert(ActivePortal && ActivePortal->status == PORTAL_ACTIVE);
+	/* Assert(ActivePortal && PortalGetStatus(ActivePortal) == PORTAL_ACTIVE); */
 	queryText = ActivePortal->sourceText;
 
 	/* Try to locate the prosrc in the original text */
