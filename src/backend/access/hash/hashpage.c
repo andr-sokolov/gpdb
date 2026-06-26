@@ -107,9 +107,13 @@ _hash_droplock(Relation rel, BlockNumber whichlock, int access)
  *		requested buffer and its reference count has been incremented
  *		(ie, the buffer is "locked and pinned").
  *
- *		P_NEW is disallowed because this routine can only be used
+ *		P_NEW is disallowed because this routine should only be used
  *		to access pages that are known to be before the filesystem EOF.
  *		Extending the index should be done with _hash_getnewbuf.
+ *
+ *		All call sites should call either _hash_checkpage or _hash_pageinit
+ *		on the returned page, depending on whether the block is expected
+ *		to be valid or not.
  */
 Buffer
 _hash_getbuf(Relation rel, BlockNumber blkno, int access, int flags)
@@ -249,7 +253,7 @@ _hash_getbuf_with_strategy(Relation rel, BlockNumber blkno,
  * Lock and pin (refcount) are both dropped.
  */
 void
-_hash_relbuf(Relation rel, Buffer buf)
+_hash_relbuf(Relation rel __attribute__((unused)), Buffer buf)
 {
 	UnlockReleaseBuffer(buf);
 }
@@ -260,7 +264,7 @@ _hash_relbuf(Relation rel, Buffer buf)
  * This is used to unpin a buffer on which we hold no lock.
  */
 void
-_hash_dropbuf(Relation rel, Buffer buf)
+_hash_dropbuf(Relation rel __attribute__((unused)), Buffer buf)
 {
 	ReleaseBuffer(buf);
 }
@@ -278,7 +282,7 @@ _hash_dropbuf(Relation rel, Buffer buf)
  * can't be combined with releasing.
  */
 void
-_hash_wrtbuf(Relation rel, Buffer buf)
+_hash_wrtbuf(Relation rel __attribute__((unused)), Buffer buf)
 {
 	MarkBufferDirty(buf);
 	UnlockReleaseBuffer(buf);
@@ -297,7 +301,7 @@ _hash_wrtbuf(Relation rel, Buffer buf)
  * as HASH_READ (a bit ugly, but handy in some places).
  */
 void
-_hash_chgbufaccess(Relation rel,
+_hash_chgbufaccess(Relation rel __attribute__((unused)),
 				   Buffer buf,
 				   int from_access,
 				   int to_access)

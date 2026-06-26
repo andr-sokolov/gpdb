@@ -36,6 +36,7 @@
 #define FRONTEND 1
 
 #include "postgres.h"
+#include "pgtime.h"
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -63,16 +64,16 @@ static const char *progname;
 static uint32 set_xid_epoch = (uint32) -1;
 static TransactionId set_xid = 0;
 static Oid	set_oid = 0;
+static Oid	set_relfilenode = 0;
 static MultiXactId set_mxid = 0;
 static MultiXactOffset set_mxoff = (MultiXactOffset) -1;
+static int32 set_data_checksum_version = -1;
 static uint32 minXlogTli = 0;
 static XLogSegNo minXlogSegNo = 0;
 
-#ifdef WIN32
-static char *restrict_env;
-#endif
-
 static void CheckDataVersion(void);
+static uint64 system_identifier = 0;
+
 static bool ReadControlFile(void);
 static void GuessControlValues(void);
 static void PrintControlValues(bool guessed);
@@ -83,18 +84,34 @@ static void KillExistingXLOG(void);
 static void KillExistingArchiveStatus(void);
 static void WriteEmptyXLOG(void);
 static void usage(void);
+static bool AcceptWarning(void);
 static void	get_restricted_token(const char *progname);
 
 #ifdef WIN32
 static int	CreateRestrictedProcess(char *cmd, PROCESS_INFORMATION *processInfo, const char *progname);
 #endif
 
+#ifndef BUFFER_LEN
+#define BUFFER_LEN (2 * (MAXPGPATH))
+#endif
 
 int
 main(int argc, char *argv[])
 {
+	/*
+	 * GPDB_MERGE_110_FIXME: The option numbers below start at 1000 to avoid
+	 * conflicts with upstream. When e22b27f0cb3e arrives, you should be able to
+	 * merge this cleanly into the upstream long_options structure.
+	 */
+	static struct option long_options[] = {
+		{"binary-upgrade", no_argument, NULL, 1000},
+		{"system-identifier", required_argument, NULL, 1001},
+		{NULL, 0, NULL, 0}
+	};
+
 	int			c;
 	bool		force = false;
+	bool		binary_upgrade = false;
 	bool		noupdate = false;
 	MultiXactId set_oldestmxid = 0;
 	char	   *endptr;
@@ -115,13 +132,18 @@ main(int argc, char *argv[])
 		}
 		if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)
 		{
-			puts("pg_resetxlog (PostgreSQL) " PG_VERSION);
+			puts("pg_resetxlog (Greenplum Database) " PG_VERSION);
+			exit(0);
+		}
+		if (strcmp(argv[1], "--gp-version") == 0)
+		{
+			puts("pg_resetxlog (Greenplum Database) " GP_VERSION);
 			exit(0);
 		}
 	}
 
 
-	while ((c = getopt(argc, argv, "fl:m:no:O:x:e:")) != -1)
+	while ((c = getopt_long(argc, argv, "fl:m:no:r:O:x:e:k:", long_options, NULL)) != -1)
 	{
 		switch (c)
 		{
@@ -174,6 +196,21 @@ main(int argc, char *argv[])
 				if (set_oid == 0)
 				{
 					fprintf(stderr, _("%s: OID (-o) must not be 0\n"), progname);
+					exit(1);
+				}
+				break;
+
+			case 'r':
+				set_relfilenode = strtoul(optarg, &endptr, 0);
+				if (endptr == optarg || *endptr != '\0')
+				{
+					fprintf(stderr, _("%s: invalid argument for option -r\n"), progname);
+					fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
+					exit(1);
+				}
+				if (set_relfilenode == 0)
+				{
+					fprintf(stderr, _("%s: relfilenode (-r) must not be 0\n"), progname);
 					exit(1);
 				}
 				break;
@@ -237,6 +274,48 @@ main(int argc, char *argv[])
 				XLogFromFileName(optarg, &minXlogTli, &minXlogSegNo);
 				break;
 
+			case 'k':
+				set_data_checksum_version = strtol(optarg, &endptr, 0);
+				if (endptr == optarg || *endptr != '\0')
+				{
+					fprintf(stderr, _("%s: invalid argument for option -k\n"), progname);
+					fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
+					exit(1);
+				}
+				if (set_data_checksum_version < 0 || set_data_checksum_version > PG_DATA_CHECKSUM_VERSION)
+				{
+					fprintf(stderr, _("%s: data_checksum_version (-k) must be within 0..%d\n"),
+					        progname, PG_DATA_CHECKSUM_VERSION);
+					exit(1);
+				}
+				break;
+
+			/* GPDB-specific long options */
+			case 1000: /* --binary-upgrade */
+				binary_upgrade = true;
+				break;
+
+			case 1001: /* --system-identifier */
+#if SIZEOF_LONG >= 8
+				system_identifier = strtoul(optarg, &endptr, 0);
+#elif defined(HAVE_STRTOULL)
+				system_identifier = strtoull(optarg, &endptr, 0);
+#else
+#	error "The --system-identifier option requires 64-bit support."
+#endif
+				if (endptr == optarg || *endptr != '\0')
+				{
+					fprintf(stderr, _("%s: invalid argument for --system-identifier\n"), progname);
+					fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
+					exit(1);
+				}
+				if (system_identifier == 0)
+				{
+					fprintf(stderr, _("%s: argument of --system-identifier must not be 0\n"), progname);
+					exit(1);
+				}
+				break;
+
 			default:
 				fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
 				exit(1);
@@ -266,6 +345,14 @@ main(int argc, char *argv[])
 		exit(1);
 	}
 #endif
+
+	/* GPDB: only allow setting --system-identifier during upgrade. */
+	if (!binary_upgrade && system_identifier)
+	{
+		fprintf(stderr, _("%s: setting --system-identifier is allowed only during binary upgrade\n"),
+				progname);
+		exit(1);
+	}
 
 	get_restricted_token(progname);
 	DataDir = argv[optind];
@@ -346,6 +433,9 @@ main(int argc, char *argv[])
 	if (set_oid != 0)
 		ControlFile.checkPointCopy.nextOid = set_oid;
 
+	if (set_relfilenode != 0)
+		ControlFile.checkPointCopy.nextRelfilenode = set_relfilenode;
+
 	if (set_mxid != 0)
 	{
 		ControlFile.checkPointCopy.nextMulti = set_mxid;
@@ -367,6 +457,12 @@ main(int argc, char *argv[])
 
 	if (minXlogSegNo > newXlogSegNo)
 		newXlogSegNo = minXlogSegNo;
+
+	if (system_identifier != 0)
+		ControlFile.system_identifier = system_identifier;
+
+	if (set_data_checksum_version != -1)
+		ControlFile.data_checksum_version = (uint32) set_data_checksum_version;
 
 	/*
 	 * If we had to guess anything, and -f was not given, just print the
@@ -396,6 +492,15 @@ main(int argc, char *argv[])
 	}
 
 	/*
+	 * Warn user of using pg_resetxlog with GPDB
+	 */
+	if(!binary_upgrade && !AcceptWarning())
+	{
+		printf(_("Abort %s!\n"), progname);
+		exit(1);
+	}
+
+	/*
 	 * Else, do the dirty deed.
 	 */
 	RewriteControlFile();
@@ -407,6 +512,43 @@ main(int argc, char *argv[])
 	return 0;
 }
 
+/*
+ * Before making actual changes to xlog, warn user doing so might corrupt
+ * GPDB cluster.
+ *
+ * Return true if user accept the risk described in the warning.
+ */
+static bool
+AcceptWarning(void)
+{
+	int		ret;
+	char	response[5];
+
+	/* initialize response to empty string. */
+	response[0] = 0;
+
+	printf(_("WARNING: Do not use this on Greenplum. %s might cause data loss\n"
+			"and render system irrecoverable. Do you wish to proceed? [yes/no] "), progname);
+
+	/* Reading up to 4 letters instead of just 3 to ensure something like
+	 * "yesterday" won't be counted as "yes". Then discard anything after
+	 * the 4th character.
+	 */
+	ret = scanf("%4[^\n]%*[^\n]", response);
+
+	/* Protection against failed scanf result in uninitialized response.*/
+	if (ret == EOF || ret != 1)
+	{
+		return false;
+	}
+
+	if (strcmp(response, "yes") == 0 || strcmp(response, "Y") == 0)
+	{
+		return true;
+	}
+
+	return false;
+}
 
 /*
  * Look at the version string stored in PG_VERSION and decide if this utility
@@ -519,13 +661,11 @@ ReadControlFile(void)
 	  ((ControlFileData *) buffer)->pg_control_version == PG_CONTROL_VERSION)
 	{
 		/* Check the CRC. */
-		INIT_CRC32(crc);
-		COMP_CRC32(crc,
-				   buffer,
-				   offsetof(ControlFileData, crc));
-		FIN_CRC32(crc);
+		INIT_CRC32C(crc);
+		COMP_CRC32C(crc, buffer, offsetof(ControlFileData, crc));
+		FIN_CRC32C(crc);
 
-		if (EQ_CRC32(crc, ((ControlFileData *) buffer)->crc))
+		if (EQ_CRC32C(crc, ((ControlFileData *) buffer)->crc))
 		{
 			/* Valid data... */
 			memcpy(&ControlFile, buffer, sizeof(ControlFile));
@@ -583,6 +723,7 @@ GuessControlValues(void)
 	ControlFile.checkPointCopy.nextXidEpoch = 0;
 	ControlFile.checkPointCopy.nextXid = FirstNormalTransactionId;
 	ControlFile.checkPointCopy.nextOid = FirstBootstrapObjectId;
+	ControlFile.checkPointCopy.nextRelfilenode = FirstBootstrapObjectId;
 	ControlFile.checkPointCopy.nextMulti = FirstMultiXactId;
 	ControlFile.checkPointCopy.nextMultiOffset = 0;
 	ControlFile.checkPointCopy.oldestXid = FirstNormalTransactionId;
@@ -623,6 +764,7 @@ GuessControlValues(void)
 #endif
 	ControlFile.float4ByVal = FLOAT4PASSBYVAL;
 	ControlFile.float8ByVal = FLOAT8PASSBYVAL;
+	ControlFile.data_checksum_version = PG_DATA_CHECKSUM_VERSION;
 
 	/*
 	 * XXX eventually, should try to grovel through old XLOG to develop more
@@ -669,6 +811,8 @@ PrintControlValues(bool guessed)
 		   ControlFile.checkPointCopy.nextXid);
 	printf(_("Latest checkpoint's NextOID:          %u\n"),
 		   ControlFile.checkPointCopy.nextOid);
+	printf(_("Latest checkpoint's NextRelfilenode:  %u\n"),
+		   ControlFile.checkPointCopy.nextRelfilenode);
 	printf(_("Latest checkpoint's NextMultiXactId:  %u\n"),
 		   ControlFile.checkPointCopy.nextMulti);
 	printf(_("Latest checkpoint's NextMultiOffset:  %u\n"),
@@ -749,6 +893,12 @@ PrintNewControlValues()
 			   ControlFile.checkPointCopy.nextOid);
 	}
 
+	if (set_relfilenode != 0)
+	{
+		printf(_("NextRelfilenode:                      %u\n"),
+			   ControlFile.checkPointCopy.nextRelfilenode);
+	}
+
 	if (set_xid != 0)
 	{
 		printf(_("NextXID:                              %u\n"),
@@ -763,6 +913,27 @@ PrintNewControlValues()
 	{
 		printf(_("NextXID epoch:                        %u\n"),
 			   ControlFile.checkPointCopy.nextXidEpoch);
+	}
+
+	if (set_data_checksum_version != -1)
+	{
+		printf(_("Data page checksum version:           %u\n"),
+			   ControlFile.data_checksum_version);
+	}
+
+	if (system_identifier != 0)
+	{
+		char		sysident_str[32];
+
+		/*
+		 * Format system_identifier separately to keep platform-dependent
+		 * format code out of the translatable message string.
+		 */
+		snprintf(sysident_str, sizeof(sysident_str), UINT64_FORMAT,
+				 ControlFile.system_identifier);
+
+		printf(_("Database system identifier:           %s\n"),
+			   sysident_str);
 	}
 }
 
@@ -810,11 +981,9 @@ RewriteControlFile(void)
 	ControlFile.xlog_seg_size = XLogSegSize;
 
 	/* Contents are protected with a CRC */
-	INIT_CRC32(ControlFile.crc);
-	COMP_CRC32(ControlFile.crc,
-			   (char *) &ControlFile,
-			   offsetof(ControlFileData, crc));
-	FIN_CRC32(ControlFile.crc);
+	INIT_CRC32C(ControlFile.crc);
+	COMP_CRC32C(ControlFile.crc, &ControlFile, offsetof(ControlFileData, crc));
+	FIN_CRC32C(ControlFile.crc);
 
 	/*
 	 * We write out PG_CONTROL_SIZE bytes into pg_control, zero-padding the
@@ -1093,10 +1262,10 @@ WriteEmptyXLOG(void)
 	memcpy(XLogRecGetData(record), &ControlFile.checkPointCopy,
 		   sizeof(CheckPoint));
 
-	INIT_CRC32(crc);
-	COMP_CRC32(crc, &ControlFile.checkPointCopy, sizeof(CheckPoint));
-	COMP_CRC32(crc, (char *) record, offsetof(XLogRecord, xl_crc));
-	FIN_CRC32(crc);
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, &ControlFile.checkPointCopy, sizeof(CheckPoint));
+	COMP_CRC32C(crc, (char *) record, offsetof(XLogRecord, xl_crc));
+	FIN_CRC32C(crc);
 	record->xl_crc = crc;
 
 	/* Write the first page */
@@ -1313,13 +1482,18 @@ usage(void)
 	printf(_("Options:\n"));
 	printf(_("  -e XIDEPOCH      set next transaction ID epoch\n"));
 	printf(_("  -f               force update to be done\n"));
+	printf(_("  -k data_checksum_version     set data_checksum_version\n"));
 	printf(_("  -l XLOGFILE      force minimum WAL starting location for new transaction log\n"));
 	printf(_("  -m MXID,MXID     set next and oldest multitransaction ID\n"));
 	printf(_("  -n               no update, just show what would be done (for testing)\n"));
 	printf(_("  -o OID           set next OID\n"));
+	printf(_("  -r RELFILENODE  set next RELFILENODE\n"));
 	printf(_("  -O OFFSET        set next multitransaction offset\n"));
 	printf(_("  -V, --version    output version information, then exit\n"));
 	printf(_("  -x XID           set next transaction ID\n"));
+	printf(_("  --system-identifier=ID\n"
+			 "                   set database system identifier\n"));
 	printf(_("  -?, --help       show this help, then exit\n"));
-	printf(_("\nReport bugs to <pgsql-bugs@postgresql.org>.\n"));
+	printf(_("  --gp-version    output Greenplum version information, then exit\n"));
+	printf(_("\nReport bugs to <bugs@greenplum.org>.\n"));
 }

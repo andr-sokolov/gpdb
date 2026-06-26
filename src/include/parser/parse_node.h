@@ -17,6 +17,7 @@
 #include "nodes/parsenodes.h"
 #include "utils/relcache.h"
 
+struct HTAB;  /* utils/hsearch.h */
 
 /*
  * Expression kinds distinguished by transformExpr().  Many of these are not
@@ -42,7 +43,7 @@ typedef enum ParseExprKind
 	EXPR_KIND_FILTER,			/* FILTER */
 	EXPR_KIND_WINDOW_PARTITION, /* window definition PARTITION BY */
 	EXPR_KIND_WINDOW_ORDER,		/* window definition ORDER BY */
-	EXPR_KIND_WINDOW_FRAME_RANGE,		/* window frame clause with RANGE */
+	EXPR_KIND_WINDOW_FRAME_RANGE,	/* window frame clause with RANGE */
 	EXPR_KIND_WINDOW_FRAME_ROWS,	/* window frame clause with ROWS */
 	EXPR_KIND_SELECT_TARGET,	/* SELECT target list item */
 	EXPR_KIND_INSERT_TARGET,	/* INSERT target list item */
@@ -61,9 +62,13 @@ typedef enum ParseExprKind
 	EXPR_KIND_FUNCTION_DEFAULT, /* default parameter value for function */
 	EXPR_KIND_INDEX_EXPRESSION, /* index expression */
 	EXPR_KIND_INDEX_PREDICATE,	/* index predicate */
-	EXPR_KIND_ALTER_COL_TRANSFORM,		/* transform expr in ALTER COLUMN TYPE */
+	EXPR_KIND_ALTER_COL_TRANSFORM,	/* transform expr in ALTER COLUMN TYPE */
 	EXPR_KIND_EXECUTE_PARAMETER,	/* parameter value in EXECUTE */
-	EXPR_KIND_TRIGGER_WHEN		/* WHEN condition in CREATE TRIGGER */
+	EXPR_KIND_TRIGGER_WHEN,		/* WHEN condition in CREATE TRIGGER */
+	EXPR_KIND_PARTITION_EXPRESSION, /* PARTITION BY expression */
+
+	/* GPDB additions */
+	EXPR_KIND_SCATTER_BY		/* SCATTER BY expression */
 } ParseExprKind;
 
 
@@ -152,9 +157,16 @@ struct ParseState
 	bool		p_hasModifyingCTE;
 	bool		p_is_insert;
 	bool		p_is_update;
-	bool		p_locked_from_parent;
+	LockingClause *p_lockclause_from_parent;
 	Relation	p_target_relation;
 	RangeTblEntry *p_target_rangetblentry;
+
+	struct HTAB *p_namecache;  /* parse state object name cache */
+	bool        p_hasTblValueExpr;
+	bool        p_hasDynamicFunction; /* function w/unstable return type */
+	bool		p_hasFuncsWithExecRestrictions; /* function with EXECUTE ON MASTER / ALL SEGMENTS */
+
+	List	   *p_grp_tles;
 
 	/*
 	 * Optional hook functions for parser callbacks.  These are null unless
@@ -214,6 +226,7 @@ typedef struct ParseCallbackState
 
 extern ParseState *make_parsestate(ParseState *parentParseState);
 extern void free_parsestate(ParseState *pstate);
+extern struct HTAB *parser_get_namecache(ParseState *pstate);
 extern int	parser_errposition(ParseState *pstate, int location);
 
 extern void setup_parser_errposition_callback(ParseCallbackState *pcbstate,

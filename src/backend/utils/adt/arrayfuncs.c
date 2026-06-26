@@ -18,6 +18,7 @@
 
 #include "access/htup_details.h"
 #include "funcapi.h"
+#include "access/tupmacs.h"
 #include "libpq/pqformat.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -25,6 +26,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/typcache.h"
+#include "catalog/pg_type.h"
 
 
 /*
@@ -343,6 +345,8 @@ array_in(PG_FUNCTION_ARGS)
 
 	/* This checks for overflow of the array dimensions */
 	nitems = ArrayGetNItems(ndim, dim);
+	ArrayCheckBounds(ndim, dim, lBound);
+
 	/* Empty array? */
 	if (nitems == 0)
 		PG_RETURN_ARRAYTYPE_P(construct_empty_array(element_type));
@@ -962,7 +966,7 @@ CopyArrayEls(ArrayType *array,
 		if (bitmap)
 		{
 			bitmask <<= 1;
-			if (bitmask == 0x100)
+			if (bitmask == 0x100 /* (1<<8) */)
 			{
 				*bitmap++ = bitval;
 				bitval = 0;
@@ -1140,7 +1144,7 @@ array_out(PG_FUNCTION_ARGS)
 		if (bitmap)
 		{
 			bitmask <<= 1;
-			if (bitmask == 0x100)
+			if (bitmask == 0x100 /* (1<<8) */)
 			{
 				bitmap++;
 				bitmask = 1;
@@ -1306,24 +1310,11 @@ array_recv(PG_FUNCTION_ARGS)
 	{
 		dim[i] = pq_getmsgint(buf, 4);
 		lBound[i] = pq_getmsgint(buf, 4);
-
-		/*
-		 * Check overflow of upper bound. (ArrayNItems() below checks that
-		 * dim[i] >= 0)
-		 */
-		if (dim[i] != 0)
-		{
-			int			ub = lBound[i] + dim[i] - 1;
-
-			if (lBound[i] > ub)
-				ereport(ERROR,
-						(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-						 errmsg("integer out of range")));
-		}
 	}
 
 	/* This checks for overflow of array dimensions */
 	nitems = ArrayGetNItems(ndim, dim);
+	ArrayCheckBounds(ndim, dim, lBound);
 
 	/*
 	 * We arrange to look up info about element type, including its receive
@@ -1630,7 +1621,7 @@ array_send(PG_FUNCTION_ARGS)
 		if (bitmap)
 		{
 			bitmask <<= 1;
-			if (bitmask == 0x100)
+			if (bitmask == 0x100 /* (1<<8) */)
 			{
 				bitmap++;
 				bitmask = 1;
@@ -2133,7 +2124,7 @@ array_set(ArrayType *array,
 					(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
 					 errmsg("wrong number of array subscripts")));
 
-		if (indx[0] < 0 || indx[0] * elmlen >= arraytyplen)
+		if (indx[0] < 0 || indx[0] >= arraytyplen / elmlen)
 			ereport(ERROR,
 					(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
 					 errmsg("array subscript out of range")));
@@ -2233,10 +2224,13 @@ array_set(ArrayType *array,
 		}
 	}
 
+	/* This checks for overflow of the array dimensions */
+	newnitems = ArrayGetNItems(ndim, dim);
+	ArrayCheckBounds(ndim, dim, lb);
+
 	/*
 	 * Compute sizes of items and areas to copy
 	 */
-	newnitems = ArrayGetNItems(ndim, dim);
 	if (newhasnulls)
 		overheadlen = ARR_OVERHEAD_WITHNULLS(ndim, newnitems);
 	else
@@ -2540,6 +2534,7 @@ array_set_slice(ArrayType *array,
 
 	/* Do this mainly to check for overflow */
 	nitems = ArrayGetNItems(ndim, dim);
+	ArrayCheckBounds(ndim, dim, lb);
 
 	/*
 	 * Make sure source array has enough entries.  Note we ignore the shape of
@@ -2858,7 +2853,7 @@ array_map(FunctionCallInfo fcinfo, Oid inpType, Oid retType,
 		if (bitmap)
 		{
 			bitmask <<= 1;
-			if (bitmask == 0x100)
+			if (bitmask == 0x100 /* (1<<8) */)
 			{
 				bitmap++;
 				bitmask = 1;
@@ -2943,6 +2938,11 @@ construct_array(Datum *elems, int nelems,
  * A palloc'd ndims-D array object is constructed and returned.  Note that
  * elem values will be copied into the object even if pass-by-ref type.
  *
+ * If the "elems" array is NULL and an array of fixed width type is requested,
+ * a newly allocated array will be used.  This removes the O(array_size) behavior
+ * of this routine in the cases where a fixed length datum is being used.  In this
+ * case, this path will result in O(1) behavior.
+ *
  * NOTE: it would be cleaner to look up the elmlen/elmbval/elmalign info
  * from the system catalogs, given the elmtype.  However, the caller is
  * in a better position to cache this info across multiple uses, or even
@@ -2962,6 +2962,7 @@ construct_md_array(Datum *elems,
 	int32		dataoffset;
 	int			i;
 	int			nelems;
+	bool		fixedwidthtype;
 
 	if (ndims < 0)				/* we do allow zero-dimension arrays */
 		ereport(ERROR,
@@ -2977,29 +2978,67 @@ construct_md_array(Datum *elems,
 	if (ndims == 0)
 		return construct_empty_array(elmtype);
 
+	/* This checks for overflow of the array dimensions */
 	nelems = ArrayGetNItems(ndims, dims);
+	ArrayCheckBounds(ndims, dims, lbs);
 
 	/* compute required space */
 	nbytes = 0;
-	hasnulls = false;
-	for (i = 0; i < nelems; i++)
+
+	/*   fast path for fixed width types */
+	switch (elmtype) 
 	{
-		if (nulls && nulls[i])
+		case INT2OID:
+		case INT4OID:
+		case INT8OID:
+		case FLOAT4OID:
+		case FLOAT8OID:
+			fixedwidthtype=true;
+			break;
+		default:
+			fixedwidthtype=false;
+	}
+	hasnulls = false;
+	if (fixedwidthtype)
+	{
+		nbytes = nelems * elmlen;
+
+		/* Still need to handle the possibility of nulls */
+		if (nulls)
 		{
-			hasnulls = true;
-			continue;
+			for (i = 0; i < nelems; i++)
+			{
+				if (nulls[i])
+				{
+					hasnulls = true;
+					nbytes -= elmlen;
+				}
+			}
 		}
-		/* make sure data is not toasted */
-		if (elmlen == -1)
-			elems[i] = PointerGetDatum(PG_DETOAST_DATUM(elems[i]));
-		nbytes = att_addlength_datum(nbytes, elmlen, elems[i]);
+
 		nbytes = att_align_nominal(nbytes, elmalign);
-		/* check for overflow of total request */
-		if (!AllocSizeIsValid(nbytes))
-			ereport(ERROR,
-					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("array size exceeds the maximum allowed (%d)",
-							(int) MaxAllocSize)));
+	} 
+	else 
+	{
+		for (i = 0; i < nelems; i++)
+		{
+			/* make sure data is not toasted */
+			if (nulls && nulls[i])
+			{
+				hasnulls = true;
+				continue;
+			}
+			else if (elmlen == -1)
+				elems[i] = PointerGetDatum(PG_DETOAST_DATUM(elems[i]));
+			nbytes = att_addlength_datum(nbytes, elmlen, elems[i]);
+			nbytes = att_align_nominal(nbytes, elmalign);
+			/* check for overflow of total request */
+			if (!AllocSizeIsValid(nbytes))
+				ereport(ERROR,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("array size exceeds the maximum allowed (%d)",
+								(int) MaxAllocSize)));
+		}
 	}
 
 	/* Allocate and initialize result array */
@@ -3021,10 +3060,17 @@ construct_md_array(Datum *elems,
 	memcpy(ARR_DIMS(result), dims, ndims * sizeof(int));
 	memcpy(ARR_LBOUND(result), lbs, ndims * sizeof(int));
 
-	CopyArrayEls(result,
-				 elems, nulls, nelems,
-				 elmlen, elmbyval, elmalign,
-				 false);
+	if (elems==NULL && fixedwidthtype) 
+	{
+		/* do nothing */
+	} 
+	else
+	{
+		CopyArrayEls(result,
+					 elems, nulls, nelems,
+					 elmlen, elmbyval, elmalign,
+					 false);
+	}
 
 	return result;
 }
@@ -3118,7 +3164,7 @@ deconstruct_array(ArrayType *array,
 		if (bitmap)
 		{
 			bitmask <<= 1;
-			if (bitmask == 0x100)
+			if (bitmask == 0x100 /* (1<<8) */)
 			{
 				bitmap++;
 				bitmask = 1;
@@ -3290,7 +3336,7 @@ array_eq(PG_FUNCTION_ARGS)
 
 			/* advance bitmap pointers if any */
 			bitmask <<= 1;
-			if (bitmask == 0x100)
+			if (bitmask == 0x100 /* (1<<8) */)
 			{
 				if (bitmap1)
 					bitmap1++;
@@ -3492,7 +3538,7 @@ array_cmp(FunctionCallInfo fcinfo)
 
 		/* advance bitmap pointers if any */
 		bitmask <<= 1;
-		if (bitmask == 0x100)
+		if (bitmask == 0x100 /* (1<<8) */)
 		{
 			if (bitmap1)
 				bitmap1++;
@@ -3799,7 +3845,7 @@ array_contain_compare(ArrayType *array1, ArrayType *array2, Oid collation,
 
 		/* advance bitmap pointer if any */
 		bitmask <<= 1;
-		if (bitmask == 0x100)
+		if (bitmask == 0x100 /* (1<<8) */)
 		{
 			if (bitmap1)
 				bitmap1++;
@@ -4226,7 +4272,7 @@ array_seek(char *ptr, int offset, bits8 *nullbitmap, int nitems,
 				ptr = (char *) att_align_nominal(ptr, typalign);
 			}
 			bitmask <<= 1;
-			if (bitmask == 0x100)
+			if (bitmask == 0x100 /* (1<<8) */)
 			{
 				nullbitmap++;
 				bitmask = 1;
@@ -4329,7 +4375,7 @@ array_bitmap_copy(bits8 *destbitmap, int destoffset,
 			else
 				destbitval &= ~destbitmask;
 			destbitmask <<= 1;
-			if (destbitmask == 0x100)
+			if (destbitmask == 0x100 /* (1<<8) */)
 			{
 				*destbitmap++ = destbitval;
 				destbitmask = 1;
@@ -4337,7 +4383,7 @@ array_bitmap_copy(bits8 *destbitmap, int destoffset,
 					destbitval = *destbitmap;
 			}
 			srcbitmask <<= 1;
-			if (srcbitmask == 0x100)
+			if (srcbitmask == 0x100 /* (1<<8) */)
 			{
 				srcbitmap++;
 				srcbitmask = 1;
@@ -4354,7 +4400,7 @@ array_bitmap_copy(bits8 *destbitmap, int destoffset,
 		{
 			destbitval |= destbitmask;
 			destbitmask <<= 1;
-			if (destbitmask == 0x100)
+			if (destbitmask == 0x100 /* (1<<8) */)
 			{
 				*destbitmap++ = destbitval;
 				destbitmask = 1;
@@ -5023,7 +5069,9 @@ array_fill_internal(ArrayType *dims, ArrayType *lbs,
 		lbsv = deflbs;
 	}
 
+	/* This checks for overflow of the array dimensions */
 	nitems = ArrayGetNItems(ndims, dimv);
+	ArrayCheckBounds(ndims, dimv, lbsv);
 
 	/* fast track for empty array */
 	if (nitems <= 0)

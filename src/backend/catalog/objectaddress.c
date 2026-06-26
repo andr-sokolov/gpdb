@@ -15,6 +15,8 @@
 
 #include "postgres.h"
 
+#include "access/genam.h"
+#include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/sysattr.h"
 #include "catalog/catalog.h"
@@ -32,6 +34,7 @@
 #include "catalog/pg_conversion.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_extension.h"
+#include "catalog/pg_extprotocol.h"
 #include "catalog/pg_foreign_data_wrapper.h"
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_language.h"
@@ -43,6 +46,8 @@
 #include "catalog/pg_operator.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_rewrite.h"
+#include "catalog/pg_resgroup.h"
+#include "catalog/pg_resqueue.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_ts_config.h"
@@ -56,6 +61,8 @@
 #include "commands/event_trigger.h"
 #include "commands/extension.h"
 #include "commands/proclang.h"
+#include "commands/queue.h"
+#include "commands/resgroupcmds.h"
 #include "commands/tablespace.h"
 #include "commands/trigger.h"
 #include "foreign/foreign.h"
@@ -415,6 +422,22 @@ static const ObjectPropertyType ObjectProperty[] =
 		ACL_KIND_TYPE,
 		true
 	}
+
+
+	/* GPDB additions */
+	,
+	{
+		ExtprotocolRelationId,
+		ExtprotocolOidIndexId,
+		EXTPROTOCOLOID,
+		EXTPROTOCOLNAME,
+		Anum_pg_extprotocol_ptcname,
+		InvalidAttrNumber,
+		Anum_pg_extprotocol_ptcowner,
+		Anum_pg_extprotocol_ptcacl,
+		ACL_KIND_EXTPROTOCOL,
+		true
+	},
 };
 
 static ObjectAddress get_object_address_unqualified(ObjectType objtype,
@@ -503,6 +526,7 @@ get_object_address(ObjectType objtype, List *objname, List *objargs,
 			case OBJECT_VIEW:
 			case OBJECT_MATVIEW:
 			case OBJECT_FOREIGN_TABLE:
+			case OBJECT_EXTTABLE:
 				address =
 					get_relation_by_qualified_name(objtype, objname,
 												   &relation, lockmode,
@@ -529,6 +553,7 @@ get_object_address(ObjectType objtype, List *objname, List *objargs,
 			case OBJECT_FDW:
 			case OBJECT_FOREIGN_SERVER:
 			case OBJECT_EVENT_TRIGGER:
+			case OBJECT_EXTPROTOCOL:
 				address = get_object_address_unqualified(objtype,
 														 objname, missing_ok);
 				break;
@@ -620,6 +645,16 @@ get_object_address(ObjectType objtype, List *objname, List *objargs,
 			case OBJECT_TSCONFIGURATION:
 				address.classId = TSConfigRelationId;
 				address.objectId = get_ts_config_oid(objname, missing_ok);
+				address.objectSubId = 0;
+				break;
+		   case OBJECT_RESQUEUE:
+				address.classId = ResQueueRelationId;
+				address.objectId = get_resqueue_oid(NameListToString(objname), false);
+				address.objectSubId = 0;
+				break;
+			case OBJECT_RESGROUP:
+				address.classId = ResGroupRelationId;
+				address.objectId = GetResGroupIdForName(NameListToString(objname));
 				address.objectSubId = 0;
 				break;
 			default:
@@ -755,6 +790,9 @@ get_object_address_unqualified(ObjectType objtype,
 			case OBJECT_EVENT_TRIGGER:
 				msg = gettext_noop("event trigger name cannot be qualified");
 				break;
+			case OBJECT_EXTPROTOCOL:
+				msg = gettext_noop("protocol name cannot be qualified");
+				break;
 			default:
 				elog(ERROR, "unrecognized objtype: %d", (int) objtype);
 				msg = NULL;		/* placate compiler */
@@ -815,6 +853,11 @@ get_object_address_unqualified(ObjectType objtype,
 			address.objectId = get_event_trigger_oid(name, missing_ok);
 			address.objectSubId = 0;
 			break;
+		case OBJECT_EXTPROTOCOL:
+			address.classId = ExtprotocolRelationId;
+			address.objectId = get_extprotocol_oid(name, missing_ok);
+			address.objectSubId = 0;
+			break;
 		default:
 			elog(ERROR, "unrecognized objtype: %d", (int) objtype);
 			/* placate compiler, which doesn't know elog won't return */
@@ -842,7 +885,8 @@ get_relation_by_qualified_name(ObjectType objtype, List *objname,
 	address.objectSubId = 0;
 
 	relation = relation_openrv_extended(makeRangeVarFromNameList(objname),
-										lockmode, missing_ok);
+										lockmode, missing_ok,
+										false);
 	if (!relation)
 		return address;
 
@@ -888,6 +932,14 @@ get_relation_by_qualified_name(ObjectType objtype, List *objname,
 				ereport(ERROR,
 						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 						 errmsg("\"%s\" is not a foreign table",
+								RelationGetRelationName(relation))));
+			break;
+		case OBJECT_EXTTABLE:
+			if (relation->rd_rel->relkind != RELKIND_RELATION ||
+				relation->rd_rel->relstorage != RELSTORAGE_EXTERNAL)
+				ereport(ERROR,
+						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+						 errmsg("\"%s\" is not an external table",
 								RelationGetRelationName(relation))));
 			break;
 		default:
@@ -1152,6 +1204,7 @@ check_object_ownership(Oid roleid, ObjectType objtype, ObjectAddress address,
 		case OBJECT_VIEW:
 		case OBJECT_MATVIEW:
 		case OBJECT_FOREIGN_TABLE:
+		case OBJECT_EXTTABLE:
 		case OBJECT_COLUMN:
 		case OBJECT_RULE:
 		case OBJECT_TRIGGER:
@@ -1293,8 +1346,15 @@ check_object_ownership(Oid roleid, ObjectType objtype, ObjectAddress address,
 							 errmsg("must have CREATEROLE privilege")));
 			}
 			break;
+		case OBJECT_EXTPROTOCOL:
+			if (!pg_extprotocol_ownercheck(address.objectId, roleid))
+				aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_EXTPROTOCOL,
+							   NameListToString(objname));
+			break;
 		case OBJECT_TSPARSER:
 		case OBJECT_TSTEMPLATE:
+		case OBJECT_RESQUEUE:
+		case OBJECT_RESGROUP:
 			/* We treat these object types as being owned by superusers */
 			if (!superuser_arg(roleid))
 				ereport(ERROR,
@@ -2234,6 +2294,18 @@ getObjectDescription(const ObjectAddress *object)
 				break;
 			}
 
+		case OCLASS_EXTPROTOCOL:
+			{
+				appendStringInfo(&buffer, _("protocol %s"),
+								 ExtProtocolGetNameByOid(object->objectId));
+				break;
+			}
+		case OCLASS_COMPRESSION:
+			{
+				elog(NOTICE, "NOT YET IMPLEMENTED");
+				break;
+			}
+
 		default:
 			appendStringInfo(&buffer, "unrecognized object %u %u %d",
 							 object->classId,
@@ -2288,8 +2360,14 @@ getRelationDescription(StringInfo buffer, Oid relid)
 	switch (relForm->relkind)
 	{
 		case RELKIND_RELATION:
-			appendStringInfo(buffer, _("table %s"),
-							 relname);
+			if (relForm->relstorage == RELSTORAGE_AOROWS)
+				appendStringInfo(buffer, _("append only table %s"), relname);
+			else if (relForm->relstorage == RELSTORAGE_AOCOLS)
+				appendStringInfo(buffer, _("append only columnar table %s"), relname);
+			else if (relForm->relstorage == RELSTORAGE_EXTERNAL)
+				appendStringInfo(buffer, _("external table %s"), relname);
+			else
+				appendStringInfo(buffer, _("table %s"), relname);
 			break;
 		case RELKIND_INDEX:
 			appendStringInfo(buffer, _("index %s"),
@@ -2301,6 +2379,18 @@ getRelationDescription(StringInfo buffer, Oid relid)
 			break;
 		case RELKIND_TOASTVALUE:
 			appendStringInfo(buffer, _("toast table %s"),
+							 relname);
+			break;
+		case RELKIND_AOSEGMENTS:
+			appendStringInfo(buffer, _("append only file segment listing %s"),
+							 relname);
+			break;
+		case RELKIND_AOBLOCKDIR:
+			appendStringInfo(buffer, _("append only file block directory %s"),
+							 relname);
+			break;
+		case RELKIND_AOVISIMAP:
+			appendStringInfo(buffer, _("append only file visibility map %s"),
 							 relname);
 			break;
 		case RELKIND_VIEW:

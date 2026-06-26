@@ -15,6 +15,7 @@
  * a usable vsnprintf(), then a copy of our own implementation of it will
  * be linked into libpq.
  *
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -23,7 +24,14 @@
  *-------------------------------------------------------------------------
  */
 
-#include "postgres_fe.h"
+/*
+ * This file is compiled with both frontend and backend codes, symlinked by
+ * src/backend/Makefile, and use macro FRONTEND to switch.
+ *
+ * Include "c.h" to adopt Greenplum C types. Don't include "postgres_fe.h",
+ * which only defines FRONTEND besides including "c.h"
+ */
+#include "c.h"
 
 #include <limits.h>
 
@@ -36,10 +44,6 @@
 
 /* All "broken" PQExpBuffers point to this string. */
 static const char oom_buffer[1] = "";
-
-static bool
-appendPQExpBufferVA(PQExpBuffer str, const char *fmt, va_list args)
-__attribute__((format(PG_PRINTF_ATTRIBUTE, 2, 0)));
 
 
 /*
@@ -284,7 +288,7 @@ appendPQExpBuffer(PQExpBuffer str, const char *fmt,...)
  * Attempt to format data and append it to str.  Returns true if done
  * (either successful or hard failure), false if need to retry.
  */
-static bool
+bool
 appendPQExpBufferVA(PQExpBuffer str, const char *fmt, va_list args)
 {
 	size_t		avail;
