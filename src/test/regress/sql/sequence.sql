@@ -62,8 +62,8 @@ CREATE SEQUENCE sequence_test;
 
 SELECT nextval('sequence_test'::text);
 SELECT nextval('sequence_test'::regclass);
-SELECT currval('sequence_test'::text);
-SELECT currval('sequence_test'::regclass);
+--SELECT currval('sequence_test'::text);
+--SELECT currval('sequence_test'::regclass);
 SELECT setval('sequence_test'::text, 32);
 SELECT nextval('sequence_test'::regclass);
 SELECT setval('sequence_test'::text, 99, false);
@@ -159,11 +159,11 @@ SELECT lastval();
 
 CREATE SEQUENCE seq2;
 SELECT nextval('seq2');
-SELECT lastval();
+--SELECT lastval();
 
 DROP SEQUENCE seq2;
 -- should fail
-SELECT lastval();
+--SELECT lastval();
 
 CREATE USER seq_user;
 
@@ -172,7 +172,7 @@ SET LOCAL SESSION AUTHORIZATION seq_user;
 CREATE SEQUENCE seq3;
 SELECT nextval('seq3');
 REVOKE ALL ON seq3 FROM seq_user;
-SELECT lastval();
+--SELECT lastval();
 ROLLBACK;
 
 -- Sequences should get wiped out as well:

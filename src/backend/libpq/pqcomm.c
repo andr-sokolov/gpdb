@@ -67,6 +67,7 @@
  *------------------------
  */
 #include "postgres.h"
+#include <pthread.h>
 
 #include <signal.h>
 #include <fcntl.h>
@@ -95,6 +96,8 @@
 #include "storage/ipc.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
+#include "cdb/cdbvars.h"
+#include "tcop/tcopprot.h"
 
 /*
  * Cope with the various platform-specific ways to spell TCP keepalive socket
@@ -145,6 +148,8 @@ static char PqRecvBuffer[PQ_RECV_BUFFER_SIZE];
 static int	PqRecvPointer;		/* Next index to read a byte from PqRecvBuffer */
 static int	PqRecvLength;		/* End of data available in PqRecvBuffer */
 
+static pthread_mutex_t send_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 /*
  * Message status
  */
@@ -158,6 +163,7 @@ static void pq_close(int code, Datum arg);
 static int	internal_putbytes(const char *s, size_t len);
 static int	internal_flush(void);
 static void pq_set_nonblocking(bool nonblocking);
+static bool pq_send_mutex_lock();
 
 #ifdef HAVE_UNIX_SOCKETS
 static int	Lock_AF_UNIX(char *unixSocketDir, char *unixSocketPath);
@@ -192,8 +198,6 @@ pq_init(void)
 void
 pq_comm_reset(void)
 {
-	/* Do not throw away pending data, but do reset the busy flag */
-	PqCommBusy = false;
 	/* We can abort any old-style COPY OUT, too */
 	pq_endcopyout(true);
 }
@@ -256,6 +260,24 @@ pq_close(int code, Datum arg)
 	}
 }
 
+/* --------------------------------
+ *		pq_comm_close_fatal - shutdown libpq at backend fatal error exit
+ * --------------------------------
+ */
+void
+pq_comm_close_fatal(void)
+{
+	if (MyProcPort != NULL)
+	{
+		/* Cleanly shut down SSL layer */
+		secure_close(MyProcPort);
+
+		if (MyProcPort->sock >= 0)
+            closesocket(MyProcPort->sock);
+        
+		MyProcPort->sock = -1;
+	}
+}                               /* pq_comm_close_fatal */
 
 
 /*
@@ -442,7 +464,7 @@ StreamServerPort(int family, char *hostName, unsigned short portNumber,
 		}
 #endif
 
-#ifdef IPV6_V6ONLY
+#if defined(IPV6_V6ONLY) && defined(IPPROTO_IPV6)
 		if (addr->ai_family == AF_INET6)
 		{
 			if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY,
@@ -678,6 +700,23 @@ StreamConnection(pgsocket server_fd, Port *port)
 		return STATUS_ERROR;
 	}
 
+	/* 
+	 * Set a send timeout on the socket if specified, on the master only
+	 * Solaris doesn't support setting SO_SNDTIMEO, so setting this won't work on Solaris (MPP-22526) 
+	 */ 
+	if (IS_QUERY_DISPATCHER() && gp_connection_send_timeout > 0)
+	{
+	  struct timeval timeout;
+	  timeout.tv_sec = gp_connection_send_timeout;
+	  timeout.tv_usec = 0;
+
+	  if (setsockopt (port->sock, SOL_SOCKET, SO_SNDTIMEO, (char *)&timeout,
+			  sizeof(timeout)) < 0)
+	    {
+	      elog(LOG, "setsockopt(SO_SNDTIMEO) failed: %m");
+	    }
+	}
+
 	/* select NODELAY and KEEPALIVE options if it's a TCP connection */
 	if (!IS_AF_UNIX(port->laddr.addr.ss_family))
 	{
@@ -885,8 +924,8 @@ pq_recvbuf(void)
 
 		if (r < 0)
 		{
-			if (errno == EINTR)
-				continue;		/* Ok if interrupted */
+			if (errno == EINTR || errno == EAGAIN)
+				continue;		/* Ok if interrupted or timeout expired */
 
 			/*
 			 * Careful: an ereport() that tries to write to the client would
@@ -909,6 +948,67 @@ pq_recvbuf(void)
 		/* r contains number of bytes read, so just incr length */
 		PqRecvLength += r;
 		return 0;
+	}
+}
+
+/**
+ *
+ * Can only be called for non-SSL connections (such as file replication connections).
+ *
+ * Wait for at least one byte of data to be available, or for the
+ *   socket to be in error.
+ *
+ * return true if we have data or a socket error, false if the function
+ *   call was interrupted
+ */
+bool
+pq_waitForDataUsingSelect(void)
+{
+	if ( PqRecvPointer < PqRecvLength)
+	{
+		/* we already have data in the buffer ... so done */
+		return true;
+	}
+
+#ifdef USE_SSL
+	if ( MyProcPort->ssl )
+	{
+		elog(ERROR, "SSL connection cannot be used with pq_waitForDataUsingSelect");
+		return true; /* unreachable */
+	}
+	else
+#endif
+	{
+		int sock = MyProcPort->sock;
+		for ( ;; )
+		{
+			fd_set toRead;
+			fd_set haveError;
+			int numSockets;
+
+			FD_ZERO(&toRead);
+			FD_ZERO(&haveError);
+
+			FD_SET(sock, &toRead);
+			FD_SET(sock, &haveError);
+
+			errno = 0;
+			numSockets = select(sock+1, &toRead, NULL /* toWrite */, &haveError, NULL );
+
+			if ( errno == EINTR)
+			{
+				return false;
+			}
+			else if (errno != 0 )
+			{
+				elog(FATAL, "select failed: %m");
+			}
+			else if ( numSockets > 0 )
+			{
+				/* the socket has data to read or is in error so break out */
+				return true;
+			}
+		}
 	}
 }
 
@@ -1260,6 +1360,77 @@ pq_getmessage(StringInfo s, int maxlen)
 	return 0;
 }
 
+/*
+ * Wrapper of simple pthread locking functionality, using pthread_mutex_trylock
+ * and loop to make it interruptible when waiting the lock;
+ *
+ * return true if successfully acquires the lock, false if unable to get the lock
+ * and interrupted by SIGTERM, otherwise, infinitely loop to acquire the mutex.
+ *
+ * If we are going to return false, we close the socket to client; this is crucial
+ * for exiting dispatch thread if it is stuck on sending NOTICE to client, and hence
+ * avoid mutex deadlock;
+ *
+ * NOTE: should not call CHECK_FOR_INTERRUPTS and ereport in this routine, since
+ * it is in multi-thread context;
+ */
+static bool
+pq_send_mutex_lock()
+{
+	int count = PQ_BUSY_TEST_COUNT_IN_EXITING;
+	int mutex_res;
+
+	do
+	{
+		mutex_res = pthread_mutex_trylock(&send_mutex);
+
+		if (mutex_res == 0)
+		{
+			return true;
+		}
+
+		if (mutex_res == EBUSY)
+		{
+			/* No need to acquire lock for TermSignalReceived, since we are in
+ 			 * a loop here */
+			if (TermSignalReceived)
+			{
+				/*
+ 				 * try PQ_BUSY_TEST_COUNT_IN_EXITING times before going to
+ 				 * close the socket, in case real concurrent writing is in
+ 				 * progress(compared to stuck send call in secure_write);
+ 				 *
+ 				 * It cannot help completely eliminate the false negative
+ 				 * cases, but giving the process is exiting, it is acceptable
+ 				 * to discard some messages, contrasted with the chance of
+ 				 * infinite stuck;
+ 				 */
+				if (count-- < 0)
+				{
+					/* On Redhat and Suse, simple closing the socket would not get
+					 * send() out of hanging state, shutdown() can do this(though not
+					 * explicitly mentioned in manual page); however, if send over a
+					 * socket which has been shutdown, process would be terminated by
+					 * SIGPIPE; to avoid this race condition, we set the socket to be
+					 * invalid before calling shutdown()
+					 *
+					 * On OSX, close() can get send() out of hanging state, while
+					 * shutdown() would lead to SIGPIPE */
+					int saved_fd = MyProcPort->sock;
+					MyProcPort->sock = -1;
+					whereToSendOutput = DestNone;
+#ifndef __darwin__
+					shutdown(saved_fd, SHUT_WR);
+#endif
+					closesocket(saved_fd);
+					return false;
+				}
+			}
+		}
+		pg_usleep(1000L);
+	} while (true);
+}
+
 
 /* --------------------------------
  *		pq_putbytes		- send bytes to connection (not flushed until pq_flush)
@@ -1274,12 +1445,14 @@ pq_putbytes(const char *s, size_t len)
 
 	/* Should only be called by old-style COPY OUT */
 	Assert(DoingCopyOut);
-	/* No-op if reentrant call */
-	if (PqCommBusy)
-		return 0;
-	PqCommBusy = true;
+	if (!pq_send_mutex_lock())
+	{
+		return EOF;
+	}
+
 	res = internal_putbytes(s, len);
-	PqCommBusy = false;
+
+	pthread_mutex_unlock(&send_mutex);
 	return res;
 }
 
@@ -1319,13 +1492,28 @@ pq_flush(void)
 {
 	int			res;
 
+	if (Gp_role == GP_ROLE_DISPATCH && IsUnderPostmaster)
+	{
+		if (!pq_send_mutex_lock())
+		{
+			return EOF;
+		}
+	}
+
 	/* No-op if reentrant call */
 	if (PqCommBusy)
+	{
+		if (Gp_role == GP_ROLE_DISPATCH && IsUnderPostmaster)
+			pthread_mutex_unlock(&send_mutex);
 		return 0;
+	}
 	PqCommBusy = true;
 	pq_set_nonblocking(false);
 	res = internal_flush();
 	PqCommBusy = false;
+
+	if (Gp_role == GP_ROLE_DISPATCH && IsUnderPostmaster)
+		pthread_mutex_unlock(&send_mutex);
 	return res;
 }
 
@@ -1377,9 +1565,14 @@ internal_flush(void)
 			if (errno != last_reported_send_errno)
 			{
 				last_reported_send_errno = errno;
+				/* TDOO: what's this? */
+				HOLD_INTERRUPTS();
+
+				/* we can use ereport here, for the protection of send mutex */
 				ereport(COMMERROR,
 						(errcode_for_socket_access(),
 						 errmsg("could not send data to client: %m")));
+				RESUME_INTERRUPTS();
 			}
 
 			/*
@@ -1418,9 +1611,21 @@ pq_flush_if_writable(void)
 	if (PqSendPointer == PqSendStart)
 		return 0;
 
+	if (Gp_role == GP_ROLE_DISPATCH && IsUnderPostmaster)
+	{
+		if (!pq_send_mutex_lock())
+		{
+			return EOF;
+		}
+	}
+
 	/* No-op if reentrant call */
 	if (PqCommBusy)
+	{
+		if (Gp_role == GP_ROLE_DISPATCH && IsUnderPostmaster)
+			pthread_mutex_unlock(&send_mutex);
 		return 0;
+	}
 
 	/* Temporarily put the socket into non-blocking mode */
 	pq_set_nonblocking(true);
@@ -1428,6 +1633,8 @@ pq_flush_if_writable(void)
 	PqCommBusy = true;
 	res = internal_flush();
 	PqCommBusy = false;
+	if (Gp_role == GP_ROLE_DISPATCH && IsUnderPostmaster)
+		pthread_mutex_unlock(&send_mutex);
 	return res;
 }
 
@@ -1467,9 +1674,7 @@ pq_is_send_pending(void)
  *
  *		We also suppress messages generated while pqcomm.c is busy.  This
  *		avoids any possibility of messages being inserted within other
- *		messages.  The only known trouble case arises if SIGQUIT occurs
- *		during a pqcomm.c routine --- quickdie() will try to send a warning
- *		message, and the most reasonable approach seems to be to drop it.
+ *		messages.
  *
  *		returns 0 if OK, EOF if trouble
  * --------------------------------
@@ -1477,12 +1682,25 @@ pq_is_send_pending(void)
 int
 pq_putmessage(char msgtype, const char *s, size_t len)
 {
-	if (DoingCopyOut || PqCommBusy)
-		return 0;
-	PqCommBusy = true;
+	if (DoingCopyOut)
+	{
+		return EOF;
+	}
+
+	if (Gp_role == GP_ROLE_DISPATCH && IsUnderPostmaster)
+	{
+		if (!pq_send_mutex_lock())
+		{
+			return EOF;
+		}
+	}
+
 	if (msgtype)
+	{
 		if (internal_putbytes(&msgtype, 1))
 			goto fail;
+	}
+
 	if (PG_PROTOCOL_MAJOR(FrontendProtocol) >= 3)
 	{
 		uint32		n32;
@@ -1491,13 +1709,19 @@ pq_putmessage(char msgtype, const char *s, size_t len)
 		if (internal_putbytes((char *) &n32, 4))
 			goto fail;
 	}
+
 	if (internal_putbytes(s, len))
 		goto fail;
-	PqCommBusy = false;
+
+	if (Gp_role == GP_ROLE_DISPATCH && IsUnderPostmaster)
+		pthread_mutex_unlock(&send_mutex);
+
 	return 0;
 
 fail:
-	PqCommBusy = false;
+	if (Gp_role == GP_ROLE_DISPATCH && IsUnderPostmaster)
+		pthread_mutex_unlock(&send_mutex);
+
 	return EOF;
 }
 
@@ -1537,7 +1761,13 @@ pq_putmessage_noblock(char msgtype, const char *s, size_t len)
 void
 pq_startcopyout(void)
 {
+	if (!pq_send_mutex_lock())
+	{
+		/* no need to return a status, since socket has been closed in failed cases */
+		return;
+	}
 	DoingCopyOut = true;
+	pthread_mutex_unlock(&send_mutex);
 }
 
 /* --------------------------------
@@ -1558,7 +1788,12 @@ pq_endcopyout(bool errorAbort)
 	if (errorAbort)
 		pq_putbytes("\n\n\\.\n", 5);
 	/* in non-error case, copy.c will have emitted the terminator line */
+	if (!pq_send_mutex_lock())
+	{
+		return;
+	}
 	DoingCopyOut = false;
+	pthread_mutex_unlock(&send_mutex);
 }
 
 
@@ -1786,7 +2021,7 @@ pq_getkeepalivescount(Port *port)
 
 	if (port->default_keepalives_count == 0)
 	{
-		ACCEPT_TYPE_ARG3 size = sizeof(port->default_keepalives_count);
+		socklen_t size = sizeof(port->default_keepalives_count);
 
 		if (getsockopt(port->sock, IPPROTO_TCP, TCP_KEEPCNT,
 					   (char *) &port->default_keepalives_count,

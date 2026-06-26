@@ -14,6 +14,7 @@
 #ifndef PARAMS_H
 #define PARAMS_H
 
+#include "nodes/nodes.h"
 /* To avoid including a pile of parser headers, reference ParseState thus: */
 struct ParseState;
 
@@ -74,6 +75,26 @@ typedef struct ParamListInfoData
 	ParamExternData params[1];	/* VARIABLE LENGTH ARRAY */
 }	ParamListInfoData;
 
+
+/*
+ * Serialized form of ParamExternData. This is used when query parameters
+ * are serialized, when dispatching a query from QD to QEs.
+ */
+typedef struct SerializedParamExternData
+{
+	NodeTag		type;
+
+	/* Fields from ParamExternData */
+	Datum		value;			/* parameter value */
+	bool		isnull;			/* is it NULL? */
+	uint16		pflags;			/* flag bits, see above */
+	Oid			ptype;			/* parameter's datatype, or 0 */
+
+	/* Extra information about the type */
+	int16		plen;
+	bool		pbyval;
+
+} SerializedParamExternData;
 
 /* ----------------
  *	  ParamExecData

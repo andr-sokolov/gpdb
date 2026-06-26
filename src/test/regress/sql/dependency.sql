@@ -7,7 +7,7 @@ CREATE USER regression_user2;
 CREATE USER regression_user3;
 CREATE GROUP regression_group;
 
-CREATE TABLE deptest (f1 serial primary key, f2 text);
+CREATE TABLE deptest (f1 serial primary key, f2 text) DISTRIBUTED BY (f1);
 
 GRANT SELECT ON TABLE deptest TO GROUP regression_group;
 GRANT ALL ON TABLE deptest TO regression_user, regression_user2;
@@ -57,11 +57,11 @@ REASSIGN OWNED BY regression_user1 TO regression_user0;
 -- this one is allowed
 DROP OWNED BY regression_user0;
 
-CREATE TABLE deptest1 (f1 int unique);
+CREATE TABLE deptest1 (f1 int unique) DISTRIBUTED BY (f1);
 GRANT ALL ON deptest1 TO regression_user1 WITH GRANT OPTION;
 
 SET SESSION AUTHORIZATION regression_user1;
-CREATE TABLE deptest (a serial primary key, b text);
+CREATE TABLE deptest (a serial primary key, b text) DISTRIBUTED BY (a);
 GRANT ALL ON deptest1 TO regression_user2;
 RESET SESSION AUTHORIZATION;
 \z deptest1
@@ -78,7 +78,7 @@ GRANT CREATE ON DATABASE regression TO regression_user1;
 
 SET SESSION AUTHORIZATION regression_user1;
 CREATE SCHEMA deptest;
-CREATE TABLE deptest (a serial primary key, b text);
+CREATE TABLE deptest (a serial primary key, b text) DISTRIBUTED BY (a);
 ALTER DEFAULT PRIVILEGES FOR ROLE regression_user1 IN SCHEMA deptest
   GRANT ALL ON TABLES TO regression_user2;
 CREATE FUNCTION deptest_func() RETURNS void LANGUAGE plpgsql

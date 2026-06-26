@@ -41,7 +41,10 @@ extern _stringlist *dblist;
 extern bool debug;
 extern char *inputdir;
 extern char *outputdir;
+extern char *prehook;
 extern char *launcher;
+extern bool optimizer_enabled;
+extern bool resgroup_enabled;
 
 /*
  * This should not be global but every module should be able to read command
@@ -56,5 +59,6 @@ int regression_main(int argc, char *argv[],
 				init_function ifunc, test_function tfunc);
 void		add_stringlist_item(_stringlist **listhead, const char *str);
 PID_TYPE	spawn_process(const char *cmdline);
+void		exit_nicely(int code);
 void		replace_string(char *string, char *replace, char *replacement);
 bool		file_exists(const char *file);

@@ -707,6 +707,7 @@ extern BTCycleId _bt_vacuum_cycleid(Relation rel);
 extern BTCycleId _bt_start_vacuum(Relation rel);
 extern void _bt_end_vacuum(Relation rel);
 extern void _bt_end_vacuum_callback(int code, Datum arg);
+extern void _bt_validate_vacuum(Relation irel, Relation hrel, TransactionId oldest_xmin);
 extern Size BTreeShmemSize(void);
 extern void BTreeShmemInit(void);
 
@@ -724,7 +725,8 @@ extern void _bt_leafbuild(BTSpool *btspool, BTSpool *spool2);
 /*
  * prototypes for functions in nbtxlog.c
  */
-extern void btree_redo(XLogRecPtr lsn, XLogRecord *record);
-extern void btree_desc(StringInfo buf, uint8 xl_info, char *rec);
+extern void btree_redo(XLogRecPtr beginLoc, XLogRecPtr lsn, XLogRecord *record);
+extern void btree_desc(StringInfo buf, XLogRecord *record);
+extern void btree_mask(char *pagedata, BlockNumber blkno);
 
 #endif   /* NBTREE_H */

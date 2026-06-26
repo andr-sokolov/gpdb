@@ -32,10 +32,7 @@ our $config;
 do "./src/tools/msvc/config_default.pl";
 do "./src/tools/msvc/config.pl" if (-f "src/tools/msvc/config.pl");
 
-my $vcver = Mkvcbuild::mkvcbuild($config);
-
 # check what sort of build we are doing
-
 my $bconf     = $ENV{CONFIG} || "Release";
 my $buildwhat = $ARGV[1]     || "";
 if (uc($ARGV[0]) eq 'DEBUG')
@@ -47,6 +44,13 @@ elsif (uc($ARGV[0]) ne "RELEASE")
 	$buildwhat = $ARGV[0] || "";
 }
 
+my $buildclient = 0;
+if ($buildwhat eq "client")
+{
+	$buildclient = 1;
+	$buildwhat = $ARGV[1] || "";
+}
+my $vcver = Mkvcbuild::mkvcbuild($config, $buildclient);
 # ... and do it
 
 if ($buildwhat and $vcver >= 10.00)

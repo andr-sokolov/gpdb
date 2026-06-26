@@ -31,6 +31,8 @@
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 
+#include "cdb/cdbvars.h"
+
 /*
  * Hooks for function calls
  */
@@ -469,7 +471,6 @@ fetch_finfo_record(void *filehandle, char *funcname)
 		elog(ERROR, "null result from info function \"%s\"", infofuncname);
 	switch (inforec->api_version)
 	{
-		case 0:
 		case 1:
 			/* OK, no additional fields to validate */
 			break;
@@ -624,6 +625,20 @@ fmgr_internal_function(const char *proname)
 static Datum
 fmgr_oldstyle(PG_FUNCTION_ARGS)
 {
+	/*
+	 * V0 functions are not supported in Greenplum. The immediate reason
+	 * for that is that a Datum is always 8 bytes on Greenplum, which
+	 * breaks V0 functions using e.g. int arguments, on 32-bit platforms
+	 * where an int is normally 4 bytes. But this is no great loss; no-one
+	 * should be using V0 calling convention anymore anyway.
+	 */
+	ereport(ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 errmsg("Old style C function (API version 0) are no longer supported by Greenplum")
+				));
+	return (Datum) 0; /* keep compiler quiet */
+
+#ifdef NOT_USED
 	Oldstyle_fnextra *fnextra;
 	int			n_arguments = fcinfo->nargs;
 	int			i;
@@ -854,6 +869,7 @@ fmgr_oldstyle(PG_FUNCTION_ARGS)
 	}
 
 	return PointerGetDatum(returnValue);
+#endif
 }
 
 
@@ -2075,57 +2091,10 @@ OidSendFunctionCall(Oid functionId, Datum val)
 
 
 /*
- * !!! OLD INTERFACE !!!
- *
- * fmgr() is the only remaining vestige of the old-style caller support
- * functions.  It's no longer used anywhere in the Postgres distribution,
- * but we should leave it around for a release or two to ease the transition
- * for user-supplied C functions.  OidFunctionCallN() replaces it for new
- * code.
- *
- * DEPRECATED, DO NOT USE IN NEW CODE
+ * On GPDB, int64, float8 and float4 are always pass-by-value, and there are
+ * static inline functions in postgres.h to implement these.
  */
-char *
-fmgr(Oid procedureId,...)
-{
-	FmgrInfo	flinfo;
-	FunctionCallInfoData fcinfo;
-	int			n_arguments;
-	Datum		result;
-
-	fmgr_info(procedureId, &flinfo);
-
-	MemSet(&fcinfo, 0, sizeof(fcinfo));
-	fcinfo.flinfo = &flinfo;
-	fcinfo.nargs = flinfo.fn_nargs;
-	n_arguments = fcinfo.nargs;
-
-	if (n_arguments > 0)
-	{
-		va_list		pvar;
-		int			i;
-
-		if (n_arguments > FUNC_MAX_ARGS)
-			ereport(ERROR,
-					(errcode(ERRCODE_TOO_MANY_ARGUMENTS),
-			 errmsg("function %u has too many arguments (%d, maximum is %d)",
-					flinfo.fn_oid, n_arguments, FUNC_MAX_ARGS)));
-		va_start(pvar, procedureId);
-		for (i = 0; i < n_arguments; i++)
-			fcinfo.arg[i] = PointerGetDatum(va_arg(pvar, char *));
-		va_end(pvar);
-	}
-
-	result = FunctionCallInvoke(&fcinfo);
-
-	/* Check for null result, since caller is clearly not expecting one */
-	if (fcinfo.isnull)
-		elog(ERROR, "function %u returned NULL", flinfo.fn_oid);
-
-	return DatumGetPointer(result);
-}
-
-
+#if 0
 /*-------------------------------------------------------------------------
  *		Support routines for standard maybe-pass-by-reference datatypes
  *
@@ -2225,6 +2194,8 @@ DatumGetFloat8(Datum X)
 	return myunion.retval;
 }
 #endif   /* USE_FLOAT8_BYVAL */
+
+#endif /* GPDB */
 
 
 /*-------------------------------------------------------------------------

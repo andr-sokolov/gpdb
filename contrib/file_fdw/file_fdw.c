@@ -288,7 +288,7 @@ file_fdw_validator(PG_FUNCTION_ARGS)
 	/*
 	 * Now apply the core COPY code's validation logic for more checks.
 	 */
-	ProcessCopyOptions(NULL, true, other_options);
+	ProcessCopyOptions(NULL, true, other_options, 0, true);
 
 	/*
 	 * Filename option is required for file_fdw foreign tables.
@@ -377,6 +377,22 @@ fileGetOptions(Oid foreigntableid,
 	 */
 	if (*filename == NULL)
 		elog(ERROR, "filename is required for file_fdw foreign tables");
+
+
+	if (table->exec_location == FTEXECLOCATION_ALL_SEGMENTS)
+	{
+		/*
+		 * pass the on_segment option to COPY, which will replace the required
+		 * placeholder "<SEGID>" in filename
+		 */
+		options = list_append_unique(options, makeDefElem("on_segment", (Node *)makeInteger(TRUE)));
+	}
+	else if (table->exec_location == FTEXECLOCATION_ANY)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("file_fdw does not support mpp_execute option 'any'")));
+	}
 
 	*other_options = options;
 }
@@ -627,9 +643,12 @@ fileBeginForeignScan(ForeignScanState *node, int eflags)
 	 */
 	cstate = BeginCopyFrom(node->ss.ss_currentRelation,
 						   filename,
-						   false,
-						   NIL,
-						   options);
+						   false, /* is_program */
+						   NULL,  /* data_source_cb */
+						   NULL,  /* data_source_cb_extra */
+						   NIL,   /* attnamelist */
+						   options,
+						   NIL);  /* ao_segnos */
 
 	/*
 	 * Save state in node->fdw_state.  We must save enough information to call
@@ -676,7 +695,7 @@ fileIterateForeignScan(ForeignScanState *node)
 	 */
 	ExecClearTuple(slot);
 	found = NextCopyFrom(festate->cstate, NULL,
-						 slot->tts_values, slot->tts_isnull,
+						 slot_get_values(slot), slot_get_isnull(slot),
 						 NULL);
 	if (found)
 		ExecStoreVirtualTuple(slot);
@@ -700,9 +719,12 @@ fileReScanForeignScan(ForeignScanState *node)
 
 	festate->cstate = BeginCopyFrom(node->ss.ss_currentRelation,
 									festate->filename,
-									false,
-									NIL,
-									festate->options);
+									false, /* is_program */
+									NULL,  /* data_source_cb */
+									NULL,  /* data_source_cb_extra */
+									NIL,   /* attnamelist */
+									festate->options,
+									NIL);  /* ao_segnos */
 }
 
 /*
@@ -951,7 +973,8 @@ estimate_size(PlannerInfo *root, RelOptInfo *baserel,
 							   baserel->baserestrictinfo,
 							   0,
 							   JOIN_INNER,
-							   NULL);
+							   NULL,
+							   false); /* GPDB_91_MERGE_FIXME: do we need damping? */
 
 	nrows = clamp_row_est(nrows);
 
@@ -1034,7 +1057,10 @@ file_acquire_sample_rows(Relation onerel, int elevel,
 	/*
 	 * Create CopyState from FDW options.
 	 */
-	cstate = BeginCopyFrom(onerel, filename, false, NIL, options);
+	/*
+	 * GPDB_92_MERGE_FIXME: what is the expected args?
+	 */
+	cstate = BeginCopyFrom(onerel, filename, false, NULL, NULL, NIL, options, NIL);
 
 	/*
 	 * Use per-tuple memory context to prevent leak of memory used to read

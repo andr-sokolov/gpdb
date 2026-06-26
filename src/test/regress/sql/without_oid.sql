@@ -45,9 +45,7 @@ SELECT count(oid) FROM wo;
 VACUUM ANALYZE wi;
 VACUUM ANALYZE wo;
 
-SELECT min(relpages) < max(relpages), min(reltuples) - max(reltuples)
-  FROM pg_class
- WHERE relname IN ('wi', 'wo');
+SELECT (SELECT relpages FROM pg_class WHERE relname='wo')<= (SELECT relpages FROM pg_class WHERE relname='wi'), (SELECT reltuples FROM pg_class WHERE relname='wi')-(SELECT reltuples FROM pg_class WHERE relname='wo');
 
 DROP TABLE wi;
 DROP TABLE wo;

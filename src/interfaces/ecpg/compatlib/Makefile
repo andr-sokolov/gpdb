@@ -13,6 +13,11 @@ subdir = src/interfaces/ecpg/compatlib
 top_builddir = ../../../..
 include $(top_builddir)/src/Makefile.global
 
+# The frontend doesn't need everything that's in LIBS, some are backend only
+LIBS := $(filter-out -lresolv -lbz2, $(LIBS))
+# This program isn't interactive, so doesn't need these
+LIBS := $(filter-out -lreadline -ledit -ltermcap -lncurses -lcurses -lcurl -lssl -lcrypto -lz, $(LIBS))
+
 NAME= ecpg_compat
 SO_MAJOR_VERSION= 3
 SO_MINOR_VERSION= 6
@@ -24,6 +29,13 @@ override CFLAGS += $(PTHREAD_CFLAGS)
 SHLIB_LINK_INTERNAL = -L../ecpglib -lecpg -L../pgtypeslib -lpgtypes $(libpq)
 SHLIB_LINK = $(filter -lintl -lm, $(LIBS)) $(PTHREAD_LIBS)
 SHLIB_PREREQS = submake-ecpglib submake-pgtypeslib
+
+# For a bug in gcc on centos 32-bit
+ifeq ($(GCC), yes)
+ CFLAGS += -Wno-error
+endif # GCC
+
+SHLIB_EXPORTS = exports.txt
 
 SHLIB_EXPORTS = exports.txt
 

@@ -17,6 +17,8 @@
 #include "nodes/parsenodes.h"
 #include "utils/array.h"
 
+struct HTAB;  /* utils/hsearch.h */
+
 /* commands/dropcmds.c */
 extern void RemoveObjects(DropStmt *stmt);
 
@@ -28,19 +30,27 @@ extern Oid DefineIndex(Oid relationId,
 			bool check_rights,
 			bool skip_build,
 			bool quiet);
-extern Oid	ReindexIndex(RangeVar *indexRelation);
-extern Oid	ReindexTable(RangeVar *relation);
-extern Oid ReindexDatabase(const char *databaseName,
-				bool do_system, bool do_user);
+extern Oid	ReindexIndex(ReindexStmt *stmt);
+extern Oid	ReindexTable(ReindexStmt *stmt);
+extern Oid	ReindexDatabase(ReindexStmt *stmt);
 extern char *makeObjectName(const char *name1, const char *name2,
 			   const char *label);
 extern char *ChooseRelationName(const char *name1, const char *name2,
 				   const char *label, Oid namespaceid);
+extern char *ChooseRelationNameWithCache(const char *name1, const char *name2,
+								const char *label, Oid namespaceid, 
+								struct HTAB *cache);
+extern char *ChooseIndexName(const char *tabname, Oid namespaceId,
+				List *colnames, List *exclusionOpNames,
+				bool primary, bool isconstraint);
+extern List *ChooseIndexColumnNames(List *indexElems);
 extern bool CheckIndexCompatible(Oid oldId,
 					 char *accessMethodName,
 					 List *attributeList,
 					 List *exclusionOpNames);
 extern Oid	GetDefaultOpClass(Oid type_id, Oid am_id);
+extern Oid GetIndexOpClass(List *opclass, Oid attrType,
+				char *accessMethodName, Oid accessMethodId);
 
 /* commands/functioncmds.c */
 extern Oid	CreateFunction(CreateFunctionStmt *stmt, const char *queryString);
@@ -50,6 +60,18 @@ extern void SetFunctionArgType(Oid funcOid, int argIndex, Oid newArgType);
 extern Oid	AlterFunction(AlterFunctionStmt *stmt);
 extern Oid	CreateCast(CreateCastStmt *stmt);
 extern void DropCastById(Oid castOid);
+extern Oid  get_cast_oid(Oid sourcetypeid, Oid targettypeid, bool missing_ok);
+extern void interpret_function_parameter_list(List *parameters,
+								  Oid languageOid,
+								  bool is_aggregate,
+								  const char *queryString,
+								  oidvector **parameterTypes,
+								  ArrayType **allParameterTypes,
+								  ArrayType **parameterModes,
+								  ArrayType **parameterNames,
+								  List **parameterDefaults,
+								  Oid *variadicArgType,
+								  Oid *requiredResultType);
 extern void IsThereFunctionInNamespace(const char *proname, int pronargs,
 						   oidvector *proargtypes, Oid nspOid);
 extern void ExecuteDoStmt(DoStmt *stmt);
@@ -72,7 +94,7 @@ extern void RemoveOperatorById(Oid operOid);
 
 /* commands/aggregatecmds.c */
 extern Oid DefineAggregate(List *name, List *args, bool oldstyle,
-				List *parameters, const char *queryString);
+						   List *parameters, const char *queryString);
 
 /* commands/opclasscmds.c */
 extern Oid	DefineOpClass(CreateOpClassStmt *stmt);

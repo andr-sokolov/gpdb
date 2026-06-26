@@ -125,11 +125,16 @@ drop domain dia;
 create type comptype as (r float8, i float8);
 create domain dcomptypea as comptype[];
 create table dcomptable (d1 dcomptypea unique);
+-- GPDB: marking the column as 'unique' fails, because a unique column needs
+-- to be part of the distribution key, and composite types can't be used as
+-- distribution keys because they have no hash opclasses.
+create table dcomptable (d1 dcomptypea /*unique*/);
+create index on dcomptable (d1);
 
 insert into dcomptable values (array[row(1,2)]::dcomptypea);
 insert into dcomptable values (array[row(3,4), row(5,6)]::comptype[]);
 insert into dcomptable values (array[row(7,8)::comptype, row(9,10)::comptype]);
-insert into dcomptable values (array[row(1,2)]::dcomptypea);  -- fail on uniqueness
+--insert into dcomptable values (array[row(1,2)]::dcomptypea);  -- fail on uniqueness
 insert into dcomptable (d1[1]) values(row(9,10));
 insert into dcomptable (d1[1].r) values(11);
 
@@ -261,7 +266,8 @@ create domain dnotnulltest integer;
 create table domnotnull
 ( col1 dnotnulltest
 , col2 dnotnulltest
-);
+, id int4 -- distribute on this column, so that we can UPDATE the others
+) distributed by (id);
 
 insert into domnotnull default values;
 alter domain dnotnulltest set not null; -- fails
@@ -321,7 +327,7 @@ alter domain con drop constraint if exists nonexistent;
 
 -- Test ALTER DOMAIN .. CONSTRAINT .. NOT VALID
 create domain things AS INT;
-CREATE TABLE thethings (stuff things);
+CREATE TABLE thethings (id int, stuff things);
 INSERT INTO thethings (stuff) VALUES (55);
 ALTER DOMAIN things ADD CONSTRAINT meow CHECK (VALUE < 11);
 ALTER DOMAIN things ADD CONSTRAINT meow CHECK (VALUE < 11) NOT VALID;
@@ -452,7 +458,7 @@ alter domain posint add constraint c1 check(value >= 0);
 drop table ddtest2;
 
 -- Likewise for domains within arrays of composite
-create table ddtest2(f1 ddtest1[]);
+create table ddtest2(f1 ddtest1[], distkey int) distributed by (distkey);
 insert into ddtest2 values('{(-1)}');
 alter domain posint add constraint c1 check(value >= 0);
 drop table ddtest2;
@@ -580,3 +586,22 @@ create domain testdomain1 as int constraint unsigned check (value > 0);
 alter domain testdomain1 rename constraint unsigned to unsigned_foo;
 alter domain testdomain1 drop constraint unsigned_foo;
 drop domain testdomain1;
+
+--
+-- Create Domain will dispatch collation
+-- See github issue: https://github.com/greenplum-db/gpdb/issues/12015
+--
+
+create domain testdomain_issue_12015 as text collate "C";
+
+select count(distinct (typname, collname))
+from
+(
+  select  typname,
+          (select collname from pg_collation where oid = typcollation)
+  from pg_type where typname = 'testdomain_issue_12015'
+  union all
+  select typname,
+         (select collname from pg_collation where oid = typcollation)
+  from gp_dist_random('pg_type') where typname = 'testdomain_issue_12015'
+)x;

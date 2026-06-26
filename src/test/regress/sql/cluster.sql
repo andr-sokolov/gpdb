@@ -3,13 +3,14 @@
 --
 
 CREATE TABLE clstr_tst_s (rf_a SERIAL PRIMARY KEY,
-	b INT);
+	b INT) DISTRIBUTED BY (rf_a);
 
 CREATE TABLE clstr_tst (a SERIAL PRIMARY KEY,
 	b INT,
 	c TEXT,
 	d TEXT,
-	CONSTRAINT clstr_tst_con FOREIGN KEY (b) REFERENCES clstr_tst_s);
+	CONSTRAINT clstr_tst_con FOREIGN KEY (b) REFERENCES clstr_tst_s)
+	DISTRIBUTED BY (a);
 
 CREATE INDEX clstr_tst_b ON clstr_tst (b);
 CREATE INDEX clstr_tst_c ON clstr_tst (c);
@@ -106,9 +107,9 @@ WHERE pg_class.oid=indexrelid
 
 -- Verify that clustering all tables does in fact cluster the right ones
 CREATE USER clstr_user;
-CREATE TABLE clstr_1 (a INT PRIMARY KEY);
-CREATE TABLE clstr_2 (a INT PRIMARY KEY);
-CREATE TABLE clstr_3 (a INT PRIMARY KEY);
+CREATE TABLE clstr_1 (a INT PRIMARY KEY) DISTRIBUTED BY (a);
+CREATE TABLE clstr_2 (a INT PRIMARY KEY) DISTRIBUTED BY (a);
+CREATE TABLE clstr_3 (a INT PRIMARY KEY) DISTRIBUTED BY (a);
 ALTER TABLE clstr_1 OWNER TO clstr_user;
 ALTER TABLE clstr_3 OWNER TO clstr_user;
 GRANT SELECT ON clstr_2 TO clstr_user;
@@ -157,13 +158,14 @@ SELECT * FROM clstr_1;
 -- Test MVCC-safety of cluster. There isn't much we can do to verify the
 -- results with a single backend...
 
-CREATE TABLE clustertest (key int PRIMARY KEY);
+CREATE TABLE clustertest (key int, distkey int) DISTRIBUTED BY (distkey);
+CREATE INDEX clustertest_pkey ON clustertest (key);
 
-INSERT INTO clustertest VALUES (10);
-INSERT INTO clustertest VALUES (20);
-INSERT INTO clustertest VALUES (30);
-INSERT INTO clustertest VALUES (40);
-INSERT INTO clustertest VALUES (50);
+INSERT INTO clustertest VALUES (10, 1);
+INSERT INTO clustertest VALUES (20, 2);
+INSERT INTO clustertest VALUES (30, 1);
+INSERT INTO clustertest VALUES (40, 2);
+INSERT INTO clustertest VALUES (50, 3);
 
 -- Use a transaction so that updates are not committed when CLUSTER sees 'em
 BEGIN;
@@ -179,13 +181,13 @@ UPDATE clustertest SET key = 60 WHERE key = 50;
 UPDATE clustertest SET key = 70 WHERE key = 60;
 UPDATE clustertest SET key = 80 WHERE key = 70;
 
-SELECT * FROM clustertest;
+SELECT key FROM clustertest;
 CLUSTER clustertest_pkey ON clustertest;
-SELECT * FROM clustertest;
+SELECT key FROM clustertest;
 
 COMMIT;
 
-SELECT * FROM clustertest;
+SELECT key FROM clustertest;
 
 -- check that temp tables can be clustered
 create temp table clstr_temp (col1 int primary key, col2 text);

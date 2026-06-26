@@ -134,6 +134,8 @@ CONTEXT:  PL/Perl function "trigger_data"
 DROP TRIGGER show_trigger_data_trig on trigger_test;
 insert into trigger_test values(1,'insert', '("(1)")');
 CREATE VIEW trigger_test_view AS SELECT * FROM trigger_test;
+--start_ignore
+-- INSTEAD OF triggers are not yet supported in Greenplum
 CREATE TRIGGER show_trigger_data_trig
 INSTEAD OF INSERT OR UPDATE OR DELETE ON trigger_test_view
 FOR EACH ROW EXECUTE PROCEDURE trigger_data(24,'skidoo view');
@@ -208,6 +210,7 @@ NOTICE:  $_TD->{table_schema} = 'public'
 CONTEXT:  PL/Perl function "trigger_data"
 NOTICE:  $_TD->{when} = 'INSTEAD OF'
 CONTEXT:  PL/Perl function "trigger_data"
+--end_ignore
 DROP VIEW trigger_test_view;
 delete from trigger_test;
 DROP FUNCTION trigger_data();
@@ -245,14 +248,16 @@ SELECT * FROM trigger_test;
 (4 rows)
 
 UPDATE trigger_test SET i = 5 where i=3;
+ERROR:  UPDATE on distributed key column not allowed on relation with update triggers
 UPDATE trigger_test SET i = 100 where i=1;
+ERROR:  UPDATE on distributed key column not allowed on relation with update triggers
 SELECT * FROM trigger_test;
- i |                          v                           |   foo   
----+------------------------------------------------------+---------
- 1 | first line(modified by trigger)                      | ("(2)")
- 2 | second line(modified by trigger)                     | ("(3)")
- 4 | immortal                                             | ("(4)")
- 5 | third line(modified by trigger)(modified by trigger) | ("(5)")
+ i |                v                 |   foo   
+---+----------------------------------+---------
+ 1 | first line(modified by trigger)  | ("(2)")
+ 2 | second line(modified by trigger) | ("(3)")
+ 3 | third line(modified by trigger)  | ("(4)")
+ 4 | immortal                         | ("(4)")
 (4 rows)
 
 DROP TRIGGER "test_valid_id_trig" ON trigger_test;
@@ -273,16 +278,16 @@ $$ LANGUAGE plperl;
 CREATE TRIGGER "test_trigger_recurse" BEFORE INSERT ON trigger_test
 FOR EACH ROW EXECUTE PROCEDURE "trigger_recurse"();
 INSERT INTO trigger_test (i, v) values (10000, 'top');
+ERROR:  function cannot execute on a QE slice because it issues a non-SELECT statement at line 6.
+CONTEXT:  PL/Perl function "trigger_recurse"
 SELECT * FROM trigger_test;
-   i   |                          v                           |   foo   
--------+------------------------------------------------------+---------
-     1 | first line(modified by trigger)                      | ("(2)")
-     2 | second line(modified by trigger)                     | ("(3)")
-     4 | immortal                                             | ("(4)")
-     5 | third line(modified by trigger)(modified by trigger) | ("(5)")
- 20000 | child                                                | 
- 10000 | top                                                  | 
-(6 rows)
+ i |                v                 |   foo   
+---+----------------------------------+---------
+ 1 | first line(modified by trigger)  | ("(2)")
+ 2 | second line(modified by trigger) | ("(3)")
+ 3 | third line(modified by trigger)  | ("(4)")
+ 4 | immortal                         | ("(4)")
+(4 rows)
 
 CREATE OR REPLACE FUNCTION immortal() RETURNS trigger AS $$
     if ($_TD->{old}{v} eq $_TD->{args}[0])
@@ -318,29 +323,29 @@ create event trigger perl_a_snitch on ddl_command_start
 create event trigger perl_b_snitch on ddl_command_end
    execute procedure perlsnitch();
 create or replace function foobar() returns int language sql as $$select 1;$$;
-NOTICE:  perlsnitch: ddl_command_start CREATE FUNCTION 
+NOTICE:  perlsnitch: ddl_command_start CREATE FUNCTION
 CONTEXT:  PL/Perl function "perlsnitch"
-NOTICE:  perlsnitch: ddl_command_end CREATE FUNCTION 
+NOTICE:  perlsnitch: ddl_command_end CREATE FUNCTION
 CONTEXT:  PL/Perl function "perlsnitch"
 alter function foobar() cost 77;
-NOTICE:  perlsnitch: ddl_command_start ALTER FUNCTION 
+NOTICE:  perlsnitch: ddl_command_start ALTER FUNCTION
 CONTEXT:  PL/Perl function "perlsnitch"
-NOTICE:  perlsnitch: ddl_command_end ALTER FUNCTION 
+NOTICE:  perlsnitch: ddl_command_end ALTER FUNCTION
 CONTEXT:  PL/Perl function "perlsnitch"
 drop function foobar();
-NOTICE:  perlsnitch: ddl_command_start DROP FUNCTION 
+NOTICE:  perlsnitch: ddl_command_start DROP FUNCTION
 CONTEXT:  PL/Perl function "perlsnitch"
-NOTICE:  perlsnitch: ddl_command_end DROP FUNCTION 
+NOTICE:  perlsnitch: ddl_command_end DROP FUNCTION
 CONTEXT:  PL/Perl function "perlsnitch"
 create table foo();
-NOTICE:  perlsnitch: ddl_command_start CREATE TABLE 
+NOTICE:  perlsnitch: ddl_command_start CREATE TABLE
 CONTEXT:  PL/Perl function "perlsnitch"
-NOTICE:  perlsnitch: ddl_command_end CREATE TABLE 
+NOTICE:  perlsnitch: ddl_command_end CREATE TABLE
 CONTEXT:  PL/Perl function "perlsnitch"
 drop table foo;
-NOTICE:  perlsnitch: ddl_command_start DROP TABLE 
+NOTICE:  perlsnitch: ddl_command_start DROP TABLE
 CONTEXT:  PL/Perl function "perlsnitch"
-NOTICE:  perlsnitch: ddl_command_end DROP TABLE 
+NOTICE:  perlsnitch: ddl_command_end DROP TABLE
 CONTEXT:  PL/Perl function "perlsnitch"
 drop event trigger perl_a_snitch;
 drop event trigger perl_b_snitch;

@@ -39,49 +39,49 @@ install_support_functions_in_new_db(const char *db_name)
 
 	PQclear(executeQueryOrDie(conn,
 							  "CREATE OR REPLACE FUNCTION "
-							  "binary_upgrade.set_next_pg_type_oid(OID) "
+							  "binary_upgrade.set_next_pg_type_oid(OID, OID, TEXT) "
 							  "RETURNS VOID "
 							  "AS '$libdir/pg_upgrade_support' "
 							  "LANGUAGE C STRICT;"));
 	PQclear(executeQueryOrDie(conn,
 							  "CREATE OR REPLACE FUNCTION "
-							"binary_upgrade.set_next_array_pg_type_oid(OID) "
+							"binary_upgrade.set_next_array_pg_type_oid(OID, OID, TEXT) "
 							  "RETURNS VOID "
 							  "AS '$libdir/pg_upgrade_support' "
 							  "LANGUAGE C STRICT;"));
 	PQclear(executeQueryOrDie(conn,
 							  "CREATE OR REPLACE FUNCTION "
-							"binary_upgrade.set_next_toast_pg_type_oid(OID) "
+							"binary_upgrade.set_next_toast_pg_type_oid(OID, OID, TEXT) "
 							  "RETURNS VOID "
 							  "AS '$libdir/pg_upgrade_support' "
 							  "LANGUAGE C STRICT;"));
 	PQclear(executeQueryOrDie(conn,
 							  "CREATE OR REPLACE FUNCTION "
-							"binary_upgrade.set_next_heap_pg_class_oid(OID) "
+							"binary_upgrade.set_next_heap_pg_class_oid(OID, OID, TEXT) "
 							  "RETURNS VOID "
 							  "AS '$libdir/pg_upgrade_support' "
 							  "LANGUAGE C STRICT;"));
 	PQclear(executeQueryOrDie(conn,
 							  "CREATE OR REPLACE FUNCTION "
-						   "binary_upgrade.set_next_index_pg_class_oid(OID) "
+						   "binary_upgrade.set_next_index_pg_class_oid(OID, OID, TEXT) "
 							  "RETURNS VOID "
 							  "AS '$libdir/pg_upgrade_support' "
 							  "LANGUAGE C STRICT;"));
 	PQclear(executeQueryOrDie(conn,
 							  "CREATE OR REPLACE FUNCTION "
-						   "binary_upgrade.set_next_toast_pg_class_oid(OID) "
+						   "binary_upgrade.set_next_toast_pg_class_oid(OID, OID, TEXT) "
 							  "RETURNS VOID "
 							  "AS '$libdir/pg_upgrade_support' "
 							  "LANGUAGE C STRICT;"));
 	PQclear(executeQueryOrDie(conn,
 							  "CREATE OR REPLACE FUNCTION "
-							  "binary_upgrade.set_next_pg_enum_oid(OID) "
+							  "binary_upgrade.set_next_pg_enum_oid(OID, OID, TEXT) "
 							  "RETURNS VOID "
 							  "AS '$libdir/pg_upgrade_support' "
 							  "LANGUAGE C STRICT;"));
 	PQclear(executeQueryOrDie(conn,
 							  "CREATE OR REPLACE FUNCTION "
-							  "binary_upgrade.set_next_pg_authid_oid(OID) "
+							  "binary_upgrade.set_next_pg_authid_oid(OID, TEXT) "
 							  "RETURNS VOID "
 							  "AS '$libdir/pg_upgrade_support' "
 							  "LANGUAGE C STRICT;"));
@@ -91,6 +91,25 @@ install_support_functions_in_new_db(const char *db_name)
 							  "RETURNS VOID "
 							  "AS '$libdir/pg_upgrade_support' "
 							  "LANGUAGE C;"));
+	PQclear(executeQueryOrDie(conn,
+							  "CREATE OR REPLACE FUNCTION "
+							  "binary_upgrade.set_next_pg_namespace_oid(OID, TEXT) "
+							  "RETURNS VOID "
+							  "AS '$libdir/pg_upgrade_support' "
+							  "LANGUAGE C STRICT;"));
+	PQclear(executeQueryOrDie(conn,
+							  "CREATE OR REPLACE FUNCTION "
+							  "binary_upgrade.set_preassigned_oids(oid[]) "
+							  "RETURNS VOID "
+							  "AS '$libdir/pg_upgrade_support' "
+							  "LANGUAGE C STRICT;"));
+	PQclear(executeQueryOrDie(conn,
+	                          "CREATE OR REPLACE FUNCTION "
+	                          "binary_upgrade.set_next_preassigned_tablespace_oid(OID, TEXT) "
+	                          "RETURNS VOID "
+	                          "AS '$libdir/pg_upgrade_support' "
+	                          "LANGUAGE C STRICT;"));
+
 	PQfinish(conn);
 }
 
@@ -133,9 +152,20 @@ get_loadable_libraries(void)
 	int			totaltups;
 	int			dbnum;
 	bool		found_public_plpython_handler = false;
+	char	   *pg83_str;
 
 	ress = (PGresult **) pg_malloc(old_cluster.dbarr.ndbs * sizeof(PGresult *));
 	totaltups = 0;
+
+	/*
+	 * gpoptutils was removed during the 5.0 development cycle and the
+	 * functionality is now in backend, skip when checking for loadable
+	 * libraries in 4.3-> upgrades.
+	 */
+	if (GET_MAJOR_VERSION(old_cluster.major_version) == 802)
+		pg83_str = "probin NOT IN ('$libdir/gpoptutils') AND ";
+	else
+		pg83_str = "";
 
 	/* Fetch all library names, removing duplicates within each DB */
 	for (dbnum = 0; dbnum < old_cluster.dbarr.ndbs; dbnum++)
@@ -154,7 +184,9 @@ get_loadable_libraries(void)
 										"FROM	pg_catalog.pg_proc "
 										"WHERE	prolang = 13 /* C */ AND "
 										"probin IS NOT NULL AND "
+										" %s "
 										"oid >= %u;",
+										pg83_str,
 										FirstNormalObjectId);
 		totaltups += PQntuples(ress[dbnum]);
 

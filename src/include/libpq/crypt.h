@@ -13,9 +13,12 @@
 #ifndef PG_CRYPT_H
 #define PG_CRYPT_H
 
-#include "libpq/libpq-be.h"
+#include "c.h"
 
-extern int md5_crypt_verify(const Port *port, const char *role,
+#include "libpq/libpq-be.h"
+#include "libpq/md5.h"
+
+extern int hashed_passwd_verify(const Port *port, const char *role,
 				 char *client_pass, char **logdetail);
 
 #endif

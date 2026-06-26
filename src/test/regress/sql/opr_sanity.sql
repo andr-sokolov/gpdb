@@ -30,7 +30,7 @@ SELECT ($1 = $2) OR
  ($2 = 'pg_catalog.anyarray'::pg_catalog.regtype AND
   EXISTS(select 1 from pg_catalog.pg_type where
          oid = $1 and typelem != 0 and typlen = -1))
-$$ language sql strict stable;
+$$ language sql strict stable READS SQL DATA;
 
 -- This one ignores castcontext, so it considers only physical equivalence
 -- and not whether the coercion can be invoked implicitly.
@@ -43,7 +43,7 @@ SELECT ($1 = $2) OR
  ($2 = 'pg_catalog.anyarray'::pg_catalog.regtype AND
   EXISTS(select 1 from pg_catalog.pg_type where
          oid = $1 and typelem != 0 and typlen = -1))
-$$ language sql strict stable;
+$$ language sql strict stable READS SQL DATA;
 
 -- **************** pg_proc ****************
 
@@ -99,19 +99,27 @@ WHERE p1.oid != p2.oid AND
 -- Considering only built-in procs (prolang = 12), look for multiple uses
 -- of the same internal function (ie, matching prosrc fields).  It's OK to
 -- have several entries with different pronames for the same internal function,
--- but conflicts in the number of arguments and other critical items should
--- be complained of.  (We don't check data types here; see next query.)
--- Note: ignore aggregate functions here, since they all point to the same
--- dummy built-in function.
+-- but conflicts in the number of arguments (except in the case of window 
+-- functions) and other critical items should be complained of.  (We don't 
+-- check data types here; see next query.) 
+--
+-- Note: ignore aggregate functions here, since they all point to the same dummy
+-- built-in function.
+--
+-- Note: ignoring gp_deprecated here since the function ignores its parameters
+-- always errors and never returns a value.
 
 SELECT p1.oid, p1.proname, p2.oid, p2.proname
 FROM pg_proc AS p1, pg_proc AS p2
 WHERE p1.oid < p2.oid AND
     p1.prosrc = p2.prosrc AND
+	p1.prosrc NOT IN ('gp_deprecated') AND
     p1.prolang = 12 AND p2.prolang = 12 AND
     (p1.proisagg = false OR p2.proisagg = false) AND
+    (p1.proiswindow = false OR p1.proiswindow = false) AND
     (p1.prolang != p2.prolang OR
      p1.proisagg != p2.proisagg OR
+     p1.proiswindow != p2.proiswindow OR
      p1.prosecdef != p2.prosecdef OR
      p1.proisstrict != p2.proisstrict OR
      p1.proretset != p2.proretset OR
@@ -126,100 +134,134 @@ WHERE p1.oid < p2.oid AND
 -- so treated.  Note that the expected output of this part of the test will
 -- need to be modified whenever new pairs of types are made binary-equivalent,
 -- or when new polymorphic built-in functions are added!
+--
 -- Note: ignore aggregate functions here, since they all point to the same
--- dummy built-in function.  Likewise, ignore range constructor functions.
+-- dummy built-in function.
+--
+-- Note: ignoring gp_deprecated here since the function ignores its parameters
+-- always errors and never returns a value.
 
-SELECT DISTINCT p1.prorettype, p2.prorettype
+SELECT DISTINCT p1.prorettype::regtype, p2.prorettype::regtype
 FROM pg_proc AS p1, pg_proc AS p2
 WHERE p1.oid != p2.oid AND
     p1.prosrc = p2.prosrc AND
+	p1.prosrc NOT IN ('gp_deprecated') AND
     p1.prolang = 12 AND p2.prolang = 12 AND
     NOT p1.proisagg AND NOT p2.proisagg AND
+    NOT p1.proiswindow AND NOT p2.proiswindow AND
     p1.prosrc NOT LIKE E'range\\_constructor_' AND
     p2.prosrc NOT LIKE E'range\\_constructor_' AND
     (p1.prorettype < p2.prorettype)
-ORDER BY 1, 2;
+ORDER BY 1, 2; -- order none
 
-SELECT DISTINCT p1.proargtypes[0], p2.proargtypes[0]
+SELECT DISTINCT p1.proargtypes[0]::regtype, p2.proargtypes[0]::regtype
 FROM pg_proc AS p1, pg_proc AS p2
 WHERE p1.oid != p2.oid AND
     p1.prosrc = p2.prosrc AND
+	p1.prosrc NOT IN ('gp_deprecated') AND
     p1.prolang = 12 AND p2.prolang = 12 AND
     NOT p1.proisagg AND NOT p2.proisagg AND
+    NOT p1.proiswindow AND NOT p2.proiswindow AND
     p1.prosrc NOT LIKE E'range\\_constructor_' AND
     p2.prosrc NOT LIKE E'range\\_constructor_' AND
     (p1.proargtypes[0] < p2.proargtypes[0])
-ORDER BY 1, 2;
+ORDER BY 1, 2; -- order none
 
-SELECT DISTINCT p1.proargtypes[1], p2.proargtypes[1]
+SELECT DISTINCT p1.proargtypes[1]::regtype, p2.proargtypes[1]::regtype
 FROM pg_proc AS p1, pg_proc AS p2
 WHERE p1.oid != p2.oid AND
     p1.prosrc = p2.prosrc AND
+	p1.prosrc NOT IN ('gp_deprecated') AND
     p1.prolang = 12 AND p2.prolang = 12 AND
     NOT p1.proisagg AND NOT p2.proisagg AND
+    NOT p1.proiswindow AND NOT p2.proiswindow AND
     p1.prosrc NOT LIKE E'range\\_constructor_' AND
     p2.prosrc NOT LIKE E'range\\_constructor_' AND
     (p1.proargtypes[1] < p2.proargtypes[1])
-ORDER BY 1, 2;
+ORDER BY 1, 2; -- order none
 
-SELECT DISTINCT p1.proargtypes[2], p2.proargtypes[2]
+SELECT DISTINCT p1.proargtypes[2]::regtype, p2.proargtypes[2]::regtype
 FROM pg_proc AS p1, pg_proc AS p2
 WHERE p1.oid != p2.oid AND
     p1.prosrc = p2.prosrc AND
+	p1.prosrc NOT IN ('gp_deprecated') AND
     p1.prolang = 12 AND p2.prolang = 12 AND
     NOT p1.proisagg AND NOT p2.proisagg AND
+    NOT p1.proiswindow AND NOT p2.proiswindow AND
     (p1.proargtypes[2] < p2.proargtypes[2])
-ORDER BY 1, 2;
+ORDER BY 1, 2; -- order none
 
-SELECT DISTINCT p1.proargtypes[3], p2.proargtypes[3]
+SELECT DISTINCT p1.proargtypes[3]::regtype, p2.proargtypes[3]::regtype
 FROM pg_proc AS p1, pg_proc AS p2
 WHERE p1.oid != p2.oid AND
     p1.prosrc = p2.prosrc AND
+	p1.prosrc NOT IN ('gp_deprecated') AND
     p1.prolang = 12 AND p2.prolang = 12 AND
     NOT p1.proisagg AND NOT p2.proisagg AND
+    NOT p1.proiswindow AND NOT p2.proiswindow AND
     (p1.proargtypes[3] < p2.proargtypes[3])
-ORDER BY 1, 2;
+ORDER BY 1, 2; -- order none
 
-SELECT DISTINCT p1.proargtypes[4], p2.proargtypes[4]
+SELECT DISTINCT p1.proargtypes[4]::regtype, p2.proargtypes[4]::regtype
 FROM pg_proc AS p1, pg_proc AS p2
 WHERE p1.oid != p2.oid AND
     p1.prosrc = p2.prosrc AND
+	p1.prosrc NOT IN ('gp_deprecated') AND
     p1.prolang = 12 AND p2.prolang = 12 AND
     NOT p1.proisagg AND NOT p2.proisagg AND
+    NOT p1.proiswindow AND NOT p2.proiswindow AND
     (p1.proargtypes[4] < p2.proargtypes[4])
-ORDER BY 1, 2;
+ORDER BY 1, 2; -- order none
 
-SELECT DISTINCT p1.proargtypes[5], p2.proargtypes[5]
+SELECT DISTINCT p1.proargtypes[5]::regtype, p2.proargtypes[5]::regtype
 FROM pg_proc AS p1, pg_proc AS p2
 WHERE p1.oid != p2.oid AND
     p1.prosrc = p2.prosrc AND
+	p1.prosrc NOT IN ('gp_deprecated') AND
     p1.prolang = 12 AND p2.prolang = 12 AND
     NOT p1.proisagg AND NOT p2.proisagg AND
+    NOT p1.proiswindow AND NOT p2.proiswindow AND
     (p1.proargtypes[5] < p2.proargtypes[5])
-ORDER BY 1, 2;
+ORDER BY 1, 2; -- order none
 
-SELECT DISTINCT p1.proargtypes[6], p2.proargtypes[6]
+SELECT DISTINCT p1.proargtypes[6]::regtype, p2.proargtypes[6]::regtype
 FROM pg_proc AS p1, pg_proc AS p2
 WHERE p1.oid != p2.oid AND
     p1.prosrc = p2.prosrc AND
+	p1.prosrc NOT IN ('gp_deprecated') AND
     p1.prolang = 12 AND p2.prolang = 12 AND
     NOT p1.proisagg AND NOT p2.proisagg AND
+    NOT p1.proiswindow AND NOT p2.proiswindow AND
     (p1.proargtypes[6] < p2.proargtypes[6])
-ORDER BY 1, 2;
+ORDER BY 1, 2; -- order none
 
-SELECT DISTINCT p1.proargtypes[7], p2.proargtypes[7]
+SELECT DISTINCT p1.proargtypes[7]::regtype, p2.proargtypes[7]::regtype
 FROM pg_proc AS p1, pg_proc AS p2
 WHERE p1.oid != p2.oid AND
     p1.prosrc = p2.prosrc AND
+	p1.prosrc NOT IN ('gp_deprecated') AND
     p1.prolang = 12 AND p2.prolang = 12 AND
     NOT p1.proisagg AND NOT p2.proisagg AND
+    NOT p1.proiswindow AND NOT p2.proiswindow AND
     (p1.proargtypes[7] < p2.proargtypes[7])
-ORDER BY 1, 2;
+ORDER BY 1, 2; -- order none
+
+-- The checks above only extend to the first 8 parameters, list any
+-- functions not checked.
+SELECT proname, pronargs 
+FROM pg_proc 
+WHERE pronargs > 8 and prolang = 12 AND
+	proname NOT IN ('gp_add_segment') AND
+	proname NOT LIKE '%costestimate' AND
+    NOT proisagg AND 
+    NOT proiswindow;
+
 
 -- Look for functions that return type "internal" and do not have any
 -- "internal" argument.  Such a function would be a security hole since
 -- it might be used to call an internal function from an SQL command.
--- As of 7.3 this query should find only internal_in.
+-- As of 7.3 this query should find only internal_in, which is safe because
+-- it always throws an error when called.
 
 SELECT p1.oid, p1.proname
 FROM pg_proc as p1
@@ -839,6 +881,72 @@ WHERE a.aggfnoid = p.oid AND
     a.aggminvtransfn = iptr.oid AND
     ptr.proisstrict != iptr.proisstrict;
 
+-- Check that all combine functions have signature
+-- combine(transtype, transtype) returns transtype
+-- NOTE: use physically_coercible here, not binary_coercible, because
+-- max and min on abstime are implemented using int4larger/int4smaller.
+
+SELECT a.aggfnoid, p.proname
+FROM pg_aggregate as a, pg_proc as p
+WHERE a.aggcombinefn = p.oid AND
+    (p.pronargs != 2 OR
+     p.prorettype != p.proargtypes[0] OR
+     p.prorettype != p.proargtypes[1] OR
+     NOT physically_coercible(a.aggtranstype, p.proargtypes[0]));
+
+-- Check that no combine function for an INTERNAL transtype is strict.
+
+SELECT a.aggfnoid, p.proname
+FROM pg_aggregate as a, pg_proc as p
+WHERE a.aggcombinefn = p.oid AND
+    a.aggtranstype = 'internal'::regtype AND p.proisstrict;
+
+-- serialize/deserialize functions should be specified only for aggregates
+-- with transtype internal and a combine function, and we should have both
+-- or neither of them.
+
+SELECT aggfnoid, aggtranstype, aggserialfn, aggdeserialfn
+FROM pg_aggregate
+WHERE (aggserialfn != 0 OR aggdeserialfn != 0)
+  AND (aggtranstype != 'internal'::regtype OR aggcombinefn = 0 OR
+       aggserialfn = 0 OR aggdeserialfn = 0);
+
+-- Check that all serialization functions have signature
+-- serialize(internal) returns bytea
+-- Also insist that they be strict; it's wasteful to run them on NULLs.
+
+SELECT a.aggfnoid, p.proname
+FROM pg_aggregate as a, pg_proc as p
+WHERE a.aggserialfn = p.oid AND
+    (p.prorettype != 'bytea'::regtype OR p.pronargs != 1 OR
+     p.proargtypes[0] != 'internal'::regtype OR
+     NOT p.proisstrict);
+
+-- Check that all deserialization functions have signature
+-- deserialize(bytea, internal) returns internal
+-- Also insist that they be strict; it's wasteful to run them on NULLs.
+
+SELECT a.aggfnoid, p.proname
+FROM pg_aggregate as a, pg_proc as p
+WHERE a.aggdeserialfn = p.oid AND
+    (p.prorettype != 'internal'::regtype OR p.pronargs != 2 OR
+     p.proargtypes[0] != 'bytea'::regtype OR
+     p.proargtypes[1] != 'internal'::regtype OR
+     NOT p.proisstrict);
+
+-- Check that aggregates which have the same transition function also have
+-- the same combine, serialization, and deserialization functions.
+-- While that isn't strictly necessary, it's fishy if they don't.
+
+SELECT a.aggfnoid, a.aggcombinefn, a.aggserialfn, a.aggdeserialfn,
+       b.aggfnoid, b.aggcombinefn, b.aggserialfn, b.aggdeserialfn
+FROM
+    pg_aggregate a, pg_aggregate b
+WHERE
+    a.aggfnoid < b.aggfnoid AND a.aggtransfn = b.aggtransfn AND
+    (a.aggcombinefn != b.aggcombinefn OR a.aggserialfn != b.aggserialfn
+     OR a.aggdeserialfn != b.aggdeserialfn);
+
 -- Cross-check aggsortop (if present) against pg_operator.
 -- We expect to find entries for bool_and, bool_or, every, max, and min.
 
@@ -1179,6 +1287,7 @@ WHERE NOT (
   --   at least one of 4 and 6 must be given.
   -- SP-GiST has five support functions, all mandatory
   amname = 'btree' AND procnums @> '{1}' OR
+  amname = 'bitmap' AND procnums @> '{1}' OR
   amname = 'hash' AND procnums = '{1}' OR
   amname = 'gist' AND procnums @> '{1, 2, 3, 4, 5, 6, 7}' OR
   amname = 'gin' AND (procnums @> '{1, 2, 3}' AND (procnums && '{4, 6}')) OR
@@ -1198,6 +1307,7 @@ SELECT * FROM (
 WHERE NOT (
   -- same per-AM rules as above
   amname = 'btree' AND procnums @> '{1}' OR
+  amname = 'bitmap' AND procnums @> '{1}' OR
   amname = 'hash' AND procnums = '{1}' OR
   amname = 'gist' AND procnums @> '{1, 2, 3, 4, 5, 6, 7}' OR
   amname = 'gin' AND (procnums @> '{1, 2, 3}' AND (procnums && '{4, 6}')) OR
@@ -1232,7 +1342,7 @@ SELECT p1.amprocfamily, p1.amprocnum,
 	p2.oid, p2.proname,
 	p3.opfname
 FROM pg_amproc AS p1, pg_proc AS p2, pg_opfamily AS p3
-WHERE p3.opfmethod = (SELECT oid FROM pg_am WHERE amname = 'btree')
+WHERE p3.opfmethod IN (SELECT oid FROM pg_am WHERE amname IN ('btree', 'bitmap'))
     AND p1.amprocfamily = p3.oid AND p1.amproc = p2.oid AND
     (CASE WHEN amprocnum = 1
           THEN prorettype != 'int4'::regtype OR proretset OR pronargs != 2
@@ -1296,3 +1406,15 @@ FROM pg_amproc AS p1, pg_proc AS p2
 WHERE p1.amproc = p2.oid AND
     p1.amproclefttype != p1.amprocrighttype AND
     p2.provolatile = 'v';
+
+-- Check for oid collisions between pg_proc/pg_type/pg_class
+SELECT *
+FROM
+  (SELECT *, count(*) over (partition by oid) as oid_count
+   FROM (select oid, 'pg_proc' as catalog, proname as name from pg_proc
+         union all
+         select oid, 'pg_type' as catalog, typname as name from pg_type
+         union all
+         select oid, 'pg_class' as catalgo, relname as name from pg_class) cats
+  ) cat_counts
+WHERE oid_count > 1;

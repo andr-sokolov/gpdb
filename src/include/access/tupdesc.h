@@ -80,6 +80,21 @@ typedef struct tupleDesc
 	int			tdrefcount;		/* reference count, or -1 if not counting */
 }	*TupleDesc;
 
+/*
+ * When dispatching a planned statement from QD to QEs, we need to be able
+ * to transmit TupleDescs. TupleDesc doesn't have the Node header, so for
+ * convenience of the read and out functions, we wrap them in TupleDescNode
+ * structs, which do.
+ *
+ * These are never serialized on disk, only in the read/outfast protocol,
+ * as part of PlannedStmts.
+ */
+typedef struct tupleDescNode
+{
+	NodeTag		type;
+	int			natts;
+	TupleDesc	tuple;
+} TupleDescNode;
 
 /* Accessor for the i'th attribute of tupdesc. */
 #define TupleDescAttr(tupdesc, i) ((tupdesc)->attrs[(i)])
@@ -113,7 +128,7 @@ extern void DecrTupleDescRefCount(TupleDesc tupdesc);
 			DecrTupleDescRefCount(tupdesc); \
 	} while (0)
 
-extern bool equalTupleDescs(TupleDesc tupdesc1, TupleDesc tupdesc2);
+extern bool equalTupleDescs(TupleDesc tupdesc1, TupleDesc tupdesc2, bool strict);
 
 extern void TupleDescInitEntry(TupleDesc desc,
 				   AttrNumber attributeNumber,

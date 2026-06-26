@@ -11,7 +11,7 @@
 
 #include "mb/pg_wchar.h"
 #include "pg_upgrade.h"
-
+#include "greenplum/pg_upgrade_greenplum.h"
 
 static void set_locale_and_encoding(ClusterInfo *cluster);
 static void check_new_cluster_is_empty(void);
@@ -85,10 +85,14 @@ check_and_dump_old_cluster(bool live_check, char **sequence_script_file_name)
 
 	get_pg_database_relfilenode(&old_cluster);
 
+	if (is_greenplum_dispatcher_mode())
+		generate_old_tablespaces_file(&old_cluster);
+
 	/* Extract a list of databases and tables from the old cluster */
 	get_db_and_rel_infos(&old_cluster);
 
-	init_tablespaces();
+	if (!user_opts.check || is_greenplum_dispatcher_mode())
+		init_tablespaces();
 
 	get_loadable_libraries();
 
@@ -96,12 +100,31 @@ check_and_dump_old_cluster(bool live_check, char **sequence_script_file_name)
 	/*
 	 * Check for various failure cases
 	 */
+	report_progress(&old_cluster, CHECK, "Failure checks");
 	check_is_super_user(&old_cluster);
 	check_proper_datallowconn(&old_cluster);
 	check_for_prepared_transactions(&old_cluster);
 	check_for_reg_data_type_usage(&old_cluster);
 	check_for_isn_and_int8_passing_mismatch(&old_cluster);
 
+	/*
+	 * Check for various Greenplum failure cases
+	 */
+	check_greenplum();
+
+	/*
+	 * Upgrading from Greenplum 4.3.x which is based on PostgreSQL 8.2.
+	 * Upgrading from one version of 4.3.x to another 4.3.x version is not
+	 * supported.
+	 */
+	if (GET_MAJOR_VERSION(old_cluster.major_version) == 802)
+	{
+		old_8_3_check_for_name_data_type_usage(&old_cluster);
+
+		old_GPDB4_check_for_money_data_type_usage();
+		old_GPDB4_check_no_free_aoseg();
+		check_hash_partition_usage();
+	}
 	if (GET_MAJOR_VERSION(old_cluster.major_version) == 904 &&
 		old_cluster.controldata.cat_ver < JSONB_FORMAT_CHANGE_CAT_VER)
 		check_for_jsonb_9_4_usage(&old_cluster);
@@ -112,6 +135,7 @@ check_and_dump_old_cluster(bool live_check, char **sequence_script_file_name)
 		old_8_3_check_for_name_data_type_usage(&old_cluster);
 		old_8_3_check_for_tsquery_usage(&old_cluster);
 		old_8_3_check_ltree_usage(&old_cluster);
+		check_hash_partition_usage();
 		if (user_opts.check)
 		{
 			old_8_3_rebuild_tsvector_tables(&old_cluster, true);
@@ -119,7 +143,7 @@ check_and_dump_old_cluster(bool live_check, char **sequence_script_file_name)
 			old_8_3_invalidate_bpchar_pattern_ops_indexes(&old_cluster, true);
 		}
 		else
-
+		{
 			/*
 			 * While we have the old server running, create the script to
 			 * properly restore its sequence values but we report this at the
@@ -127,21 +151,26 @@ check_and_dump_old_cluster(bool live_check, char **sequence_script_file_name)
 			 */
 			*sequence_script_file_name =
 				old_8_3_create_sequence_script(&old_cluster);
+		}
 	}
-
 	/* Pre-PG 9.4 had a different 'line' data type internal format */
 	if (GET_MAJOR_VERSION(old_cluster.major_version) <= 903)
 		old_9_3_check_for_line_data_type_usage(&old_cluster);
 
+#if 0
+	/*
+	 * GPDB 6 does not support large objects
+	 */
 	/* Pre-PG 9.0 had no large object permissions */
 	if (GET_MAJOR_VERSION(old_cluster.major_version) <= 804)
 		new_9_0_populate_pg_largeobject_metadata(&old_cluster, true);
+#endif
 
 	/*
 	 * While not a check option, we do this now because this is the only time
 	 * the old server is running.
 	 */
-	if (!user_opts.check)
+	if (!user_opts.check && is_greenplum_dispatcher_mode())
 		generate_old_dump();
 
 	if (!live_check)
@@ -178,9 +207,18 @@ check_new_cluster(void)
 	 * We only allow the install user in the new cluster because other defined
 	 * users might match users defined in the old cluster and generate an
 	 * error during pg_dump restore.
+ 	 *
+ 	 * However, in Greenplum, if we are upgrading a segment, its users have
+	 * already been replicated to it from the master via gpupgrade.  Hence,
+	 * we only need to do this check for the QD.  In other words, the
+	 * Greenplum cluster upgrade scheme will overwrite the QE's schema
+ 	 * with the QD's schema, making this check inappropriate for a QE upgrade.
 	 */
-	if (new_cluster.role_count != 1)
-		pg_fatal("Only the install user can be defined in the new cluster.\n");
+	if (is_greenplum_dispatcher_mode())
+	{
+		if (new_cluster.role_count != 1)
+			pg_fatal("Only the install user can be defined in the new cluster.\n");
+	}
 
 	check_for_prepared_transactions(&new_cluster);
 }
@@ -214,6 +252,10 @@ issue_warnings_and_set_wal_level(char *sequence_script_file_name)
 	 */
 	start_postmaster(&new_cluster, true);
 
+	/* old = PG 8.2/GPDB 4.3 warnings */
+	if (GET_MAJOR_VERSION(old_cluster.major_version) == 802)
+		new_gpdb5_0_invalidate_indexes();
+
 	/* old = PG 8.3 warnings? */
 	if (GET_MAJOR_VERSION(old_cluster.major_version) <= 803)
 	{
@@ -221,7 +263,8 @@ issue_warnings_and_set_wal_level(char *sequence_script_file_name)
 		if (sequence_script_file_name)
 		{
 			prep_status("Adjusting sequences");
-			exec_prog(UTILITY_LOG_FILE, NULL, true,
+			exec_prog(UTILITY_LOG_FILE, NULL, true, true,
+					  PG_OPTIONS_UTILITY_MODE
 					  "\"%s/psql\" " EXEC_PSQL_ARGS " %s -f \"%s\"",
 					  new_cluster.bindir, cluster_conn_opts(&new_cluster),
 					  sequence_script_file_name);
@@ -234,9 +277,14 @@ issue_warnings_and_set_wal_level(char *sequence_script_file_name)
 		old_8_3_invalidate_bpchar_pattern_ops_indexes(&new_cluster, false);
 	}
 
+#if 0
+	/*
+	 * GPDB 6 does not support large objects
+	 */
 	/* Create dummy large object permissions for old < PG 9.0? */
 	if (GET_MAJOR_VERSION(old_cluster.major_version) <= 804)
 		new_9_0_populate_pg_largeobject_metadata(&new_cluster, false);
+#endif
 
 	stop_postmaster(false);
 }
@@ -283,16 +331,34 @@ check_cluster_versions(void)
 	new_cluster.major_version = get_major_server_version(&new_cluster);
 
 	/*
+	 * Upgrading within a major version is a handy feature of pg_upgrade, but
+	 * we don't allow it for within 4.3.x clusters, 4.3.x can only be an old
+	 * version to be upgraded from.
+	 */
+	if (GET_MAJOR_VERSION(old_cluster.major_version) == 802 &&
+		GET_MAJOR_VERSION(new_cluster.major_version) == 802)
+	{
+		pg_log(PG_FATAL,
+			   "old and new cluster cannot both be Greenplum 4.3.x installations\n");
+	}
+
+	/*
 	 * We allow upgrades from/to the same major version for alpha/beta
 	 * upgrades
 	 */
 
-	if (GET_MAJOR_VERSION(old_cluster.major_version) < 803)
-		pg_fatal("This utility can only upgrade from PostgreSQL version 8.3 and later.\n");
+	/*
+	 * Upgrading from anything older than an 8.2 based Greenplum is not
+	 * supported. TODO: This needs to be amended to check for the actual
+	 * 4.3.x version we target and not a blanket 8.2 check, but for now
+	 * this will cover most cases.
+	 */
+	if (GET_MAJOR_VERSION(old_cluster.major_version) < 802)
+		pg_fatal("This utility can only upgrade from Greenplum version 4.3.x and later.\n");
 
 	/* Only current PG version is supported as a target */
 	if (GET_MAJOR_VERSION(new_cluster.major_version) != GET_MAJOR_VERSION(PG_VERSION_NUM))
-		pg_fatal("This utility can only upgrade to PostgreSQL version %s.\n",
+		pg_fatal("This utility can only upgrade to Greenplum version %s.\n",
 				 PG_MAJORVERSION);
 
 	/*
@@ -301,7 +367,7 @@ check_cluster_versions(void)
 	 * older versions.
 	 */
 	if (old_cluster.major_version > new_cluster.major_version)
-		pg_fatal("This utility cannot be used to downgrade to older major PostgreSQL versions.\n");
+		pg_fatal("This utility cannot be used to downgrade to older major Greenplum versions.\n");
 
 	/* get old and new binary versions */
 	get_bin_version(&old_cluster);
@@ -462,8 +528,14 @@ equivalent_locale(int category, const char *loca, const char *locb)
 	lenb = charb ? (charb - canonb) : strlen(canonb);
 
 	if (lena == lenb && pg_strncasecmp(canona, canonb, lena) == 0)
+	{
+		pg_free(canona);
+		pg_free(canonb);
 		return true;
+	}
 
+	pg_free(canona);
+	pg_free(canonb);
 	return false;
 }
 
@@ -494,6 +566,14 @@ static void
 check_new_cluster_is_empty(void)
 {
 	int			dbnum;
+
+	/*
+	 * If we are upgrading a segment we expect to have a complete datadir in
+	 * place from the QD at this point, so the cluster cannot be tested for
+	 * being empty.
+	 */
+	if (!is_greenplum_dispatcher_mode())
+		return;
 
 	for (dbnum = 0; dbnum < new_cluster.dbarr.ndbs; dbnum++)
 	{
@@ -652,7 +732,6 @@ check_proper_datallowconn(ClusterInfo *cluster)
 
 	check_ok();
 }
-
 
 /*
  * create_script_for_old_cluster_deletion()
@@ -971,7 +1050,6 @@ check_for_reg_data_type_usage(ClusterInfo *cluster)
 					i_attname;
 		DbInfo	   *active_db = &cluster->dbarr.dbs[dbnum];
 		PGconn	   *conn = connectToServer(cluster, active_db->db_name);
-
 		/*
 		 * While several relkinds don't store any data, e.g. views, they can
 		 * be used to define data types of other columns, so we check all
@@ -991,10 +1069,14 @@ check_for_reg_data_type_usage(ClusterInfo *cluster)
 								"			'pg_catalog.regoperator'::pg_catalog.regtype, "
 		/* regclass.oid is preserved, so 'regclass' is OK */
 		/* regtype.oid is preserved, so 'regtype' is OK */
-		"			'pg_catalog.regconfig'::pg_catalog.regtype, "
-								"			'pg_catalog.regdictionary'::pg_catalog.regtype) AND "
+								" %s "
+								" ) AND "
 								"		c.relnamespace = n.oid AND "
-							  "		n.nspname NOT IN ('pg_catalog', 'information_schema')");
+							  "		n.nspname NOT IN ('pg_catalog', 'information_schema')",
+						GET_MAJOR_VERSION(old_cluster.major_version) == 802 ?
+							"0" :
+							"'pg_catalog.regconfig'::pg_catalog.regtype, "
+							"'pg_catalog.regdictionary'::pg_catalog.regtype ");
 
 		ntups = PQntuples(res);
 		i_nspname = PQfnumber(res, "nspname");
@@ -1152,7 +1234,7 @@ get_bin_version(ClusterInfo *cluster)
 	if (strchr(cmd_output, '\n') != NULL)
 		*strchr(cmd_output, '\n') = '\0';
 
-	if (sscanf(cmd_output, "%*s %*s %d.%d", &pre_dot, &post_dot) != 2)
+	if (sscanf(cmd_output, "%*s %*s %*s %d.%d", &pre_dot, &post_dot) != 2)
 		pg_fatal("could not get version from %s\n", cmd);
 
 	cluster->bin_version = (pre_dot * 100 + post_dot) * 100;
@@ -1177,7 +1259,7 @@ get_canonical_locale_name(int category, const char *locale)
 		pg_fatal("failed to get the current locale\n");
 
 	/* 'save' may be pointing at a modifiable scratch variable, so copy it. */
-	save = pg_strdup(save);
+	save = (char *) pg_strdup(save);
 
 	/* set the locale with setlocale, to see if it accepts it. */
 	res = setlocale(category, locale);
