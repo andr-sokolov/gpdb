@@ -60,7 +60,6 @@
 #include "utils/resowner.h"
 #include "utils/timestamp.h"
 
-
 /*
  * GUC parameters
  */

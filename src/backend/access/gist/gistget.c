@@ -16,7 +16,9 @@
 
 #include "access/gist_private.h"
 #include "access/relscan.h"
-#include "miscadmin.h"
+#include "executor/execdebug.h"
+#include "miscadmin.h"    /* work_mem */
+#include "nodes/tidbitmap.h"
 #include "pgstat.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
@@ -65,12 +67,10 @@ gistindex_keytest(IndexScanDesc scan,
 	 * minimum possible distances.  This means we'll always follow it to the
 	 * referenced page.
 	 */
-	if (GistTupleIsInvalid(tuple))
+	if (!GistPageIsLeaf(page) && GistTupleIsInvalid(tuple))
 	{
 		int			i;
 
-		if (GistPageIsLeaf(page))		/* shouldn't happen */
-			elog(ERROR, "invalid GiST tuple found on leaf page");
 		for (i = 0; i < scan->numberOfOrderBys; i++)
 		{
 			so->distances[i].value = -get_float8_infinity();
@@ -560,7 +560,7 @@ gistgetbitmap(PG_FUNCTION_ARGS)
 	GISTSearchItem fakeItem;
 
 	if (!so->qual_ok)
-		PG_RETURN_INT64(0);
+		PG_RETURN_INT64(ntids);
 
 	pgstat_count_index_scan(scan->indexRelation);
 

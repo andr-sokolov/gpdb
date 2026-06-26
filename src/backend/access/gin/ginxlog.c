@@ -13,7 +13,9 @@
  */
 #include "postgres.h"
 
+#include "access/gin.h"
 #include "access/gin_private.h"
+#include "access/bufmask.h"
 #include "access/xlogutils.h"
 #include "utils/memutils.h"
 
@@ -983,7 +985,7 @@ ginRedoDeleteListPages(XLogRecPtr lsn, XLogRecord *record)
 }
 
 void
-gin_redo(XLogRecPtr lsn, XLogRecord *record)
+gin_redo(XLogRecPtr beginLoc, XLogRecPtr lsn, XLogRecord *record)
 {
 	uint8		info = record->xl_info & ~XLR_INFO_MASK;
 	MemoryContext oldCtx;
@@ -1048,4 +1050,35 @@ void
 gin_xlog_cleanup(void)
 {
 	MemoryContextDelete(opCtx);
+}
+
+/*
+ * Mask a GIN page before running consistency checks on it.
+ */
+void
+gin_mask(char *pagedata, BlockNumber blkno)
+{
+	Page		page = (Page) pagedata;
+	GinPageOpaque opaque;
+
+	mask_page_lsn_and_checksum(page);
+	opaque = GinPageGetOpaque(page);
+
+	mask_page_hint_bits(page);
+
+	/*
+	 * GIN metapage doesn't use pd_lower/pd_upper. Other page types do. Hence,
+	 * we need to apply masking for those pages.
+	 */
+	if (opaque->flags != GIN_META)
+	{
+		/*
+		 * For GIN_DELETED page, the page is initialized to empty. Hence, mask
+		 * the page content.
+		 */
+		if (opaque->flags & GIN_DELETED)
+			mask_page_content(page);
+		else
+			mask_unused_space(page);
+	}
 }

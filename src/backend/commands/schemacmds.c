@@ -19,9 +19,11 @@
 #include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
+#include "catalog/heap.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
+#include "catalog/oid_dispatch.h"
 #include "catalog/pg_namespace.h"
 #include "commands/dbcommands.h"
 #include "commands/schemacmds.h"
@@ -32,6 +34,11 @@
 #include "utils/builtins.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
+
+#include "cdb/cdbdisp_query.h"
+#include "cdb/cdbsreh.h"
+#include "cdb/cdbsrlz.h"
+#include "cdb/cdbvars.h"
 
 
 static void AlterSchemaOwner_internal(HeapTuple tup, Relation rel, Oid newOwnerId);
@@ -52,6 +59,27 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString)
 	Oid			saved_uid;
 	int			save_sec_context;
 	AclResult	aclresult;
+	bool		shouldDispatch = (Gp_role == GP_ROLE_DISPATCH && 
+								  !IsBootstrapProcessingMode());
+
+	/*
+	 * GPDB: Creation of temporary namespaces is a special case. This statement
+	 * is dispatched by the dispatcher node the first time a temporary table is
+	 * created. It bypasses all the normal checks and logic of schema creation,
+	 * and is routed to the internal routine for creating temporary namespaces,
+	 * instead.
+	 */
+	if (stmt->istemp)
+	{
+		Assert(Gp_role == GP_ROLE_EXECUTE);
+
+		Assert(stmt->schemaname == NULL);
+		Assert(stmt->authid == NULL);
+		Assert(stmt->schemaElts == NIL);
+
+		InitTempTableNamespace();
+		return InvalidOid;
+	}
 
 	GetUserIdAndSecContext(&saved_uid, &save_sec_context);
 
@@ -79,10 +107,13 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString)
 
 	/* Additional check to protect reserved schema names */
 	if (!allowSystemTableMods && IsReservedName(schemaName))
+	{
 		ereport(ERROR,
 				(errcode(ERRCODE_RESERVED_NAME),
 				 errmsg("unacceptable schema name \"%s\"", schemaName),
-		   errdetail("The prefix \"pg_\" is reserved for system schemas.")));
+				 errdetail("The prefix \"%s\" is reserved for system schemas.",
+						   GetReservedPrefix(schemaName))));
+	}
 
 	/*
 	 * If if_not_exists was given and the schema already exists, bail out.
@@ -101,6 +132,41 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString)
 		return InvalidOid;
 	}
 
+	/* Create the schema's namespace */
+	if (shouldDispatch || Gp_role != GP_ROLE_EXECUTE)
+	{
+		namespaceId = NamespaceCreate(schemaName, owner_uid, false);
+
+		if (shouldDispatch)
+		{
+			elog(DEBUG5, "shouldDispatch = true, namespaceOid = %d", namespaceId);
+
+			/*
+			 * Dispatch the command to all primary and mirror segment dbs.
+			 * Starts a global transaction and reconfigures cluster if needed.
+			 * Waits for QEs to finish.  Exits via ereport(ERROR,...) if error.
+			 */
+			CdbDispatchUtilityStatement((Node *) stmt,
+										DF_CANCEL_ON_ERROR |
+										DF_WITH_SNAPSHOT |
+										DF_NEED_TWO_PHASE,
+										GetAssignedOidsForDispatch(),
+										NULL);
+		}
+
+		/* MPP-6929: metadata tracking */
+		if (Gp_role == GP_ROLE_DISPATCH)
+			MetaTrackAddObject(NamespaceRelationId,
+							   namespaceId,
+							   saved_uid,
+							   "CREATE", "SCHEMA"
+					);
+	}
+	else
+	{
+		namespaceId = NamespaceCreate(schemaName, owner_uid, false);
+	}
+
 	/*
 	 * If the requested authorization is different from the current user,
 	 * temporarily set the current user so that the object(s) will be created
@@ -112,9 +178,6 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString)
 	if (saved_uid != owner_uid)
 		SetUserIdAndSecContext(owner_uid,
 							save_sec_context | SECURITY_LOCAL_USERID_CHANGE);
-
-	/* Create the schema's namespace */
-	namespaceId = NamespaceCreate(schemaName, owner_uid, false);
 
 	/* Advance cmd counter to make the namespace visible */
 	CommandCounterIncrement();
@@ -189,6 +252,11 @@ RemoveSchemaById(Oid schemaOid)
 	ReleaseSysCache(tup);
 
 	heap_close(relation, RowExclusiveLock);
+
+	/*
+	 * Remove all persistent error logs belonging to the the schema.
+	 */
+	PersistentErrorLogDelete(MyDatabaseId, schemaOid, NULL);
 }
 
 
@@ -220,7 +288,7 @@ RenameSchema(const char *oldname, const char *newname)
 				 errmsg("schema \"%s\" already exists", newname)));
 
 	/* must be owner */
-	if (!pg_namespace_ownercheck(HeapTupleGetOid(tup), GetUserId()))
+	if (!pg_namespace_ownercheck(nspOid, GetUserId()))
 		aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_NAMESPACE,
 					   oldname);
 
@@ -230,16 +298,36 @@ RenameSchema(const char *oldname, const char *newname)
 		aclcheck_error(aclresult, ACL_KIND_DATABASE,
 					   get_database_name(MyDatabaseId));
 
+	if (!allowSystemTableMods && IsReservedName(oldname))
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to ALTER SCHEMA \"%s\"", oldname),
+				 errdetail("Schema %s is reserved for system use.", oldname)));
+	}
+
 	if (!allowSystemTableMods && IsReservedName(newname))
+	{
 		ereport(ERROR,
 				(errcode(ERRCODE_RESERVED_NAME),
 				 errmsg("unacceptable schema name \"%s\"", newname),
-		   errdetail("The prefix \"pg_\" is reserved for system schemas.")));
+				 errdetail("The prefix \"%s\" is reserved for system schemas.",
+						   GetReservedPrefix(newname))));
+	}
+
 
 	/* rename */
 	namestrcpy(&(((Form_pg_namespace) GETSTRUCT(tup))->nspname), newname);
 	simple_heap_update(rel, &tup->t_self, tup);
 	CatalogUpdateIndexes(rel, tup);
+
+	/* MPP-6929: metadata tracking */
+	if (Gp_role == GP_ROLE_DISPATCH)
+		MetaTrackUpdObject(NamespaceRelationId,
+						   nspOid,
+						   GetUserId(),
+						   "ALTER", "RENAME"
+				);
 
 	InvokeObjectPostAlterHook(NamespaceRelationId, HeapTupleGetOid(tup), 0);
 
@@ -287,6 +375,14 @@ AlterSchemaOwner(const char *name, Oid newOwnerId)
 				(errcode(ERRCODE_UNDEFINED_SCHEMA),
 				 errmsg("schema \"%s\" does not exist", name)));
 
+	if (!allowSystemTableMods && IsReservedName(name))
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to ALTER SCHEMA \"%s\"", name),
+				 errdetail("Schema %s is reserved for system use.", name)));
+	}
+
 	nspOid = HeapTupleGetOid(tup);
 
 	AlterSchemaOwner_internal(tup, rel, newOwnerId);
@@ -303,7 +399,6 @@ AlterSchemaOwner_internal(HeapTuple tup, Relation rel, Oid newOwnerId)
 {
 	Form_pg_namespace nspForm;
 
-	Assert(tup->t_tableOid == NamespaceRelationId);
 	Assert(RelationGetRelid(rel) == NamespaceRelationId);
 
 	nspForm = (Form_pg_namespace) GETSTRUCT(tup);
@@ -322,9 +417,11 @@ AlterSchemaOwner_internal(HeapTuple tup, Relation rel, Oid newOwnerId)
 		bool		isNull;
 		HeapTuple	newtuple;
 		AclResult	aclresult;
+		Oid			nsoid;
 
 		/* Otherwise, must be owner of the existing object */
-		if (!pg_namespace_ownercheck(HeapTupleGetOid(tup), GetUserId()))
+		nsoid = HeapTupleGetOid(tup);
+		if (!pg_namespace_ownercheck(nsoid, GetUserId()))
 			aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_NAMESPACE,
 						   NameStr(nspForm->nspname));
 
@@ -371,6 +468,14 @@ AlterSchemaOwner_internal(HeapTuple tup, Relation rel, Oid newOwnerId)
 
 		simple_heap_update(rel, &newtuple->t_self, newtuple);
 		CatalogUpdateIndexes(rel, newtuple);
+
+		/* MPP-6929: metadata tracking */
+		if (Gp_role == GP_ROLE_DISPATCH)
+			MetaTrackUpdObject(NamespaceRelationId,
+							   nsoid,
+							   GetUserId(),
+							   "ALTER", "OWNER"
+					);
 
 		heap_freetuple(newtuple);
 

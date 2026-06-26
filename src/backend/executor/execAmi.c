@@ -14,6 +14,7 @@
 
 #include "access/htup_details.h"
 #include "executor/execdebug.h"
+#include "executor/instrument.h"
 #include "executor/nodeAgg.h"
 #include "executor/nodeAppend.h"
 #include "executor/nodeBitmapAnd.h"
@@ -23,8 +24,6 @@
 #include "executor/nodeCtescan.h"
 #include "executor/nodeForeignscan.h"
 #include "executor/nodeFunctionscan.h"
-#include "executor/nodeGroup.h"
-#include "executor/nodeGroup.h"
 #include "executor/nodeHash.h"
 #include "executor/nodeHashjoin.h"
 #include "executor/nodeIndexonlyscan.h"
@@ -48,6 +47,14 @@
 #include "executor/nodeValuesscan.h"
 #include "executor/nodeWindowAgg.h"
 #include "executor/nodeWorktablescan.h"
+#include "executor/nodeAssertOp.h"
+#include "executor/nodeDynamicSeqscan.h"
+#include "executor/nodeDynamicIndexscan.h"
+#include "executor/nodeMotion.h"
+#include "executor/nodeSequence.h"
+#include "executor/nodeTableFunction.h"
+#include "executor/nodePartitionSelector.h"
+#include "executor/nodeShareInputScan.h"
 #include "nodes/nodeFuncs.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
@@ -70,6 +77,9 @@ ExecReScan(PlanState *node)
 	/* If collecting timing stats, update them */
 	if (node->instrument)
 		InstrEndLoop(node->instrument);
+
+	/* no longer squelched */
+	node->squelched = false;
 
 	/*
 	 * If we have changed parameters, propagate that info.
@@ -141,6 +151,10 @@ ExecReScan(PlanState *node)
 			ExecReScanRecursiveUnion((RecursiveUnionState *) node);
 			break;
 
+		case T_AssertOpState:
+			ExecReScanAssertOp((AssertOpState *) node);
+			break;
+
 		case T_BitmapAndState:
 			ExecReScanBitmapAnd((BitmapAndState *) node);
 			break;
@@ -155,6 +169,14 @@ ExecReScan(PlanState *node)
 
 		case T_IndexScanState:
 			ExecReScanIndexScan((IndexScanState *) node);
+			break;
+
+		case T_DynamicSeqScanState:
+			ExecReScanDynamicSeqScan((DynamicSeqScanState *) node);
+			break;
+
+		case T_DynamicIndexScanState:
+			ExecReScanDynamicIndex((DynamicIndexScanState *) node);
 			break;
 
 		case T_IndexOnlyScanState:
@@ -175,6 +197,10 @@ ExecReScan(PlanState *node)
 
 		case T_SubqueryScanState:
 			ExecReScanSubqueryScan((SubqueryScanState *) node);
+			break;
+
+		case T_SequenceState:
+			ExecReScanSequence((SequenceState *) node);
 			break;
 
 		case T_FunctionScanState:
@@ -217,10 +243,6 @@ ExecReScan(PlanState *node)
 			ExecReScanSort((SortState *) node);
 			break;
 
-		case T_GroupState:
-			ExecReScanGroup((GroupState *) node);
-			break;
-
 		case T_AggState:
 			ExecReScanAgg((AggState *) node);
 			break;
@@ -249,6 +271,21 @@ ExecReScan(PlanState *node)
 			ExecReScanLimit((LimitState *) node);
 			break;
 
+		case T_MotionState:
+			ExecReScanMotion((MotionState *) node);
+			break;
+
+		case T_TableFunctionScan:
+			ExecReScanTableFunction((TableFunctionState *) node);
+			break;
+
+		case T_ShareInputScanState:
+			ExecReScanShareInputScan((ShareInputScanState *) node);
+			break;
+		case T_PartitionSelectorState:
+			ExecReScanPartitionSelector((PartitionSelectorState *) node);
+			break;
+			
 		default:
 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(node));
 			break;
@@ -271,10 +308,6 @@ ExecMarkPos(PlanState *node)
 {
 	switch (nodeTag(node))
 	{
-		case T_SeqScanState:
-			ExecSeqMarkPos((SeqScanState *) node);
-			break;
-
 		case T_IndexScanState:
 			ExecIndexMarkPos((IndexScanState *) node);
 			break;
@@ -303,6 +336,17 @@ ExecMarkPos(PlanState *node)
 			ExecResultMarkPos((ResultState *) node);
 			break;
 
+		case T_MotionState:
+			ereport(ERROR, (
+				errcode(ERRCODE_INTERNAL_ERROR),
+				errmsg("unsupported call to mark position of Motion operator")
+				));
+			break;
+
+		case T_ForeignScanState:
+			elog(ERROR, "Marking scan position for foreign relation is not supported");
+			break;
+
 		default:
 			/* don't make hard error unless caller asks to restore... */
 			elog(DEBUG2, "unrecognized node type: %d", (int) nodeTag(node));
@@ -328,10 +372,6 @@ ExecRestrPos(PlanState *node)
 {
 	switch (nodeTag(node))
 	{
-		case T_SeqScanState:
-			ExecSeqRestrPos((SeqScanState *) node);
-			break;
-
 		case T_IndexScanState:
 			ExecIndexRestrPos((IndexScanState *) node);
 			break;
@@ -360,6 +400,17 @@ ExecRestrPos(PlanState *node)
 			ExecResultRestrPos((ResultState *) node);
 			break;
 
+		case T_MotionState:
+			ereport(ERROR, (
+				errcode(ERRCODE_INTERNAL_ERROR),
+				errmsg("unsupported call to restore position of Motion operator")
+				));
+			break;
+
+		case T_ForeignScanState:
+			elog(ERROR, "Restoring scan position is not yet supported for foreign relation scan");
+			break;
+
 		default:
 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(node));
 			break;
@@ -383,13 +434,13 @@ ExecSupportsMarkRestore(NodeTag plantype)
 {
 	switch (plantype)
 	{
-		case T_SeqScan:
 		case T_IndexScan:
 		case T_IndexOnlyScan:
 		case T_TidScan:
 		case T_ValuesScan:
 		case T_Material:
 		case T_Sort:
+		case T_ShareInputScan:
 			return true;
 
 		case T_Result:
@@ -451,6 +502,7 @@ ExecSupportsBackwardScan(Plan *node)
 		case T_FunctionScan:
 		case T_ValuesScan:
 		case T_CteScan:
+		case T_WorkTableScan:
 			return TargetListSupportsBackwardScan(node->targetlist);
 
 		case T_IndexScan:
@@ -465,6 +517,9 @@ ExecSupportsBackwardScan(Plan *node)
 			return ExecSupportsBackwardScan(((SubqueryScan *) node)->subplan) &&
 				TargetListSupportsBackwardScan(node->targetlist);
 
+		case T_ShareInputScan:
+			return true;
+
 		case T_Material:
 		case T_Sort:
 			/* these don't evaluate tlist */
@@ -478,6 +533,170 @@ ExecSupportsBackwardScan(Plan *node)
 		default:
 			return false;
 	}
+}
+
+/*
+ * ExecSquelchNode
+ *
+ * When a node decides that it will not consume any more input tuples from a
+ * subtree that has not yet returned end-of-data, it must call
+ * ExecSquelchNode() on the subtree.
+ *
+ * This is necessary, to avoid deadlock with Motion nodes. There might be a
+ * receiving Motion node in the subtree, and it needs to let the sender side
+ * of the Motion know that we will not be reading any more tuples. We might
+ * have sibling QE processes in other segments that are still waiting for
+ * tuples from the sender Motion, but if the sender's send queue is full, it
+ * will never send them. By explicitly telling the sender that we will not be
+ * reading any more tuples, it knows to not wait for us, and can skip over,
+ * and send tuples to the other QEs that might be waiting.
+ *
+ * This also gives memory-hungry nodes a chance to release memory earlier, so
+ * that other nodes higher up in the plan can make use of it. The Squelch
+ * function for many node call a separate node-specific ExecEagerFree*()
+ * function to do that.
+ *
+ * After a node has been squelched, you mustn't try to read more tuples from
+ * it. However, ReScanning the node will "un-squelch" it, allowing to read
+ * again. Squelching a node is roughly equivalent to fetching and discarding
+ * all tuples from it.
+ */
+void
+ExecSquelchNode(PlanState *node)
+{
+	ListCell   *lc;
+
+	if (!node)
+		return;
+
+	if (node->squelched)
+		return;
+
+	switch (nodeTag(node))
+	{
+		case T_MotionState:
+			ExecSquelchMotion((MotionState *) node);
+			break;
+
+		case T_ModifyTableState:
+			ExecSquelchModifyTable((ModifyTableState *) node);
+			return;
+
+			/*
+			 * Node types that need custom code to recurse.
+			 */
+		case T_AppendState:
+			ExecSquelchAppend((AppendState *) node);
+			break;
+
+		case T_MergeAppendState:
+			ExecSquelchMergeAppend((MergeAppendState *) node);
+			break;
+
+		case T_SequenceState:
+			ExecSquelchSequence((SequenceState *) node);
+			break;
+
+		case T_SubqueryScanState:
+			ExecSquelchSubqueryScan((SubqueryScanState *) node);
+			break;
+
+			/*
+			 * Node types that need no special handling, just recurse to
+			 * children.
+			 */
+		case T_AssertOpState:
+		case T_BitmapAndState:
+		case T_BitmapOrState:
+		case T_LimitState:
+		case T_NestLoopState:
+		case T_MergeJoinState:
+		case T_RepeatState:
+		case T_SetOpState:
+		case T_UniqueState:
+		case T_HashState:
+		case T_PartitionSelectorState:
+		case T_WorkTableScanState:
+		case T_ResultState:
+			ExecSquelchNode(outerPlanState(node));
+			ExecSquelchNode(innerPlanState(node));
+			break;
+
+			/*
+			 * These node types have nothing to do, and have no children.
+			 */
+		case T_SeqScanState:
+		case T_IndexScanState:
+		case T_DynamicSeqScanState:
+		case T_DynamicIndexScanState:
+		case T_IndexOnlyScanState:
+		case T_BitmapIndexScanState:
+		case T_ForeignScanState:
+		case T_ValuesScanState:
+		case T_TidScanState:
+		case T_TableFunctionState:
+			break;
+
+			/*
+			 * Node types that consume resources that we want to free eagerly,
+			 * as soon as possible.
+			 */
+		case T_RecursiveUnionState:
+			ExecSquelchRecursiveUnion((RecursiveUnionState *) node);
+			break;
+
+		case T_BitmapHeapScanState:
+			ExecSquelchBitmapHeapScan((BitmapHeapScanState *) node);
+			break;
+
+		case T_FunctionScanState:
+			ExecSquelchFunctionScan((FunctionScanState *) node);
+			break;
+
+		case T_HashJoinState:
+			ExecSquelchHashJoin((HashJoinState *) node);
+			break;
+
+		case T_MaterialState:
+			ExecSquelchMaterial((MaterialState*) node);
+			break;
+
+		case T_SortState:
+			ExecSquelchSort((SortState *) node);
+			break;
+
+		case T_AggState:
+			ExecSquelchAgg((AggState*) node);
+			break;
+
+		case T_WindowAggState:
+			ExecSquelchWindowAgg((WindowAggState *) node);
+			break;
+
+		case T_ShareInputScanState:
+			ExecSquelchShareInputScan((ShareInputScanState *) node);
+			break;
+
+		default:
+			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(node));
+			break;
+	}
+
+	/*
+	 * Also recurse into subplans, if any. (InitPlans are handled as a separate step,
+	 * at executor startup, and don't need squelching.)
+	 */
+	foreach(lc, node->subPlan)
+	{
+		SubPlanState *sps = (SubPlanState *) lfirst(lc);
+		PlanState  *ips = sps->planstate;
+
+		if (!ips)
+			elog(ERROR, "subplan has no planstate");
+		ExecSquelchNode(ips);
+	}
+
+	node->squelched = true;
 }
 
 /*
@@ -544,6 +763,7 @@ ExecMaterializesOutput(NodeTag plantype)
 		case T_CteScan:
 		case T_WorkTableScan:
 		case T_Sort:
+		case T_ShareInputScan:
 			return true;
 
 		default:

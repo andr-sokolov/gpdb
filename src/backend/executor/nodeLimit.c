@@ -21,6 +21,7 @@
 
 #include "postgres.h"
 
+#include "cdb/cdbvars.h"
 #include "executor/executor.h"
 #include "executor/nodeLimit.h"
 #include "nodes/nodeFuncs.h"
@@ -36,8 +37,8 @@ static void pass_down_bound(LimitState *node, PlanState *child_node);
  *		filtering on the stream of tuples returned by a subplan.
  * ----------------------------------------------------------------
  */
-TupleTableSlot *				/* return: a tuple or NULL */
-ExecLimit(LimitState *node)
+static TupleTableSlot *				/* return: a tuple or NULL */
+ExecLimit_guts(LimitState *node)
 {
 	ScanDirection direction;
 	TupleTableSlot *slot;
@@ -223,6 +224,26 @@ ExecLimit(LimitState *node)
 	return slot;
 }
 
+TupleTableSlot *
+ExecLimit(LimitState *node)
+{
+	TupleTableSlot *result;
+
+	result = ExecLimit_guts(node);
+
+	if (TupIsNull(result) && ScanDirectionIsForward(node->ps.state->es_direction))
+	{
+		/*
+		 * CDB: We'll read no more from inner subtree. To keep our sibling
+		 * QEs from being starved, tell source QEs not to clog up the
+		 * pipeline with our never-to-be-consumed data.
+		 */
+		ExecSquelchNode((PlanState *) node);
+	}
+
+	return result;
+}
+
 /*
  * Evaluate the limit/offset expressions --- done at startup or rescan.
  *
@@ -323,8 +344,8 @@ pass_down_bound(LimitState *node, PlanState *child_node)
 		SortState  *sortState = (SortState *) child_node;
 		int64		tuples_needed = node->count + node->offset;
 
-		/* negative test checks for overflow in sum */
-		if (node->noCount || tuples_needed < 0)
+		/* negative test checks for overflow */
+		if (node->noCount || tuples_needed < 0 || !gp_enable_sort_limit)
 		{
 			/* make sure flag gets reset if needed upon rescan */
 			sortState->bounded = false;

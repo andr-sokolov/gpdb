@@ -307,132 +307,123 @@ _bt_check_unique(Relation rel, IndexTuple itup, Relation heapRel,
 				 * that satisfies SnapshotDirty.  This is necessary because we
 				 * have just a single index entry for the entire chain.
 				 */
-				else if (heap_hot_search(&htid, heapRel, &SnapshotDirty,
-										 &all_dead))
-				{
-					TransactionId xwait;
-
-					/*
-					 * It is a duplicate. If we are only doing a partial
-					 * check, then don't bother checking if the tuple is being
-					 * updated in another transaction. Just return the fact
-					 * that it is a potential conflict and leave the full
-					 * check till later.
-					 */
-					if (checkUnique == UNIQUE_CHECK_PARTIAL)
+				else if (heap_hot_search(&htid, heapRel, &SnapshotDirty, &all_dead))
 					{
+						TransactionId xwait;
+
+						/*
+						 * It is a duplicate. If we are only doing a partial
+						 * check, then don't bother checking if the tuple is being
+						 * updated in another transaction. Just return the fact
+						 * that it is a potential conflict and leave the full
+						 * check till later.
+						 */
+						if (checkUnique == UNIQUE_CHECK_PARTIAL)
+						{
+							if (nbuf != InvalidBuffer)
+								_bt_relbuf(rel, nbuf);
+							*is_unique = false;
+							return InvalidTransactionId;
+						}
+
+						/*
+						 * If this tuple is being updated by other transaction
+						 * then we have to wait for its commit/abort.
+						 */
+						xwait = (TransactionIdIsValid(SnapshotDirty.xmin)) ?
+							SnapshotDirty.xmin : SnapshotDirty.xmax;
+
+						if (TransactionIdIsValid(xwait))
+						{
+							if (nbuf != InvalidBuffer)
+								_bt_relbuf(rel, nbuf);
+							/* Tell _bt_doinsert to wait... */
+							return xwait;
+						}
+						
+						/*
+						 * Otherwise we have a definite conflict.  But before
+						 * complaining, look to see if the tuple we want to insert
+						 * is itself now committed dead --- if so, don't complain.
+						 * This is a waste of time in normal scenarios but we must
+						 * do it to support CREATE INDEX CONCURRENTLY.
+						 *
+						 * We must follow HOT-chains here because during
+						 * concurrent index build, we insert the root TID though
+						 * the actual tuple may be somewhere in the HOT-chain.
+						 * While following the chain we might not stop at the
+						 * exact tuple which triggered the insert, but that's OK
+						 * because if we find a live tuple anywhere in this chain,
+						 * we have a unique key conflict.  The other live tuple is
+						 * not part of this chain because it had a different index
+						 * entry.
+						 */
+						htid = itup->t_tid;
+						if (heap_hot_search(&htid, heapRel, SnapshotSelf, NULL))
+						{
+							/* Normal case --- it's still live */
+						}
+						else
+						{
+							/*
+							 * It's been deleted, so no error, and no need to
+							 * continue searching.
+							 */
+							break;
+						}
+
+						/*
+						 * This is a definite conflict.  Break the tuple down into
+						 * datums and report the error.  But first, make sure we
+						 * release the buffer locks we're holding ---
+						 * BuildIndexValueDescription could make catalog accesses,
+						 * which in the worst case might touch this same index and
+						 * cause deadlocks.
+						 */
 						if (nbuf != InvalidBuffer)
 							_bt_relbuf(rel, nbuf);
-						*is_unique = false;
-						return InvalidTransactionId;
-					}
+						_bt_relbuf(rel, buf);
+	
+						{
+							Datum	values[INDEX_MAX_KEYS];
+							bool	isnull[INDEX_MAX_KEYS];
+							char	   *key_desc;
+	
+							index_deform_tuple(itup, RelationGetDescr(rel),
+											   values, isnull);
 
-					/*
-					 * If this tuple is being updated by other transaction
-					 * then we have to wait for its commit/abort.
-					 */
-					xwait = (TransactionIdIsValid(SnapshotDirty.xmin)) ?
-						SnapshotDirty.xmin : SnapshotDirty.xmax;
+							key_desc = BuildIndexValueDescription(rel, values,
+																  isnull);
 
-					if (TransactionIdIsValid(xwait))
-					{
-						if (nbuf != InvalidBuffer)
-							_bt_relbuf(rel, nbuf);
-						/* Tell _bt_doinsert to wait... */
-						return xwait;
+							ereport(ERROR,
+									(errcode(ERRCODE_UNIQUE_VIOLATION),
+									 errmsg("duplicate key value violates unique constraint \"%s\"",
+											RelationGetRelationName(rel)),
+									 key_desc ? errdetail("Key %s already exists.",
+											key_desc) : 0,
+									 errtableconstraint(heapRel,
+											RelationGetRelationName(rel))));
+						}
 					}
-
-					/*
-					 * Otherwise we have a definite conflict.  But before
-					 * complaining, look to see if the tuple we want to insert
-					 * is itself now committed dead --- if so, don't complain.
-					 * This is a waste of time in normal scenarios but we must
-					 * do it to support CREATE INDEX CONCURRENTLY.
-					 *
-					 * We must follow HOT-chains here because during
-					 * concurrent index build, we insert the root TID though
-					 * the actual tuple may be somewhere in the HOT-chain.
-					 * While following the chain we might not stop at the
-					 * exact tuple which triggered the insert, but that's OK
-					 * because if we find a live tuple anywhere in this chain,
-					 * we have a unique key conflict.  The other live tuple is
-					 * not part of this chain because it had a different index
-					 * entry.
-					 */
-					htid = itup->t_tid;
-					if (heap_hot_search(&htid, heapRel, SnapshotSelf, NULL))
-					{
-						/* Normal case --- it's still live */
-					}
-					else
+					else if (all_dead)
 					{
 						/*
-						 * It's been deleted, so no error, and no need to
-						 * continue searching
+						 * The conflicting tuple (or whole HOT chain) is dead to
+						 * everyone, so we may as well mark the index entry
+						 * killed.
 						 */
-						break;
+						ItemIdMarkDead(curitemid);
+						opaque->btpo_flags |= BTP_HAS_GARBAGE;
+
+						/*
+						 * Mark buffer with a dirty hint, since state is not
+						 * crucial. Be sure to mark the proper buffer dirty.
+						 */
+						if (nbuf != InvalidBuffer)
+							MarkBufferDirtyHint(nbuf, true);
+						else
+							MarkBufferDirtyHint(buf, true);
 					}
-
-					/*
-					 * Check for a conflict-in as we would if we were going to
-					 * write to this page.  We aren't actually going to write,
-					 * but we want a chance to report SSI conflicts that would
-					 * otherwise be masked by this unique constraint violation.
-					 */
-					CheckForSerializableConflictIn(rel, NULL, buf);
-
-					/*
-					 * This is a definite conflict.  Break the tuple down into
-					 * datums and report the error.  But first, make sure we
-					 * release the buffer locks we're holding ---
-					 * BuildIndexValueDescription could make catalog accesses,
-					 * which in the worst case might touch this same index and
-					 * cause deadlocks.
-					 */
-					if (nbuf != InvalidBuffer)
-						_bt_relbuf(rel, nbuf);
-					_bt_relbuf(rel, buf);
-
-					{
-						Datum		values[INDEX_MAX_KEYS];
-						bool		isnull[INDEX_MAX_KEYS];
-						char	   *key_desc;
-
-						index_deform_tuple(itup, RelationGetDescr(rel),
-										   values, isnull);
-
-						key_desc = BuildIndexValueDescription(rel, values,
-															  isnull);
-
-						ereport(ERROR,
-								(errcode(ERRCODE_UNIQUE_VIOLATION),
-								 errmsg("duplicate key value violates unique constraint \"%s\"",
-										RelationGetRelationName(rel)),
-								 key_desc ? errdetail("Key %s already exists.",
-													  key_desc) : 0,
-								 errtableconstraint(heapRel,
-											 RelationGetRelationName(rel))));
-					}
-				}
-				else if (all_dead)
-				{
-					/*
-					 * The conflicting tuple (or whole HOT chain) is dead to
-					 * everyone, so we may as well mark the index entry
-					 * killed.
-					 */
-					ItemIdMarkDead(curitemid);
-					opaque->btpo_flags |= BTP_HAS_GARBAGE;
-
-					/*
-					 * Mark buffer with a dirty hint, since state is not
-					 * crucial. Be sure to mark the proper buffer dirty.
-					 */
-					if (nbuf != InvalidBuffer)
-						MarkBufferDirtyHint(nbuf, true);
-					else
-						MarkBufferDirtyHint(buf, true);
-				}
 			}
 		}
 
@@ -1576,6 +1567,13 @@ _bt_findsplitloc(Relation rel,
 
 		olddataitemstoleft += itemsz;
 	}
+
+	/* If the new item goes as the last item, check for splitting so that
+	 * all the old items go to the left page and the new item goes to the
+	 * right page.
+	 */
+	if (newitemoff > maxoff && !goodenoughfound)
+		_bt_checksplitloc(&state, newitemoff, false, olddataitemstotal, 0);
 
 	/*
 	 * If the new item goes as the last item, check for splitting so that all

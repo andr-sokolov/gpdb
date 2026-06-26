@@ -1,4 +1,6 @@
 /exports.list
+/libpq.rc
+# .c files that are symlinked in from elsewhere
 /chklocale.c
 /crypt.c
 /getaddrinfo.c

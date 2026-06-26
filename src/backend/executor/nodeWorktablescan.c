@@ -174,7 +174,7 @@ ExecInitWorkTableScan(WorkTableScan *node, EState *estate, int eflags)
 	 */
 	ExecAssignResultTypeFromTL(&scanstate->ss.ps);
 
-	scanstate->ss.ps.ps_TupFromTlist = false;
+	/* scanstate->ss.ps.ps_TupFromTlist = false; */
 
 	return scanstate;
 }

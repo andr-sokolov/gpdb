@@ -343,7 +343,7 @@ static const SchemaQuery Query_for_list_of_tables = {
 	/* catname */
 	"pg_catalog.pg_class c",
 	/* selcondition */
-	"c.relkind IN ('r')",
+	"c.relkind IN ('r' , 'x')",  /* GPDB: x is obsolete, used only on very old GPDB systems */
 	/* viscondition */
 	"pg_catalog.pg_table_is_visible(c.oid)",
 	/* namespace */
@@ -567,6 +567,11 @@ static const SchemaQuery Query_for_list_of_matviews = {
 "  UNION ALL SELECT 'all') ss "\
 " WHERE substring(name,1,%d)='%s'"
 
+#define Query_for_list_of_resgroups \
+" SELECT pg_catalog.quote_ident(rsgname) "\
+"   FROM pg_catalog.pg_resgroup "\
+"  WHERE substring(pg_catalog.quote_ident(rsgname),1,%d)='%s'"
+
 #define Query_for_list_of_roles \
 " SELECT pg_catalog.quote_ident(rolname) "\
 "   FROM pg_catalog.pg_roles "\
@@ -765,6 +770,7 @@ static const pgsql_thing_t words_after_create[] = {
 								 * good idea. */
 	{"OWNED", NULL, NULL, THING_NO_CREATE},		/* for DROP OWNED BY ... */
 	{"PARSER", Query_for_list_of_ts_parsers, NULL, THING_NO_SHOW},
+	{"RESOURCE", NULL},
 	{"ROLE", Query_for_list_of_roles},
 	{"RULE", "SELECT pg_catalog.quote_ident(rulename) FROM pg_catalog.pg_rules WHERE substring(pg_catalog.quote_ident(rulename),1,%d)='%s'"},
 	{"SCHEMA", Query_for_list_of_schemas},
@@ -2378,22 +2384,38 @@ psql_completion(const char *text, int start, int end)
 		COMPLETE_WITH_LIST(list_CREATEROLE);
 	}
 
-/* CREATE ROLE,USER,GROUP <name> WITH */
-	else if ((pg_strcasecmp(prev4_wd, "CREATE") == 0 &&
-			  (pg_strcasecmp(prev3_wd, "ROLE") == 0 ||
-			   pg_strcasecmp(prev3_wd, "GROUP") == 0 ||
-			   pg_strcasecmp(prev3_wd, "USER") == 0) &&
-			  pg_strcasecmp(prev_wd, "WITH") == 0))
-	{
-		/* Similar to the above, but don't complete "WITH" again. */
-		static const char *const list_CREATEROLE_WITH[] =
-		{"ADMIN", "CONNECTION LIMIT", "CREATEDB", "CREATEROLE", "CREATEUSER",
-			"ENCRYPTED", "IN", "INHERIT", "LOGIN", "NOCREATEDB",
-			"NOCREATEROLE", "NOCREATEUSER", "NOINHERIT", "NOLOGIN",
-			"NOREPLICATION", "NOSUPERUSER", "REPLICATION", "ROLE",
-		"SUPERUSER", "SYSID", "UNENCRYPTED", "VALID UNTIL", NULL};
+/* CREATE/DROP RESOURCE GROUP/QUEUE */
+	else if ((pg_strcasecmp(prev2_wd, "CREATE") == 0 || pg_strcasecmp(prev2_wd, "DROP") == 0) &&
+			 pg_strcasecmp(prev_wd, "RESOURCE") == 0)
+	 {
+		static const char *const list_CREATERESOURCEGROUP[] =
+		{"GROUP", "QUEUE", NULL};
 
-		COMPLETE_WITH_LIST(list_CREATEROLE_WITH);
+		COMPLETE_WITH_LIST(list_CREATERESOURCEGROUP);
+	 }
+
+/* CREATE/DROP RESOURCE GROUP */
+	else if ((pg_strcasecmp(prev3_wd, "CREATE") == 0 ||
+			  pg_strcasecmp(prev3_wd, "DROP") == 0) &&
+			 pg_strcasecmp(prev2_wd, "RESOURCE") == 0 &&
+			 pg_strcasecmp(prev_wd, "GROUP") == 0)
+		COMPLETE_WITH_QUERY(Query_for_list_of_resgroups);
+
+/* CREATE RESOURCE GROUP <name> */
+	else if (pg_strcasecmp(prev4_wd, "CREATE") == 0 &&
+			 pg_strcasecmp(prev3_wd, "RESOURCE") == 0 &&
+			 pg_strcasecmp(prev2_wd, "GROUP") == 0)
+		COMPLETE_WITH_CONST("WITH (");
+
+	else if (pg_strcasecmp(prev5_wd, "RESOURCE") == 0 &&
+			 pg_strcasecmp(prev4_wd, "GROUP") == 0 &&
+			 pg_strcasecmp(prev2_wd, "WITH") == 0 &&
+			 pg_strcasecmp(prev_wd, "(") == 0)
+	{
+		static const char *const list_CREATERESOURCEGROUP[] =
+		{"CONCURRENCY", "CPU_RATE_LIMIT", "MEMORY_LIMIT", "MEMORY_REDZONE_LIMIT", NULL};
+
+		COMPLETE_WITH_LIST(list_CREATERESOURCEGROUP);
 	}
 
 	/*
@@ -2963,7 +2985,10 @@ psql_completion(const char *text, int start, int end)
 
 /* NOTIFY */
 	else if (pg_strcasecmp(prev_wd, "NOTIFY") == 0)
-		COMPLETE_WITH_QUERY("SELECT pg_catalog.quote_ident(channel) FROM pg_catalog.pg_listening_channels() AS channel WHERE substring(pg_catalog.quote_ident(channel),1,%d)='%s'");
+	   if (pset.sversion >= 80210 && pset.sversion < 80220)
+		   COMPLETE_WITH_QUERY("SELECT pg_catalog.quote_ident(relname) FROM pg_catalog.pg_listener WHERE substring(pg_catalog.quote_ident(relname),1,%d)='%s'");
+	   else
+	       COMPLETE_WITH_QUERY("SELECT pg_catalog.quote_ident(channel) FROM pg_catalog.pg_listening_channels() AS channel WHERE substring(pg_catalog.quote_ident(channel),1,%d)='%s'");
 
 /* OPTIONS */
 	else if (pg_strcasecmp(prev_wd, "OPTIONS") == 0)
@@ -3301,7 +3326,10 @@ psql_completion(const char *text, int start, int end)
 
 /* UNLISTEN */
 	else if (pg_strcasecmp(prev_wd, "UNLISTEN") == 0)
-		COMPLETE_WITH_QUERY("SELECT pg_catalog.quote_ident(channel) FROM pg_catalog.pg_listening_channels() AS channel WHERE substring(pg_catalog.quote_ident(channel),1,%d)='%s' UNION SELECT '*'");
+	    if (pset.sversion >= 80210 && pset.sversion < 80220)
+			COMPLETE_WITH_QUERY("SELECT pg_catalog.quote_ident(relname) FROM pg_catalog.pg_listener WHERE substring(pg_catalog.quote_ident(relname),1,%d)='%s'");
+		else
+			COMPLETE_WITH_QUERY("SELECT pg_catalog.quote_ident(channel) FROM pg_catalog.pg_listening_channels() AS channel WHERE substring(pg_catalog.quote_ident(channel),1,%d)='%s' UNION SELECT '*'");
 
 /* UPDATE */
 	/* If prev. word is UPDATE suggest a list of tables */
@@ -3777,13 +3805,14 @@ _complete_from_query(int is_schema_query, const char *text, int state)
 
 			/*
 			 * When fetching relation names, suppress system catalogs unless
-			 * the input-so-far begins with "pg_".  This is a compromise
+			 * the input-so-far begins with "pg_" or "gp_".	 This is a compromise
 			 * between not offering system catalogs for completion at all, and
 			 * having them swamp the result when the input is just "p".
 			 */
 			if (strcmp(completion_squery->catname,
 					   "pg_catalog.pg_class c") == 0 &&
-				strncmp(text, "pg_", 3) !=0)
+				strncmp(text, "pg_", 3) != 0 &&
+				strncmp(text, "gp_", 3) != 0)
 			{
 				appendPQExpBufferStr(&query_buffer,
 									 " AND c.relnamespace <> (SELECT oid FROM"

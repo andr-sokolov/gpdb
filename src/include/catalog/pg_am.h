@@ -69,6 +69,21 @@ CATALOG(pg_am,2601)
 	regproc		amoptions;		/* parse AM-specific parameters */
 } FormData_pg_am;
 
+/* GPDB added foreign key definitions for gpcheckcat. */
+FOREIGN_KEY(aminsert REFERENCES pg_proc(oid));
+FOREIGN_KEY(ambeginscan REFERENCES pg_proc(oid));
+FOREIGN_KEY(amgettuple REFERENCES pg_proc(oid));
+FOREIGN_KEY(amgetbitmap REFERENCES pg_proc(oid));
+FOREIGN_KEY(amrescan REFERENCES pg_proc(oid));
+FOREIGN_KEY(amendscan REFERENCES pg_proc(oid));
+FOREIGN_KEY(ammarkpos REFERENCES pg_proc(oid));
+FOREIGN_KEY(amrestrpos REFERENCES pg_proc(oid));
+FOREIGN_KEY(ambuild REFERENCES pg_proc(oid));
+FOREIGN_KEY(ambulkdelete REFERENCES pg_proc(oid));
+FOREIGN_KEY(amvacuumcleanup REFERENCES pg_proc(oid));
+FOREIGN_KEY(amcostestimate REFERENCES pg_proc(oid));
+FOREIGN_KEY(amoptions REFERENCES pg_proc(oid));
+
 /* ----------------
  *		Form_pg_am corresponds to a pointer to a tuple with
  *		the format of pg_am relation.

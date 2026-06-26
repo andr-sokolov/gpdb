@@ -19,6 +19,7 @@
 #include "miscadmin.h"
 #include "utils/datum.h"
 #include "utils/memutils.h"
+#include "nodes/tidbitmap.h"
 
 /* GUC parameter */
 int			GinFuzzySearchLimit = 0;

@@ -20,6 +20,7 @@
 #include <math.h>
 #include <limits.h>
 
+#include "access/hash.h"
 #include "access/heapam.h"
 #include "access/sysattr.h"
 #include "catalog/namespace.h"
@@ -33,9 +34,6 @@
 #include "utils/snapmgr.h"
 #include "utils/tqual.h"
 
-
-#define DatumGetItemPointer(X)	 ((ItemPointer) DatumGetPointer(X))
-#define ItemPointerGetDatum(X)	 PointerGetDatum(X)
 #define PG_GETARG_ITEMPOINTER(n) DatumGetItemPointer(PG_GETARG_DATUM(n))
 #define PG_RETURN_ITEMPOINTER(x) return ItemPointerGetDatum(x)
 
@@ -246,6 +244,14 @@ tidsmaller(PG_FUNCTION_ARGS)
 }
 
 
+Datum
+hashtid(PG_FUNCTION_ARGS)
+{
+	ItemPointer arg1 = PG_GETARG_ITEMPOINTER(0);
+
+	return hash_any((unsigned char *) arg1, sizeof(ItemPointerData));
+}
+
 /*
  *	Functions to get latest tid of a specified tuple.
  *
@@ -335,6 +341,13 @@ currtid_byreloid(PG_FUNCTION_ARGS)
 	AclResult	aclresult;
 	Snapshot	snapshot;
 
+	/*
+	 * Immediately inform client that the function is not supported
+	 */
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("function currtid is not supported by GPDB")));
+
 	result = (ItemPointer) palloc(sizeof(ItemPointerData));
 	if (!reloid)
 	{
@@ -374,6 +387,13 @@ currtid_byrelname(PG_FUNCTION_ARGS)
 	Relation	rel;
 	AclResult	aclresult;
 	Snapshot	snapshot;
+
+	/*
+	 * Immediately inform client that the function is not supported
+	 */
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("function currtid2 is not supported by GPDB")));
 
 	relrv = makeRangeVarFromNameList(textToQualifiedNameList(relname));
 	rel = heap_openrv(relrv, AccessShareLock);

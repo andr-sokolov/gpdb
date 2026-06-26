@@ -20,7 +20,14 @@
  *								of the authentication system
  */
 
-#include "postgres_fe.h"
+/*
+ * This file is compiled with both frontend and backend codes, symlinked by
+ * src/backend/Makefile, and use macro FRONTEND to switch.
+ *
+ * Include "c.h" to adopt Greenplum C types. Don't include "postgres_fe.h",
+ * which only defines FRONTEND besides including "c.h"
+ */
+#include "c.h"
 
 #ifdef WIN32
 #include "win32.h"
@@ -54,9 +61,9 @@
  * that contain the OIDs required. Redefine here, values copied
  * from src/athena/auth/krb5/src/lib/gssapi/generic/gssapi_generic.c
  */
-static const gss_OID_desc GSS_C_NT_HOSTBASED_SERVICE_desc =
+const gss_OID_desc GSS_C_NT_HOSTBASED_SERVICE_desc =
 {10, (void *) "\x2a\x86\x48\x86\xf7\x12\x01\x02\x01\x04"};
-static GSS_DLLIMP gss_OID GSS_C_NT_HOSTBASED_SERVICE = &GSS_C_NT_HOSTBASED_SERVICE_desc;
+GSS_DLLIMP gss_OID GSS_C_NT_HOSTBASED_SERVICE = &GSS_C_NT_HOSTBASED_SERVICE_desc;
 #endif
 
 /*

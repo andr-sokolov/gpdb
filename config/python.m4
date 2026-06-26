@@ -16,7 +16,7 @@
 # "python2" and "python3", in which case it's reasonable to prefer the
 # newer version.
 AC_DEFUN([PGAC_PATH_PYTHON],
-[AC_PATH_PROGS(PYTHON, [python python3 python2])
+[PGAC_PATH_PROGS(PYTHON, [python python2])
 if test x"$PYTHON" = x""; then
   AC_MSG_ERROR([Python not found])
 fi
@@ -25,9 +25,17 @@ fi
 
 # _PGAC_CHECK_PYTHON_DIRS
 # -----------------------
-# Determine the name of various directories of a given Python installation.
+# Determine the name of various directories of a given Python installation,
+# as well as the Python version.
 AC_DEFUN([_PGAC_CHECK_PYTHON_DIRS],
 [AC_REQUIRE([PGAC_PATH_PYTHON])
+python_fullversion=`${PYTHON} -c "import sys; print(sys.version)" | sed q`
+AC_MSG_NOTICE([using python $python_fullversion])
+# python_fullversion is typically n.n.n plus some trailing junk
+python_majorversion=`echo "$python_fullversion" | sed '[s/^\([0-9]*\).*/\1/]'`
+python_minorversion=`echo "$python_fullversion" | sed '[s/^[0-9]*\.\([0-9]*\).*/\1/]'`
+python_version=`echo "$python_fullversion" | sed '[s/^\([0-9]*\.[0-9]*\).*/\1/]'`
+
 AC_MSG_CHECKING([for Python distutils module])
 if "${PYTHON}" -c 'import distutils' 2>&AS_MESSAGE_LOG_FD
 then
@@ -37,20 +45,11 @@ else
     AC_MSG_ERROR([distutils module not found])
 fi
 AC_MSG_CHECKING([Python configuration directory])
-python_majorversion=`${PYTHON} -c "import sys; print(sys.version[[0]])"`
-python_version=`${PYTHON} -c "import sys; print(sys.version[[:3]])"`
 python_configdir=`${PYTHON} -c "import distutils.sysconfig; print(' '.join(filter(None,distutils.sysconfig.get_config_vars('LIBPL'))))"`
 AC_MSG_RESULT([$python_configdir])
 
 AC_MSG_CHECKING([Python include directories])
-python_includespec=`${PYTHON} -c "
-import distutils.sysconfig
-a = '-I' + distutils.sysconfig.get_python_inc(False)
-b = '-I' + distutils.sysconfig.get_python_inc(True)
-if a == b:
-    print(a)
-else:
-    print(a + ' ' + b)"`
+python_includespec=`${PYTHON} -c "import distutils.sysconfig; print('-I'+distutils.sysconfig.get_python_inc())"`
 AC_MSG_RESULT([$python_includespec])
 
 AC_SUBST(python_majorversion)[]dnl
@@ -73,14 +72,18 @@ AC_MSG_CHECKING([how to link an embedded Python application])
 
 python_libdir=`${PYTHON} -c "import distutils.sysconfig; print(' '.join(filter(None,distutils.sysconfig.get_config_vars('LIBDIR'))))"`
 python_ldlibrary=`${PYTHON} -c "import distutils.sysconfig; print(' '.join(filter(None,distutils.sysconfig.get_config_vars('LDLIBRARY'))))"`
-python_so=`${PYTHON} -c "import distutils.sysconfig; print(' '.join(filter(None,distutils.sysconfig.get_config_vars('SO'))))"`
-ldlibrary=`echo "${python_ldlibrary}" | sed "s/${python_so}$//"`
+ldlibrary=`echo "${python_ldlibrary}" | sed -e 's/\.so$//' -e 's/\.dll$//' -e 's/\.dylib$//' -e 's/\.sl$//'`
 python_enable_shared=`${PYTHON} -c "import distutils.sysconfig; print(distutils.sysconfig.get_config_vars().get('Py_ENABLE_SHARED',0))"`
 
 if test x"${python_libdir}" != x"" -a x"${python_ldlibrary}" != x"" -a x"${python_ldlibrary}" != x"${ldlibrary}"
 then
 	# New way: use the official shared library
 	ldlibrary=`echo "${ldlibrary}" | sed "s/^lib//"`
+	# special for greenplum... python was built in /opt/, but resides in the ext directory
+	if test ! -d "${python_libdir}"
+	then
+		python_libdir=`echo "${python_configdir}" | sed "s/\/python2.7\/config//"`
+	fi
 	python_libspec="-L${python_libdir} -l${ldlibrary}"
 else
 	# Old way: use libpython from python_configdir

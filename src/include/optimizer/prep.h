@@ -29,6 +29,8 @@ extern void reduce_outer_joins(PlannerInfo *root);
 extern Relids get_relids_in_jointree(Node *jtnode, bool include_joins);
 extern Relids get_relids_for_join(PlannerInfo *root, int joinrelid);
 
+extern List *init_list_cteplaninfo(int numCtes);
+
 /*
  * prototypes for prepqual.c
  */

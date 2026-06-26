@@ -128,6 +128,8 @@ ExecInitAppend(Append *node, EState *estate, int eflags)
 	/* check for unsupported flags */
 	Assert(!(eflags & EXEC_FLAG_MARK));
 
+	appendstate->eflags = eflags;
+
 	/*
 	 * Set up empty vector of subplan states
 	 */
@@ -258,8 +260,12 @@ ExecEndAppend(AppendState *node)
 	/*
 	 * shut down each of the subscans
 	 */
-	for (i = 0; i < nplans; i++)
-		ExecEndNode(appendplans[i]);
+	for (i = nplans-1; i >= 0; --i) 
+	{
+		if (appendplans[i])
+			ExecEndNode(appendplans[i]);
+	}
+
 }
 
 void
@@ -287,4 +293,13 @@ ExecReScanAppend(AppendState *node)
 	}
 	node->as_whichplan = 0;
 	exec_append_initialize_next(node);
+}
+
+void
+ExecSquelchAppend(AppendState *node)
+{
+	int			i;
+
+	for (i = 0; i < node->as_nplans; i++)
+		ExecSquelchNode(node->appendplans[i]);
 }

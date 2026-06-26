@@ -28,7 +28,11 @@
  *-------------------------------------------------------------------------
  */
 
+#ifndef FRONTEND
+#include "postgres.h"
+#else
 #include "postgres_fe.h"
+#endif
 
 #include <signal.h>
 #include <time.h>
@@ -301,6 +305,42 @@ pqGetInt(int *result, size_t bytes, PGconn *conn)
 		fprintf(conn->Pfdebug, "From backend (#%lu)> %d\n", (unsigned long) bytes, *result);
 
 	return 0;
+}
+
+int64
+pqGetInt64(int64 *result, PGconn *conn)
+{
+    int64       tmp;
+    uint32      h32;
+    uint32      l32;
+
+	if (conn->inCursor + 8 > conn->inEnd)
+		return EOF;
+
+    memcpy(&h32, conn->inBuffer + conn->inCursor, 4);
+	conn->inCursor += 4;
+	memcpy(&l32, conn->inBuffer + conn->inCursor, 4);
+	conn->inCursor += 4;
+    h32 = ntohl(h32);
+    l32 = ntohl(l32);
+
+#ifdef INT64_IS_BUSTED
+    /* error out if incoming value is wider than 32 bits */
+    tmp = l32;
+    if ((tmp < 0) ? (h32 != -1) : (h32 != 0))
+	{
+		pqInternalNotice(&conn->noticeHooks,
+						 "binary value is out of range for type bigint");
+		return EOF;
+	}
+#else
+    tmp = h32;
+    tmp <<= 32;
+    tmp |= l32;
+#endif
+
+	*result = tmp;
+    return 0;
 }
 
 /*
@@ -578,18 +618,11 @@ pqPutMsgBytes(const void *buf, size_t len, PGconn *conn)
 	return 0;
 }
 
-/*
- * pqPutMsgEnd: finish constructing a message and possibly send it
- *
- * Returns 0 on success, EOF on error
- *
- * We don't actually send anything here unless we've accumulated at least
- * 8K worth of data (the typical size of a pipe buffer on Unix systems).
- * This avoids sending small partial packets.  The caller must use pqFlush
- * when it's important to flush all the data out to the server.
+/**
+ * Same as pqPutMsgEnd except that data is NEVER flushed.
  */
-int
-pqPutMsgEnd(PGconn *conn)
+void
+pqPutMsgEndNoAutoFlush(PGconn *conn)
 {
 	if (conn->Pfdebug)
 		fprintf(conn->Pfdebug, "To backend> Msg complete, length %u\n",
@@ -606,6 +639,22 @@ pqPutMsgEnd(PGconn *conn)
 
 	/* Make message eligible to send */
 	conn->outCount = conn->outMsgEnd;
+}
+
+/*
+ * pqPutMsgEnd: finish constructing a message and possibly send it
+ *
+ * Returns 0 on success, EOF on error
+ *
+ * We don't actually send anything here unless we've accumulated at least
+ * 8K worth of data (the typical size of a pipe buffer on Unix systems).
+ * This avoids sending small partial packets.  The caller must use pqFlush
+ * when it's important to flush all the data out to the server.
+ */
+int
+pqPutMsgEnd(PGconn *conn)
+{
+	pqPutMsgEndNoAutoFlush(conn);
 
 	if (conn->outCount >= 8192)
 	{
@@ -948,8 +997,20 @@ pqSendSome(PGconn *conn, int len)
 
 	/* shift the remaining contents of the buffer */
 	if (remaining > 0)
-		memmove(conn->outBuffer, ptr, remaining);
+	{
+		if (conn->outBuffer_shared)
+			conn->outBuffer = ptr;
+		else
+			memmove(conn->outBuffer, ptr, remaining);
+	}
 	conn->outCount = remaining;
+
+	/* Once we finish with the external buffer, switch back to the original. */
+	if (remaining == 0 && conn->outBuffer_shared)
+	{
+		conn->outBuffer_shared = false;
+		conn->outBuffer = conn->outBufferSaved;
+	}
 
 	return result;
 }
@@ -973,6 +1034,26 @@ pqFlush(PGconn *conn)
 	return 0;
 }
 
+/*
+ * pqFlushNonBlocking:
+ *
+ * wrapper for pqFlush, used by the dispatcher.
+ * conn will be temporarily set to non-blocking mode,
+ * so that if not all data could be sent on 1st attempt, 
+ * pqFlushNonBlocking will return 1 instead of waiting/retrying.
+ *
+ * Return 0 on success, -1 on failure and 1 when not all data could be sent
+ */
+int
+pqFlushNonBlocking(PGconn *conn)
+{
+	int			ret;
+	bool old = conn->nonblocking;
+	conn->nonblocking = TRUE;
+	ret = pqFlush(conn);
+	conn->nonblocking = old;
+	return ret;
+}
 
 /*
  * pqWait: wait until we can read or write the connection socket
@@ -1017,6 +1098,28 @@ pqWaitTimed(int forRead, int forWrite, PGconn *conn, time_t finish_time)
 	}
 
 	return 0;
+}
+
+/*
+ * pgWaitTimeout: wait, but not past finish_time.
+ * wrapper for pqSocketCheck.
+ *
+ * finish_time = ((time_t) -1) disables the wait limit.
+ */
+int
+pqWaitTimeout(int forRead, int forWrite, PGconn *conn, time_t finish_time)
+{
+	int			result;
+
+	result = pqSocketCheck(conn, forRead, forWrite, finish_time);
+
+	if (result == 0)
+	{
+		printfPQExpBuffer(&conn->errorMessage,
+						  libpq_gettext("timeout expired\n"));
+	}
+
+	return result;
 }
 
 /*

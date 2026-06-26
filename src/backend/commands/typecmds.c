@@ -34,8 +34,10 @@
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
+#include "access/reloptions.h"
 #include "access/xact.h"
 #include "catalog/binary_upgrade.h"
+#include "catalog/catalog.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/heap.h"
@@ -52,6 +54,7 @@
 #include "catalog/pg_proc_fn.h"
 #include "catalog/pg_range.h"
 #include "catalog/pg_type.h"
+#include "catalog/pg_type_encoding.h"
 #include "catalog/pg_type_fn.h"
 #include "commands/defrem.h"
 #include "commands/tablecmds.h"
@@ -75,6 +78,10 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/tqual.h"
+
+#include "catalog/oid_dispatch.h"
+#include "cdb/cdbvars.h"
+#include "cdb/cdbdisp_query.h"
 
 
 /* result structure for get_rels_with_domain() */
@@ -108,6 +115,7 @@ static char *domainAddConstraint(Oid domainOid, Oid domainNamespace,
 					Oid baseTypeOid,
 					int typMod, Constraint *constr,
 					char *domainName);
+static void remove_type_encoding(Oid typid);
 
 
 /*
@@ -228,7 +236,25 @@ DefineType(List *names, List *parameters)
 		 * creating the shell type was all we're supposed to do.
 		 */
 		if (parameters == NIL)
+		{
+			/* Must dispatch shell type creation */
+			if (Gp_role == GP_ROLE_DISPATCH)
+			{
+				DefineStmt * stmt = makeNode(DefineStmt);
+				stmt->kind = OBJECT_TYPE;
+				stmt->oldstyle = false; /*?*/
+				stmt->defnames = names;
+				stmt->args = NIL;
+				stmt->definition = NIL;
+				CdbDispatchUtilityStatement((Node *) stmt,
+											DF_CANCEL_ON_ERROR|
+											DF_WITH_SNAPSHOT|
+											DF_NEED_TWO_PHASE,
+											GetAssignedOidsForDispatch(),
+											NULL);
+			}
 			return InvalidOid;
+		}
 	}
 	else
 	{
@@ -546,7 +572,24 @@ DefineType(List *names, List *parameters)
 					   NameListToString(analyzeName));
 #endif
 
-	array_oid = AssignTypeArrayOid();
+	array_type = makeArrayTypeName(typeName, typeNamespace);
+
+	/* Preassign array type OID so we can insert it in pg_type.typarray */
+	if (Gp_role == GP_ROLE_EXECUTE || IsBinaryUpgrade)
+	{
+		array_oid = GetPreassignedOidForType(typeNamespace, array_type, true);
+
+		/*
+		 * If we are expected to get a preassigned Oid but receive InvalidOid,
+		 * get a new Oid. This can happen during upgrades from GPDB4 to 5 where
+		 * array types over relation rowtypes were introduced so there are no
+		 * pre-existing array types to dump from the old cluster
+		 */
+		if (array_oid == InvalidOid && IsBinaryUpgrade)
+			array_oid = AssignTypeArrayOid();
+	}
+	else
+		array_oid = AssignTypeArrayOid();
 
 	/*
 	 * now have TypeCreate do all the real work.
@@ -556,7 +599,7 @@ DefineType(List *names, List *parameters)
 	 * oid must be preserved by binary upgrades.
 	 */
 	typoid =
-		TypeCreate(InvalidOid,	/* no predetermined type OID */
+		TypeCreateWithOptions(InvalidOid,	/* no predetermined type OID */
 				   typeName,	/* type name */
 				   typeNamespace,		/* namespace */
 				   InvalidOid,	/* relation oid (n/a here) */
@@ -586,12 +629,12 @@ DefineType(List *names, List *parameters)
 				   -1,			/* typMod (Domains only) */
 				   0,			/* Array Dimensions of typbasetype */
 				   false,		/* Type NOT NULL */
-				   collation);	/* type's collation */
+				   collation,	/* type's collation */
+				   (Datum) 0);
 
 	/*
 	 * Create the array type that goes with it.
 	 */
-	array_type = makeArrayTypeName(typeName, typeNamespace);
 
 	/* alignment must be 'i' or 'd' for arrays */
 	alignment = (alignment == 'd') ? 'd' : 'i';
@@ -630,6 +673,23 @@ DefineType(List *names, List *parameters)
 
 	pfree(array_type);
 
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		DefineStmt * stmt = makeNode(DefineStmt);
+		stmt->kind = OBJECT_TYPE;
+		stmt->oldstyle = false; /*?*/
+		stmt->defnames = names;
+		stmt->args = NIL;
+		stmt->definition = parameters;
+
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									GetAssignedOidsForDispatch(),
+									NULL);
+	}
+
 	return typoid;
 }
 
@@ -641,6 +701,13 @@ RemoveTypeById(Oid typeOid)
 {
 	Relation	relation;
 	HeapTuple	tup;
+
+	/* 
+	 * It might look like the call in RemoveType() is enough for
+	 * pg_type_encoding but it's not. This case catches array type derivations
+	 * of base types.
+	 */
+	remove_type_encoding(typeOid);
 
 	relation = heap_open(TypeRelationId, RowExclusiveLock);
 
@@ -668,7 +735,7 @@ RemoveTypeById(Oid typeOid)
 
 	ReleaseSysCache(tup);
 
-	heap_close(relation, RowExclusiveLock);
+	heap_close(relation,  Gp_role == GP_ROLE_DISPATCH ? NoLock : RowExclusiveLock);
 }
 
 
@@ -894,6 +961,8 @@ DefineDomain(CreateDomainStmt *stmt)
 											   NIL, false, false);
 						defaultValueBin = nodeToString(defaultExpr);
 					}
+
+					free_parsestate(pstate);
 				}
 				else
 				{
@@ -1041,6 +1110,16 @@ DefineDomain(CreateDomainStmt *stmt)
 		CommandCounterIncrement();
 	}
 
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									GetAssignedOidsForDispatch(),
+									NULL);
+	}
+
 	/*
 	 * Now we can clean up.
 	 */
@@ -1090,11 +1169,24 @@ DefineEnum(CreateEnumStmt *stmt)
 					 errmsg("type \"%s\" already exists", enumName)));
 	}
 
-	enumArrayOid = AssignTypeArrayOid();
+	enumArrayName = makeArrayTypeName(enumName, enumNamespace);
+
+	/* Preassign array type OID so we can insert it in pg_type.typarray */
+	if (Gp_role == GP_ROLE_EXECUTE || IsBinaryUpgrade)
+	{
+		enumTypeOid = GetPreassignedOidForType(enumNamespace, enumName, false);
+		enumArrayOid = GetPreassignedOidForType(enumNamespace, enumArrayName,
+											    false);
+	}
+	else
+	{
+		enumTypeOid = InvalidOid;
+		enumArrayOid = AssignTypeArrayOid();
+	}
 
 	/* Create the pg_type entry */
 	enumTypeOid =
-		TypeCreate(InvalidOid,	/* no predetermined type OID */
+		TypeCreate(enumTypeOid,
 				   enumName,	/* type name */
 				   enumNamespace,		/* namespace */
 				   InvalidOid,	/* relation oid (n/a here) */
@@ -1132,8 +1224,6 @@ DefineEnum(CreateEnumStmt *stmt)
 	/*
 	 * Create the array type that goes with it.
 	 */
-	enumArrayName = makeArrayTypeName(enumName, enumNamespace);
-
 	TypeCreate(enumArrayOid,	/* force assignment of this type OID */
 			   enumArrayName,	/* type name */
 			   enumNamespace,	/* namespace */
@@ -1167,6 +1257,14 @@ DefineEnum(CreateEnumStmt *stmt)
 			   InvalidOid);		/* type's collation */
 
 	pfree(enumArrayName);
+
+	if (Gp_role == GP_ROLE_DISPATCH)
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									GetAssignedOidsForDispatch(),
+									NULL);
 
 	return enumTypeOid;
 }
@@ -1206,6 +1304,14 @@ AlterEnum(AlterEnumStmt *stmt, bool isTopLevel)
 	if (HeapTupleHeaderGetXmin(tup->t_data) == GetCurrentTransactionId() &&
 		!(tup->t_data->t_infomask & HEAP_UPDATED))
 		 /* safe to do inside transaction block */ ;
+	else if (Gp_role == GP_ROLE_EXECUTE)
+	{
+		/*
+		 * GPDB: allow this in query executor, as distributed transaction
+		 * participants. The QD already checked this, and should've prevented
+		 * running this in any genuine transaction block.
+		 */
+	}
 	else
 		PreventTransactionChain(isTopLevel, "ALTER TYPE ... ADD");
 
@@ -1220,6 +1326,14 @@ AlterEnum(AlterEnumStmt *stmt, bool isTopLevel)
 	InvokeObjectPostAlterHook(TypeRelationId, enum_type_oid, 0);
 
 	ReleaseSysCache(tup);
+
+	if (Gp_role == GP_ROLE_DISPATCH)
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									GetAssignedOidsForDispatch(),
+									NULL);
 
 	return enum_type_oid;
 }
@@ -1423,8 +1537,21 @@ DefineRange(CreateRangeStmt *stmt)
 	/* alignment must be 'i' or 'd' for ranges */
 	alignment = (subtypalign == 'd') ? 'd' : 'i';
 
-	/* Allocate OID for array type */
-	rangeArrayOid = AssignTypeArrayOid();
+	/*
+	 * Create the array type that goes with it.
+	 */
+	rangeArrayName = makeArrayTypeName(typeName, typeNamespace);
+
+	/* Preassign array type OID so we can insert it in pg_type.typarray */
+	if (Gp_role == GP_ROLE_EXECUTE || IsBinaryUpgrade)
+	{
+		rangeArrayOid = GetPreassignedOidForType(typeNamespace, rangeArrayName,
+												 true);
+	}
+	else
+	{
+		rangeArrayOid = AssignTypeArrayOid();
+	}
 
 	/* Create the pg_type entry */
 	typoid =
@@ -1464,10 +1591,7 @@ DefineRange(CreateRangeStmt *stmt)
 	RangeCreate(typoid, rangeSubtype, rangeCollation, rangeSubOpclass,
 				rangeCanonical, rangeSubtypeDiff);
 
-	/*
-	 * Create the array type that goes with it.
-	 */
-	rangeArrayName = makeArrayTypeName(typeName, typeNamespace);
+
 
 	TypeCreate(rangeArrayOid,	/* force assignment of this type OID */
 			   rangeArrayName,	/* type name */
@@ -1505,6 +1629,14 @@ DefineRange(CreateRangeStmt *stmt)
 
 	/* And create the constructor functions for this range type */
 	makeRangeConstructors(typeName, typeNamespace, typoid, rangeSubtype);
+
+	if (Gp_role == GP_ROLE_DISPATCH)
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									GetAssignedOidsForDispatch(),
+									NULL);
 
 	return typoid;
 }
@@ -1555,6 +1687,7 @@ makeRangeConstructors(const char *name, Oid namespace,
 								  BOOTSTRAP_SUPERUSERID,		/* proowner */
 								  INTERNALlanguageId,	/* language */
 								  F_FMGR_INTERNAL_VALIDATOR,	/* language validator */
+								  InvalidOid,
 								  prosrc[i],	/* prosrc */
 								  NULL, /* probin */
 								  false,		/* isAgg */
@@ -1570,7 +1703,9 @@ makeRangeConstructors(const char *name, Oid namespace,
 								  NIL,	/* parameterDefaults */
 								  PointerGetDatum(NULL),		/* proconfig */
 								  1.0,	/* procost */
-								  0.0); /* prorows */
+								  0.0,
+								  PRODATAACCESS_NONE,
+								  PROEXECLOCATION_ANY); /* prorows */
 
 		/*
 		 * Make the constructors internally-dependent on the range type so
@@ -2026,6 +2161,8 @@ DefineCompositeType(RangeVar *typevar, List *coldeflist)
 	Oid			typeNamespace;
 	Oid			relid;
 
+	createStmt->ownerid = GetUserId();
+
 	/*
 	 * now set the parameters for keys/inheritance etc. All of these are
 	 * uninteresting for composite types...
@@ -2063,7 +2200,8 @@ DefineCompositeType(RangeVar *typevar, List *coldeflist)
 	/*
 	 * Finally create the relation.  This also creates the type.
 	 */
-	relid = DefineRelation(createStmt, RELKIND_COMPOSITE_TYPE, InvalidOid);
+	relid = DefineRelation(createStmt, RELKIND_COMPOSITE_TYPE, InvalidOid,
+						   RELSTORAGE_VIRTUAL, true, true, NULL);
 	Assert(relid != InvalidOid);
 	return relid;
 }
@@ -2126,6 +2264,8 @@ AlterDomainDefault(List *names, Node *defaultRaw)
 								  typTup->typbasetype,
 								  typTup->typtypmod,
 								  NameStr(typTup->typname));
+
+		free_parsestate(pstate);
 
 		/*
 		 * If the expression is just a NULL constant, we treat the command
@@ -3641,4 +3781,71 @@ AlterTypeNamespaceInternal(Oid typeOid, Oid nspOid,
 		AlterTypeNamespaceInternal(arrayOid, nspOid, true, true, objsMoved);
 
 	return oldNspOid;
+}
+
+/* Modify the typarray column of a pg_type row. */
+void
+AlterTypeArray(Oid typeOid, Oid arrayOid)
+{
+	Relation     typrel;
+	HeapTuple    typtup;
+	Form_pg_type typform;
+
+	typrel = heap_open(TypeRelationId, RowExclusiveLock);
+
+	typtup = SearchSysCacheCopy1(TYPEOID, ObjectIdGetDatum(typeOid));
+	if (!HeapTupleIsValid(typtup))
+		elog(ERROR, "cache lookup failed for type %u", typeOid);
+	typform = (Form_pg_type) GETSTRUCT(typtup);
+
+	typform->typarray = arrayOid;
+
+	simple_heap_update(typrel, &typtup->t_self, typtup);
+	CatalogUpdateIndexes(typrel, typtup);
+
+	InvokeObjectPostAlterHook(TypeRelationId, typeOid, 0);
+	heap_freetuple(typtup);
+	heap_close(typrel, RowExclusiveLock);
+}
+
+/*
+ * Currently, we only land here if the user has issued:
+ *
+ * ALTER TYPE <typname> SET DEFAULT ENCODING (...)
+ */
+void
+AlterType(AlterTypeStmt *stmt)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("ALTER TYPE ... SET DEFAULT ENCODING is not supported")));
+}
+
+/*
+ * Remove the default type encoding for typid.
+ */
+static void
+remove_type_encoding(Oid typid)
+{
+	Relation rel;
+	ScanKeyData scankey;
+	SysScanDesc sscan;
+	HeapTuple tuple;
+
+	rel = heap_open(TypeEncodingRelationId, RowExclusiveLock);
+
+	ScanKeyInit(&scankey,
+				Anum_pg_type_encoding_typid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(typid));
+
+	sscan = systable_beginscan(rel, TypeEncodingTypidIndexId, true,
+							   NULL, 1, &scankey);
+	while((tuple = systable_getnext(sscan)) != NULL)
+	{
+		simple_heap_delete(rel, &tuple->t_self);
+	}
+	systable_endscan(sscan);
+
+	heap_close(rel, RowExclusiveLock);
 }

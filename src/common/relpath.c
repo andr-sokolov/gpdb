@@ -122,7 +122,7 @@ GetDatabasePath(Oid dbNode, Oid spcNode)
 	{
 		/* All other tablespaces are accessed via symlinks */
 		return psprintf("pg_tblspc/%u/%s/%u",
-						spcNode, TABLESPACE_VERSION_DIRECTORY, dbNode);
+						spcNode, GP_TABLESPACE_VERSION_DIRECTORY, dbNode);
 	}
 }
 
@@ -168,12 +168,12 @@ GetRelationPath(Oid dbNode, Oid spcNode, Oid relNode,
 		else
 		{
 			if (forkNumber != MAIN_FORKNUM)
-				path = psprintf("base/%u/t%d_%u_%s",
-								dbNode, backendId, relNode,
+				path = psprintf("base/%u/t_%u_%s",
+								dbNode, relNode,
 								forkNames[forkNumber]);
 			else
-				path = psprintf("base/%u/t%d_%u",
-								dbNode, backendId, relNode);
+				path = psprintf("base/%u/t_%u",
+								dbNode, relNode);
 		}
 	}
 	else
@@ -183,25 +183,25 @@ GetRelationPath(Oid dbNode, Oid spcNode, Oid relNode,
 		{
 			if (forkNumber != MAIN_FORKNUM)
 				path = psprintf("pg_tblspc/%u/%s/%u/%u_%s",
-								spcNode, TABLESPACE_VERSION_DIRECTORY,
+								spcNode, GP_TABLESPACE_VERSION_DIRECTORY,
 								dbNode, relNode,
 								forkNames[forkNumber]);
 			else
 				path = psprintf("pg_tblspc/%u/%s/%u/%u",
-								spcNode, TABLESPACE_VERSION_DIRECTORY,
+								spcNode, GP_TABLESPACE_VERSION_DIRECTORY,
 								dbNode, relNode);
 		}
 		else
 		{
 			if (forkNumber != MAIN_FORKNUM)
-				path = psprintf("pg_tblspc/%u/%s/%u/t%d_%u_%s",
-								spcNode, TABLESPACE_VERSION_DIRECTORY,
-								dbNode, backendId, relNode,
+				path = psprintf("pg_tblspc/%u/%s/%u/t_%u_%s",
+								spcNode, GP_TABLESPACE_VERSION_DIRECTORY,
+								dbNode, relNode,
 								forkNames[forkNumber]);
 			else
-				path = psprintf("pg_tblspc/%u/%s/%u/t%d_%u",
-								spcNode, TABLESPACE_VERSION_DIRECTORY,
-								dbNode, backendId, relNode);
+				path = psprintf("pg_tblspc/%u/%s/%u/t_%u",
+								spcNode, GP_TABLESPACE_VERSION_DIRECTORY,
+								dbNode, relNode);
 		}
 	}
 	return path;

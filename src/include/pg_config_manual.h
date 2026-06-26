@@ -65,6 +65,14 @@
 #define NUM_SPINLOCK_SEMAPHORES		128
 
 /*
+ * When we have neither spinlocks nor atomic operations support we're
+ * implementing atomic operations on top of spinlock on top of semaphores. To
+ * be safe against atomic operations while holding a spinlock separate
+ * semaphores have to be used.
+ */
+#define NUM_ATOMICS_SEMAPHORES      64
+
+/*
  * Define this if you want to allow the lo_import and lo_export SQL
  * functions to be executed by ordinary users.  By default these
  * functions are only available to the Postgres superuser.  CAUTION:
@@ -109,7 +117,7 @@
  * is aligned on a larger-than-MAXALIGN boundary.  Ideally this should be
  * a platform-dependent value, but for now we just hard-wire it.
  */
-#define ALIGNOF_BUFFER	32
+#define ALIGNOF_BUFFER	64
 
 /*
  * Disable UNIX sockets for certain operating systems.
@@ -164,22 +172,6 @@
  * considerably inferior to --- random().
  */
 #define MAX_RANDOM_VALUE  (0x7FFFFFFF)
-
-/*
- * Set the format style used by gcc to check printf type functions. We really
- * want the "gnu_printf" style set, which includes what glibc uses, such
- * as %m for error strings and %lld for 64 bit long longs. But not all gcc
- * compilers are known to support it, so we just use "printf" which all
- * gcc versions alive are known to support, except on Windows where
- * using "gnu_printf" style makes a dramatic difference. Maybe someday
- * we'll have a configure test for this, if we ever discover use of more
- * variants to be necessary.
- */
-#ifdef WIN32
-#define PG_PRINTF_ATTRIBUTE gnu_printf
-#else
-#define PG_PRINTF_ATTRIBUTE printf
-#endif
 
 /*
  * On PPC machines, decide whether to use the mutex hint bit in LWARX
@@ -247,6 +239,7 @@
  */
 #ifdef USE_ASSERT_CHECKING
 #define CLOBBER_FREED_MEMORY
+#define RELCACHE_FORCE_RELEASE
 #endif
 
 /*

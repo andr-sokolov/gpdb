@@ -24,7 +24,11 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 
+#include "access/htup_details.h"
+#include "catalog/catalog.h"
 #include "miscadmin.h"
 #include "access/xlogutils.h"
 #include "access/xlog.h"
@@ -39,7 +43,7 @@
 #include "utils/memutils.h"
 #include "pg_trace.h"
 
-
+#include "catalog/pg_tablespace.h"
 /* intervals for calling AbsorbFsyncRequests in mdsync and mdpostckpt */
 #define FSYNCS_PER_ABSORB		10
 #define UNLINKS_PER_ABSORB		10
@@ -50,6 +54,13 @@
  * Note that CompactCheckpointerRequestQueue assumes that it's OK to remove an
  * fsync request from the queue if an identical, subsequent request is found.
  * See comments there before making changes here.
+ */
+/*
+ * GPDB:
+ * For AO/CO tables, the max segno should be
+ * MAX_AOREL_CONCURRENCY (128) * MaxTupleAttributeNumber (1664),
+ * which will not cause overflow and thus will not cause confusion with the
+ * below special segnos.
  */
 #define FORGET_RELATION_FSYNC	(InvalidBlockNumber)
 #define FORGET_DATABASE_FSYNC	(InvalidBlockNumber-1)
@@ -148,6 +159,7 @@ typedef struct
 	Bitmapset  *requests[MAX_FORKNUM + 1];
 	/* canceled[f] is true if we canceled fsyncs for fork "recently" */
 	bool		canceled[MAX_FORKNUM + 1];
+	bool		is_ao_segnos;	/* if the requests are for real ao/co segnos. */
 } PendingOperationEntry;
 
 typedef struct
@@ -172,7 +184,7 @@ typedef enum					/* behavior for mdopen & _mdfd_getseg */
 
 /* local routines */
 static void mdunlinkfork(RelFileNodeBackend rnode, ForkNumber forkNum,
-			 bool isRedo);
+			 bool isRedo, char relstorage);
 static MdfdVec *mdopen(SMgrRelation reln, ForkNumber forknum,
 	   ExtensionBehavior behavior);
 static void register_dirty_segment(SMgrRelation reln, ForkNumber forknum,
@@ -184,7 +196,7 @@ static char *_mdfd_segpath(SMgrRelation reln, ForkNumber forknum,
 static MdfdVec *_mdfd_openseg(SMgrRelation reln, ForkNumber forkno,
 			  BlockNumber segno, int oflags);
 static MdfdVec *_mdfd_getseg(SMgrRelation reln, ForkNumber forkno,
-			 BlockNumber blkno, bool skipFsync, ExtensionBehavior behavior);
+			 BlockNumber blkno, bool skipFsync, ExtensionBehavior behavior, bool *is_seg0);
 static BlockNumber _mdnblocks(SMgrRelation reln, ForkNumber forknum,
 		   MdfdVec *seg);
 
@@ -363,7 +375,7 @@ mdcreate(SMgrRelation reln, ForkNumber forkNum, bool isRedo)
  * we are usually not in a transaction anymore when this is called.
  */
 void
-mdunlink(RelFileNodeBackend rnode, ForkNumber forkNum, bool isRedo)
+mdunlink(RelFileNodeBackend rnode, ForkNumber forkNum, bool isRedo, char relstorage)
 {
 	/*
 	 * We have to clean out any pending fsync requests for the doomed
@@ -371,6 +383,16 @@ mdunlink(RelFileNodeBackend rnode, ForkNumber forkNum, bool isRedo)
 	 * requests for a temp relation, though.  We can send just one request
 	 * even when deleting multiple forks, since the fsync queuing code accepts
 	 * the "InvalidForkNumber = all forks" convention.
+	 *
+	 * On the mirror, AO fsync requests are always forwarded.
+	 *
+	 * On crash recovery clean out any pending fsync requests for AO. This
+	 * acts as defensive code to avoid mdsync() failures for AO in-case of any
+	 * bugs the fsync request was queued. Also, file truncate WAL record
+	 * (emitted by TRUNCATE command when issued in same transaction as create
+	 * table) can't differentiate between heap or ao during replay, always
+	 * registers fsync request. Hence need to clean out pending AO fsync
+	 * requests before unlink.
 	 */
 	if (!RelFileNodeBackendIsTemp(rnode))
 		ForgetRelationFsyncRequests(rnode.node, forkNum);
@@ -379,14 +401,14 @@ mdunlink(RelFileNodeBackend rnode, ForkNumber forkNum, bool isRedo)
 	if (forkNum == InvalidForkNumber)
 	{
 		for (forkNum = 0; forkNum <= MAX_FORKNUM; forkNum++)
-			mdunlinkfork(rnode, forkNum, isRedo);
+			mdunlinkfork(rnode, forkNum, isRedo, relstorage);
 	}
 	else
-		mdunlinkfork(rnode, forkNum, isRedo);
+		mdunlinkfork(rnode, forkNum, isRedo, relstorage);
 }
 
 static void
-mdunlinkfork(RelFileNodeBackend rnode, ForkNumber forkNum, bool isRedo)
+mdunlinkfork(RelFileNodeBackend rnode, ForkNumber forkNum, bool isRedo, char relstorage)
 {
 	char	   *path;
 	int			ret;
@@ -451,7 +473,7 @@ mdunlinkfork(RelFileNodeBackend rnode, ForkNumber forkNum, bool isRedo)
 				if (errno != ENOENT)
 					ereport(WARNING,
 							(errcode_for_file_access(),
-					   errmsg("could not remove file \"%s\": %m", segpath)));
+							 errmsg("could not remove file \"%s\": %m", segpath)));
 				break;
 			}
 		}
@@ -495,7 +517,7 @@ mdextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 						relpath(reln->smgr_rnode, forknum),
 						InvalidBlockNumber)));
 
-	v = _mdfd_getseg(reln, forknum, blocknum, skipFsync, EXTENSION_CREATE);
+	v = _mdfd_getseg(reln, forknum, blocknum, skipFsync, EXTENSION_CREATE, NULL);
 
 	seekpos = (off_t) BLCKSZ *(blocknum % ((BlockNumber) RELSEG_SIZE));
 
@@ -637,7 +659,7 @@ mdprefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)
 	off_t		seekpos;
 	MdfdVec    *v;
 
-	v = _mdfd_getseg(reln, forknum, blocknum, false, EXTENSION_FAIL);
+	v = _mdfd_getseg(reln, forknum, blocknum, false, EXTENSION_FAIL, NULL);
 
 	seekpos = (off_t) BLCKSZ *(blocknum % ((BlockNumber) RELSEG_SIZE));
 
@@ -646,7 +668,6 @@ mdprefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)
 	(void) FilePrefetch(v->mdfd_vfd, seekpos, BLCKSZ);
 #endif   /* USE_PREFETCH */
 }
-
 
 /*
  *	mdread() -- Read the specified block from a relation.
@@ -665,7 +686,7 @@ mdread(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 										reln->smgr_rnode.node.relNode,
 										reln->smgr_rnode.backend);
 
-	v = _mdfd_getseg(reln, forknum, blocknum, false, EXTENSION_FAIL);
+	v = _mdfd_getseg(reln, forknum, blocknum, false, EXTENSION_FAIL, NULL);
 
 	seekpos = (off_t) BLCKSZ *(blocknum % ((BlockNumber) RELSEG_SIZE));
 
@@ -740,7 +761,7 @@ mdwrite(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 										 reln->smgr_rnode.node.relNode,
 										 reln->smgr_rnode.backend);
 
-	v = _mdfd_getseg(reln, forknum, blocknum, skipFsync, EXTENSION_FAIL);
+	v = _mdfd_getseg(reln, forknum, blocknum, skipFsync, EXTENSION_FAIL, NULL);
 
 	seekpos = (off_t) BLCKSZ *(blocknum % ((BlockNumber) RELSEG_SIZE));
 
@@ -875,7 +896,8 @@ mdtruncate(SMgrRelation reln, ForkNumber forknum, BlockNumber nblocks)
 						relpath(reln->smgr_rnode, forknum),
 						nblocks, curnblk)));
 	}
-	if (nblocks == curnblk)
+
+	if (nblocks == curnblk && (forknum != MAIN_FORKNUM))
 		return;					/* no work */
 
 	v = mdopen(reln, forknum, EXTENSION_FAIL);
@@ -991,6 +1013,7 @@ mdsync(void)
 	uint64		elapsed;
 	uint64		longest = 0;
 	uint64		total_elapsed = 0;
+	bool		is_seg0 = false;
 
 	/*
 	 * This is only called during checkpoints, and checkpoints should only
@@ -1146,10 +1169,20 @@ mdsync(void)
 					 */
 					reln = smgropen(entry->rnode, InvalidBackendId);
 
-					/* Attempt to open and fsync the target segment */
-					seg = _mdfd_getseg(reln, forknum,
-							 (BlockNumber) segno * (BlockNumber) RELSEG_SIZE,
-									   false, EXTENSION_RETURN_NULL);
+					if (entry->is_ao_segnos)
+					{
+						/*
+						 * For AO table, only access what the segno denoted, instead
+						 * of the chain to the target segment as HEAP.
+						 */
+						seg = _mdfd_openseg(reln, forknum, segno, 0);
+					}
+					else
+					{
+						seg = _mdfd_getseg(reln, forknum,
+								(BlockNumber) segno * (BlockNumber) RELSEG_SIZE,
+										false, EXTENSION_RETURN_NULL, &is_seg0);
+					}
 
 					INSTR_TIME_SET_CURRENT(sync_start);
 
@@ -1177,6 +1210,7 @@ mdsync(void)
 
 					/* Compute file name for use in message */
 					save_errno = errno;
+					segno = (is_seg0 ? 0 : segno);
 					path = _mdfd_segpath(reln, forknum, (BlockNumber) segno);
 					errno = save_errno;
 
@@ -1208,14 +1242,14 @@ mdsync(void)
 						errno = save_errno;
 						ereport(data_sync_elevel(ERROR),
 								(errcode_for_file_access(),
-								 errmsg("could not fsync file \"%s\": %m",
-										path)));
+								 errmsg("could not fsync file \"%s\" (is_ao: %d): %m",
+										path, entry->is_ao_segnos)));
 					}
 					else
 						ereport(DEBUG1,
 								(errcode_for_file_access(),
-						errmsg("could not fsync file \"%s\" but retrying: %m",
-							   path)));
+						errmsg("could not fsync file \"%s\" (is_ao: %d) but retrying: %m",
+							   path, entry->is_ao_segnos)));
 					pfree(path);
 
 					/*
@@ -1369,11 +1403,11 @@ register_dirty_segment(SMgrRelation reln, ForkNumber forknum, MdfdVec *seg)
 	if (pendingOpsTable)
 	{
 		/* push it into local pending-ops table */
-		RememberFsyncRequest(reln->smgr_rnode.node, forknum, seg->mdfd_segno);
+		RememberFsyncRequest(reln->smgr_rnode.node, forknum, seg->mdfd_segno, false);
 	}
 	else
 	{
-		if (ForwardFsyncRequest(reln->smgr_rnode.node, forknum, seg->mdfd_segno))
+		if (ForwardFsyncRequest(reln->smgr_rnode.node, forknum, seg->mdfd_segno, false))
 			return;				/* passed it off successfully */
 
 		ereport(DEBUG1,
@@ -1406,7 +1440,8 @@ register_unlink(RelFileNodeBackend rnode)
 	{
 		/* push it into local pending-ops table */
 		RememberFsyncRequest(rnode.node, MAIN_FORKNUM,
-							 UNLINK_RELATION_REQUEST);
+							 UNLINK_RELATION_REQUEST,
+							 false);
 	}
 	else
 	{
@@ -1419,7 +1454,7 @@ register_unlink(RelFileNodeBackend rnode)
 		 */
 		Assert(IsUnderPostmaster);
 		while (!ForwardFsyncRequest(rnode.node, MAIN_FORKNUM,
-									UNLINK_RELATION_REQUEST))
+									UNLINK_RELATION_REQUEST, false))
 			pg_usleep(10000L);	/* 10 msec seems a good number */
 	}
 }
@@ -1446,7 +1481,8 @@ register_unlink(RelFileNodeBackend rnode)
  * heavyweight operation anyhow, so we'll live with it.)
  */
 void
-RememberFsyncRequest(RelFileNode rnode, ForkNumber forknum, BlockNumber segno)
+RememberFsyncRequest(RelFileNode rnode, ForkNumber forknum, BlockNumber segno,
+					 bool is_ao_segno)
 {
 	Assert(pendingOpsTable);
 
@@ -1572,6 +1608,7 @@ RememberFsyncRequest(RelFileNode rnode, ForkNumber forknum, BlockNumber segno)
 
 		entry->requests[forknum] = bms_add_member(entry->requests[forknum],
 												  (int) segno);
+		entry->is_ao_segnos = is_ao_segno;
 
 		MemoryContextSwitchTo(oldcxt);
 	}
@@ -1589,7 +1626,7 @@ ForgetRelationFsyncRequests(RelFileNode rnode, ForkNumber forknum)
 	if (pendingOpsTable)
 	{
 		/* standalone backend or startup process: fsync state is local */
-		RememberFsyncRequest(rnode, forknum, FORGET_RELATION_FSYNC);
+		RememberFsyncRequest(rnode, forknum, FORGET_RELATION_FSYNC, false);
 	}
 	else if (IsUnderPostmaster)
 	{
@@ -1603,7 +1640,7 @@ ForgetRelationFsyncRequests(RelFileNode rnode, ForkNumber forknum)
 		 * which would be bad, so I'm inclined to assume that the checkpointer
 		 * will always empty the queue soon.
 		 */
-		while (!ForwardFsyncRequest(rnode, forknum, FORGET_RELATION_FSYNC))
+		while (!ForwardFsyncRequest(rnode, forknum, FORGET_RELATION_FSYNC, false))
 			pg_usleep(10000L);	/* 10 msec seems a good number */
 
 		/*
@@ -1628,13 +1665,13 @@ ForgetDatabaseFsyncRequests(Oid dbid)
 	if (pendingOpsTable)
 	{
 		/* standalone backend or startup process: fsync state is local */
-		RememberFsyncRequest(rnode, InvalidForkNumber, FORGET_DATABASE_FSYNC);
+		RememberFsyncRequest(rnode, InvalidForkNumber, FORGET_DATABASE_FSYNC, false);
 	}
 	else if (IsUnderPostmaster)
 	{
 		/* see notes in ForgetRelationFsyncRequests */
 		while (!ForwardFsyncRequest(rnode, InvalidForkNumber,
-									FORGET_DATABASE_FSYNC))
+									FORGET_DATABASE_FSYNC, false))
 			pg_usleep(10000L);	/* 10 msec seems a good number */
 	}
 }
@@ -1643,33 +1680,39 @@ ForgetDatabaseFsyncRequests(Oid dbid)
  * DropRelationFiles -- drop files of all given relations
  */
 void
-DropRelationFiles(RelFileNode *delrels, int ndelrels, bool isRedo)
+DropRelationFiles(RelFileNodePendingDelete *delrels, int ndelrels, bool isRedo)
 {
 	SMgrRelation *srels;
+	char         *srelstorages;
 	int			i;
 
 	srels = palloc(sizeof(SMgrRelation) * ndelrels);
+	srelstorages = palloc(sizeof(char) * ndelrels);
 	for (i = 0; i < ndelrels; i++)
 	{
-		SMgrRelation srel = smgropen(delrels[i], InvalidBackendId);
+		/* GPDB: backend can only be TempRelBackendId or InvalidBackendId for a
+		 * given relfile since we don't tie temp relations to their backends. */
+		SMgrRelation srel = smgropen(delrels[i].node,
+			delrels[i].isTempRelation ? TempRelBackendId : InvalidBackendId);
 
 		if (isRedo)
 		{
 			ForkNumber	fork;
 
 			for (fork = 0; fork <= MAX_FORKNUM; fork++)
-				XLogDropRelation(delrels[i], fork);
+				XLogDropRelation(delrels[i].node, fork);
 		}
 		srels[i] = srel;
+		srelstorages[i] = delrels[i].relstorage;
 	}
 
-	smgrdounlinkall(srels, ndelrels, isRedo);
+	smgrdounlinkall(srels, ndelrels, isRedo, srelstorages);
 
 	for (i = 0; i < ndelrels; i++)
 		smgrclose(srels[i]);
+	pfree(srelstorages);
 	pfree(srels);
 }
-
 
 /*
  *	_fdvec_alloc() -- Make a MdfdVec object.
@@ -1732,7 +1775,12 @@ _mdfd_openseg(SMgrRelation reln, ForkNumber forknum, BlockNumber segno,
 	v->mdfd_vfd = fd;
 	v->mdfd_segno = segno;
 	v->mdfd_chain = NULL;
-	Assert(_mdnblocks(reln, forknum, v) <= ((BlockNumber) RELSEG_SIZE));
+	/*
+	 * Skip the assertion check, it'll cause assertion failure if aocs table
+	 * exceeds 1G. Comment this line for now to avoid future pg merge adds
+	 * back the code.
+	 */
+	/*Assert(_mdnblocks(reln, forknum, v) <= ((BlockNumber) RELSEG_SIZE));*/
 
 	/* all done */
 	return v;
@@ -1748,16 +1796,22 @@ _mdfd_openseg(SMgrRelation reln, ForkNumber forknum, BlockNumber segno,
  */
 static MdfdVec *
 _mdfd_getseg(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
-			 bool skipFsync, ExtensionBehavior behavior)
+			 bool skipFsync, ExtensionBehavior behavior, bool *is_seg0)
 {
 	MdfdVec    *v = mdopen(reln, forknum, behavior);
 	BlockNumber targetseg;
 	BlockNumber nextsegno;
 
 	if (!v)
+	{
+		if (is_seg0 != NULL)
+			*is_seg0 = true;
+
 		return NULL;			/* only possible if EXTENSION_RETURN_NULL */
+	}
 
 	targetseg = blkno / ((BlockNumber) RELSEG_SIZE);
+
 	for (nextsegno = 1; nextsegno <= targetseg; nextsegno++)
 	{
 		Assert(nextsegno == v->mdfd_segno + 1);
@@ -1789,7 +1843,7 @@ _mdfd_getseg(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 							 zerobuf, skipFsync);
 					pfree(zerobuf);
 				}
-				v->mdfd_chain = _mdfd_openseg(reln, forknum, +nextsegno, O_CREAT);
+				v->mdfd_chain = _mdfd_openseg(reln, forknum, nextsegno, O_CREAT);
 			}
 			else
 			{

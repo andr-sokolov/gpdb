@@ -96,4 +96,26 @@ typedef struct RelFileNodeBackend
 	 (node1).backend == (node2).backend && \
 	 (node1).node.spcNode == (node2).node.spcNode)
 
+inline static bool RelFileNode_IsEmpty(
+	RelFileNode	*relFileNode)
+{
+	return (relFileNode->spcNode == 0 &&
+		    relFileNode->dbNode == 0 &&
+		    relFileNode->relNode == 0);
+}
+
+/*
+ * Augmenting a relfilenode with a storage type provides a way to make optimal
+ * decisions in smgr and md layer. This is purposefully kept out of RelFileNode
+ * for performance concerns where RelFileNode used in a hotpath for BufferTag
+ * hashing. The isTempRelation flag is necessary to support file-system removal 
+ * of temporary relations on a two-phase commit/abort.
+ */
+typedef struct RelFileNodePendingDelete
+{
+	RelFileNode node;
+	bool isTempRelation;
+	char relstorage;
+} RelFileNodePendingDelete;
+
 #endif   /* RELFILENODE_H */

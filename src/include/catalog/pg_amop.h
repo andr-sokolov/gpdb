@@ -65,6 +65,13 @@ CATALOG(pg_amop,2602)
 	Oid			amopsortfamily; /* ordering opfamily OID, or 0 if search op */
 } FormData_pg_amop;
 
+/* GPDB added foreign key definitions for gpcheckcat. */
+FOREIGN_KEY(amopfamily REFERENCES pg_opfamily(oid));
+FOREIGN_KEY(amoplefttype REFERENCES pg_type(oid));
+FOREIGN_KEY(amoprighttype REFERENCES pg_type(oid));
+FOREIGN_KEY(amopopr REFERENCES pg_operator(oid));
+FOREIGN_KEY(amopmethod REFERENCES pg_am(oid));
+
 /* allowed values of amoppurpose: */
 #define AMOP_SEARCH		's'		/* operator is for search */
 #define AMOP_ORDER		'o'		/* operator is for ordering */
@@ -392,6 +399,13 @@ DATA(insert (	1988   1700 1700 3 s 1752 403 0 ));
 DATA(insert (	1988   1700 1700 4 s 1757 403 0 ));
 DATA(insert (	1988   1700 1700 5 s 1756 403 0 ));
 
+/* btree complex */
+DATA(insert (	6221   7198 7198 1 s 6481 403 0 ));
+DATA(insert (	6221   7198 7198 2 s 6483 403 0 ));
+DATA(insert (	6221   7198 7198 3 s 6469 403 0 ));
+DATA(insert (	6221   7198 7198 4 s 6484 403 0 ));
+DATA(insert (	6221   7198 7198 5 s 6482 403 0 ));
+
 /*
  *	btree bool
  */
@@ -598,6 +612,9 @@ DATA(insert (	1998   1700 1700 1 s 1752 405 0 ));
 /* array_ops */
 DATA(insert (	627    2277 2277 1 s 1070 405 0 ));
 
+/* complex_ops */
+DATA(insert (	6224   7198 7198 1 s 6469 405 0 ));
+
 
 /*
  *	gist box_ops
@@ -729,7 +746,7 @@ DATA(insert (	3702   3615 3615 7 s	3693 783 0 ));
 DATA(insert (	3702   3615 3615 8 s	3694 783 0 ));
 
 /*
- * btree range_ops
+ *  * btree range_ops
  */
 DATA(insert (	3901   3831 3831 1 s	3884 403 0 ));
 DATA(insert (	3901   3831 3831 2 s	3885 403 0 ));
@@ -844,5 +861,58 @@ DATA(insert (	3550	869 869 24 s	931 783 0 ));
 DATA(insert (	3550	869 869 25 s	932 783 0 ));
 DATA(insert (	3550	869 869 26 s	933 783 0 ));
 DATA(insert (	3550	869 869 27 s	934 783 0 ));
+
+/*
+ * hash support for a few built-in datatypes that are missing it in upstream.
+ */
+DATA(insert (	7077   27 27 1 s 387 405 0 ));
+DATA(insert (	7078   1560 1560 1 s 1784 405 0 ));
+DATA(insert (	7079   1562 1562 1 s 1804 405 0 ));
+
+/*
+ *	legacy cdbhash ops
+ */
+DATA(insert (	7100 21 21 1 s 94 405 0 ));			/* int2 */
+DATA(insert (	7100 23 23 1 s 96 405 0 ));			/* int4 */
+DATA(insert (	7100 20 20 1 s 410 405 0 ));		/* int8 */
+/* cross-datatype integer ops */
+DATA(insert (	7100   21 23 1 s	532  405 0 ));
+DATA(insert (	7100   21 20 1 s	1862 405 0 ));
+DATA(insert (	7100   23 21 1 s	533  405 0 ));
+DATA(insert (	7100   23 20 1 s	15	 405 0 ));
+DATA(insert (	7100   20 21 1 s	1868 405 0 ));
+DATA(insert (	7100   20 23 1 s	416  405 0 ));
+
+DATA(insert (	7101 700 700 1 s 620 405 0 ));		/* float4 */
+DATA(insert (	7102 701 701 1 s 670 405 0 ));		/* float8 */
+DATA(insert (	7103 1700 1700 1 s 1752 405 0 ));	/* numeric */
+DATA(insert (	7104 18 18 1 s 92 405 0 ));			/* char */
+/* text is also for varchar. */
+DATA(insert (	7105 25 25 1 s 98 405 0 ));			/* text */
+DATA(insert (	7106 1042 1042 1 s 1054 405 0 ));	/* bpchar */
+DATA(insert (	7107 17 17 1 s 1955 405 0 ));		/* bytea */
+DATA(insert (	7108 19 19 1 s 93 405 0 ));			/* name */
+DATA(insert (	7109 26 26 1 s 607 405 0 ));		/* oid */
+DATA(insert (	7110 27 27 1 s 387 405 0 ));		/* tid */
+DATA(insert (	7111 1114 1114 1 s 2060 405 0 ));	/* timestamp */
+DATA(insert (	7112 1184 1184 1 s 1320 405 0 ));	/* timestamptz */
+DATA(insert (	7113 1082 1082 1 s 1093 405 0 ));	/* date */
+DATA(insert (	7114 1083 1083 1 s 1108 405 0 ));	/* time */
+DATA(insert (	7115 1266 1266 1 s 1550 405 0 ));	/* timetz */
+DATA(insert (	7116 1186 1186 1 s 1330 405 0 ));	/* interval */
+DATA(insert (	7117 702 702 1 s 560 405 0 ));		/* abstime */
+DATA(insert (	7118 703 703 1 s 566 405 0 ));		/* reltime */
+DATA(insert (	7119 704 704 1 s 811 405 0 ));		/* tinterval */
+DATA(insert (	7120 869 869 1 s 1201 405 0 ));		/* inet */
+DATA(insert (	7121 829 829 1 s 1220 405 0 ));		/* macaddr */
+DATA(insert (	7122 1560 1560 1 s 1784 405 0 ));	/* bit */
+DATA(insert (	7123 1562 1562 1 s 1804 405 0 ));	/* varbit */
+DATA(insert (	7124 16 16 1 s 91 405 0 ));			/* bool */
+DATA(insert (	7125 2277 2277 1 s 1070 405 0 ));	/* anyarray */
+DATA(insert (	7126 30 30 1 s 649 405 0 ));		/* oidvector */
+DATA(insert (	7127 790 790 1 s 900 405 0 ));		/* money */
+DATA(insert (	7128 7198 7198 1 s 6469 405 0 ));	/* complex */
+DATA(insert (	7129 2950 2950 1 s 2972 405 0 ));	/* uuid */
+DATA(insert (	7130 3500 3500 1 s 3516 405 0 ));	/* enum */
 
 #endif   /* PG_AMOP_H */

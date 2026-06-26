@@ -6,6 +6,8 @@
  * There is hardly anything left of Paul Brown's original implementation...
  *
  *
+ * Portions Copyright (c) 2006-2008, Greenplum inc
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994-5, Regents of the University of California
  *
@@ -29,6 +31,9 @@
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
+#include "catalog/pg_type.h"
+#include "catalog/pg_namespace.h"
+#include "catalog/pg_tablespace.h"
 #include "catalog/toasting.h"
 #include "commands/cluster.h"
 #include "commands/tablecmds.h"
@@ -51,6 +56,11 @@
 #include "utils/tqual.h"
 #include "utils/tuplesort.h"
 
+#include "catalog/oid_dispatch.h"
+#include "cdb/cdbvars.h"
+#include "cdb/cdbdisp_query.h"
+#include "cdb/cdboidsync.h"
+#include "libpq/pqformat.h"
 
 /*
  * This struct is used to pass around the information on tables to be
@@ -175,7 +185,17 @@ cluster(ClusterStmt *stmt, bool isTopLevel)
 		heap_close(rel, NoLock);
 
 		/* Do the job. */
-		cluster_rel(tableOid, indexOid, false, stmt->verbose);
+		cluster_rel(tableOid, indexOid, false, stmt->verbose, true /* printError */);
+
+		if (Gp_role == GP_ROLE_DISPATCH)
+		{
+			CdbDispatchUtilityStatement((Node *) stmt,
+										DF_CANCEL_ON_ERROR|
+										DF_WITH_SNAPSHOT|
+										DF_NEED_TWO_PHASE,
+										GetAssignedOidsForDispatch(),
+										NULL);
+		}
 	}
 	else
 	{
@@ -219,13 +239,28 @@ cluster(ClusterStmt *stmt, bool isTopLevel)
 		foreach(rv, rvs)
 		{
 			RelToCluster *rvtc = (RelToCluster *) lfirst(rv);
+			bool		dispatch;
 
 			/* Start a new transaction for each relation. */
 			StartTransactionCommand();
 			/* functions in indexes may want a snapshot set */
 			PushActiveSnapshot(GetTransactionSnapshot());
 			/* Do the job. */
-			cluster_rel(rvtc->tableOid, rvtc->indexOid, true, stmt->verbose);
+			dispatch = cluster_rel(rvtc->tableOid, rvtc->indexOid, true, stmt->verbose,
+								   false /* printError */);
+
+			if (Gp_role == GP_ROLE_DISPATCH && dispatch)
+			{
+				stmt->relation = makeNode(RangeVar);
+				stmt->relation->schemaname = get_namespace_name(get_rel_namespace(rvtc->tableOid));
+				stmt->relation->relname = get_rel_name(rvtc->tableOid);
+				CdbDispatchUtilityStatement((Node *) stmt,
+											DF_CANCEL_ON_ERROR|
+											DF_WITH_SNAPSHOT,
+											GetAssignedOidsForDispatch(),
+											NULL);
+			}
+
 			PopActiveSnapshot();
 			CommitTransactionCommand();
 		}
@@ -254,9 +289,13 @@ cluster(ClusterStmt *stmt, bool isTopLevel)
  * If indexOid is InvalidOid, the table will be rewritten in physical order
  * instead of index order.  This is the new implementation of VACUUM FULL,
  * and error messages should refer to the operation as VACUUM not CLUSTER.
+ *
+ * Note that we don't support clustering on an AO table. If printError is true,
+ * this function errors out when the relation is an AO table. Otherwise, this
+ * functions prints out a warning message when the relation is an AO table.
  */
-void
-cluster_rel(Oid tableOid, Oid indexOid, bool recheck, bool verbose)
+bool
+cluster_rel(Oid tableOid, Oid indexOid, bool recheck, bool verbose, bool printError)
 {
 	Relation	OldHeap;
 
@@ -269,11 +308,11 @@ cluster_rel(Oid tableOid, Oid indexOid, bool recheck, bool verbose)
 	 * case, since cluster() already did it.)  The index lock is taken inside
 	 * check_index_is_clusterable.
 	 */
-	OldHeap = try_relation_open(tableOid, AccessExclusiveLock);
+	OldHeap = try_relation_open(tableOid, AccessExclusiveLock, false);
 
 	/* If the table has gone away, we can skip processing it */
 	if (!OldHeap)
-		return;
+		return false;
 
 	/*
 	 * Since we may open a new transaction for each relation, we have to check
@@ -292,7 +331,7 @@ cluster_rel(Oid tableOid, Oid indexOid, bool recheck, bool verbose)
 		if (!pg_class_ownercheck(tableOid, GetUserId()))
 		{
 			relation_close(OldHeap, AccessExclusiveLock);
-			return;
+			return false;
 		}
 
 		/*
@@ -306,7 +345,7 @@ cluster_rel(Oid tableOid, Oid indexOid, bool recheck, bool verbose)
 		if (RELATION_IS_OTHER_TEMP(OldHeap))
 		{
 			relation_close(OldHeap, AccessExclusiveLock);
-			return;
+			return false;		
 		}
 
 		if (OidIsValid(indexOid))
@@ -317,7 +356,7 @@ cluster_rel(Oid tableOid, Oid indexOid, bool recheck, bool verbose)
 			if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(indexOid)))
 			{
 				relation_close(OldHeap, AccessExclusiveLock);
-				return;
+				return false;
 			}
 
 			/*
@@ -327,14 +366,14 @@ cluster_rel(Oid tableOid, Oid indexOid, bool recheck, bool verbose)
 			if (!HeapTupleIsValid(tuple))		/* probably can't happen */
 			{
 				relation_close(OldHeap, AccessExclusiveLock);
-				return;
+				return false;
 			}
 			indexForm = (Form_pg_index) GETSTRUCT(tuple);
 			if (!indexForm->indisclustered)
 			{
 				ReleaseSysCache(tuple);
 				relation_close(OldHeap, AccessExclusiveLock);
-				return;
+				return false;
 			}
 			ReleaseSysCache(tuple);
 		}
@@ -388,7 +427,7 @@ cluster_rel(Oid tableOid, Oid indexOid, bool recheck, bool verbose)
 		!RelationIsPopulated(OldHeap))
 	{
 		relation_close(OldHeap, AccessExclusiveLock);
-		return;
+		return false;
 	}
 
 	/*
@@ -403,6 +442,7 @@ cluster_rel(Oid tableOid, Oid indexOid, bool recheck, bool verbose)
 	rebuild_relation(OldHeap, indexOid, verbose);
 
 	/* NB: rebuild_relation does heap_close() on OldHeap */
+	return true;
 }
 
 /*
@@ -575,7 +615,8 @@ rebuild_relation(Relation OldHeap, Oid indexOid, bool verbose)
 
 	/* Create the transient table that will receive the re-ordered data */
 	OIDNewHeap = make_new_heap(tableOid, tableSpace, false,
-							   AccessExclusiveLock);
+							   AccessExclusiveLock,
+							   false);
 
 	/* Copy the heap data into the new table in the desired order */
 	copy_heap_data(OIDNewHeap, tableOid, indexOid, verbose,
@@ -586,7 +627,10 @@ rebuild_relation(Relation OldHeap, Oid indexOid, bool verbose)
 	 * rebuild the target's indexes and throw away the transient table.
 	 */
 	finish_heap_swap(tableOid, OIDNewHeap, is_system_catalog,
-					 swap_toast_by_content, false, true,
+					 swap_toast_by_content,
+					 true /* swap_stats */,
+					 false,
+					 true,
 					 frozenXid, cutoffMulti);
 }
 
@@ -602,7 +646,8 @@ rebuild_relation(Relation OldHeap, Oid indexOid, bool verbose)
  */
 Oid
 make_new_heap(Oid OIDOldHeap, Oid NewTableSpace, bool forcetemp,
-			  LOCKMODE lockmode)
+			  LOCKMODE lockmode,
+			  bool makeCdbPolicy)
 {
 	TupleDesc	OldHeapDesc;
 	char		NewHeapName[NAMEDATALEN];
@@ -614,9 +659,25 @@ make_new_heap(Oid OIDOldHeap, Oid NewTableSpace, bool forcetemp,
 	bool		isNull;
 	Oid			namespaceid;
 	char		relpersistence;
+	bool		is_part_child;
+	bool		is_part_parent;
 
 	OldHeap = heap_open(OIDOldHeap, lockmode);
 	OldHeapDesc = RelationGetDescr(OldHeap);
+
+	is_part_child = !rel_needs_long_lock(OIDOldHeap);
+
+	/*
+	 * Check pg_inherits to determine if the OldHeap relation is a non-leaf
+	 * (parent) in a partition hierarchy.  This can be avoided for tables that
+	 * should have valid relfrozenxid based on relkind and relstorage.
+	 */
+	if (should_have_valid_relfrozenxid(OldHeap->rd_rel->relkind,
+									   OldHeap->rd_rel->relstorage,
+									   false))
+		is_part_parent = !TransactionIdIsValid(OldHeap->rd_rel->relfrozenxid);
+	else
+		is_part_parent = rel_is_parent(OIDOldHeap);
 
 	/*
 	 * Note that the NewHeap will not receive any of the defaults or
@@ -670,17 +731,23 @@ make_new_heap(Oid OIDOldHeap, Oid NewTableSpace, bool forcetemp,
 										  OldHeap->rd_rel->relowner,
 										  OldHeapDesc,
 										  NIL,
+										  OldHeap->rd_rel->relam,
 										  RELKIND_RELATION,
 										  relpersistence,
+										  OldHeap->rd_rel->relstorage,
 										  false,
 										  RelationIsMapped(OldHeap),
 										  true,
 										  0,
 										  ONCOMMIT_NOOP,
+										  makeCdbPolicy? OldHeap->rd_cdbpolicy: NULL,/*CDB*/
 										  reloptions,
 										  false,
 										  true,
-										  true);
+										  true,
+										  /* valid_opts */ true,
+										  is_part_child,
+										  is_part_parent);
 	Assert(OIDNewHeap != InvalidOid);
 
 	ReleaseSysCache(tuple);
@@ -713,11 +780,13 @@ make_new_heap(Oid OIDOldHeap, Oid NewTableSpace, bool forcetemp,
 									 &isNull);
 		if (isNull)
 			reloptions = (Datum) 0;
-
-		NewHeapCreateToastTable(OIDNewHeap, reloptions, lockmode);
+		NewHeapCreateToastTable(OIDNewHeap, reloptions, lockmode,
+								is_part_child, is_part_parent);
 
 		ReleaseSysCache(tuple);
 	}
+
+	CacheInvalidateRelcacheByRelid(OIDNewHeap);
 
 	heap_close(OldHeap, NoLock);
 
@@ -740,6 +809,9 @@ copy_heap_data(Oid OIDNewHeap, Oid OIDOldHeap, Oid OIDOldIndex, bool verbose,
 	Relation	NewHeap,
 				OldHeap,
 				OldIndex;
+	Relation	relRelation;
+	HeapTuple	reltup;
+	Form_pg_class	relform;
 	TupleDesc	oldTupDesc;
 	TupleDesc	newTupDesc;
 	int			natts;
@@ -758,6 +830,7 @@ copy_heap_data(Oid OIDNewHeap, Oid OIDOldHeap, Oid OIDOldIndex, bool verbose,
 	double		num_tuples = 0,
 				tups_vacuumed = 0,
 				tups_recently_dead = 0;
+	BlockNumber num_pages;
 	int			elevel = verbose ? INFO : DEBUG2;
 	PGRUsage	ru0;
 
@@ -969,7 +1042,7 @@ copy_heap_data(Oid OIDNewHeap, Oid OIDOldHeap, Oid OIDOldIndex, bool verbose,
 
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 
-		switch (HeapTupleSatisfiesVacuum(tuple, OldestXmin, buf))
+		switch (HeapTupleSatisfiesVacuum(OldHeap, tuple, OldestXmin, buf))
 		{
 			case HEAPTUPLE_DEAD:
 				/* Definitely dead */
@@ -1085,6 +1158,8 @@ copy_heap_data(Oid OIDNewHeap, Oid OIDOldHeap, Oid OIDOldIndex, bool verbose,
 	/* Reset rd_toastoid just to be tidy --- it shouldn't be looked at again */
 	NewHeap->rd_toastoid = InvalidOid;
 
+	num_pages = RelationGetNumberOfBlocks(NewHeap);
+
 	/* Log what we did */
 	ereport(elevel,
 			(errmsg("\"%s\": found %.0f removable, %.0f nonremovable row versions in %u pages",
@@ -1104,6 +1179,86 @@ copy_heap_data(Oid OIDNewHeap, Oid OIDOldHeap, Oid OIDOldIndex, bool verbose,
 		index_close(OldIndex, NoLock);
 	heap_close(OldHeap, NoLock);
 	heap_close(NewHeap, NoLock);
+
+	/* Update pg_class to reflect the correct values of pages and tuples. */
+	relRelation = heap_open(RelationRelationId, RowExclusiveLock);
+
+	reltup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(OIDNewHeap));
+	if (!HeapTupleIsValid(reltup))
+		elog(ERROR, "cache lookup failed for relation %u", OIDNewHeap);
+	relform = (Form_pg_class) GETSTRUCT(reltup);
+
+	relform->relpages = num_pages;
+	relform->reltuples = num_tuples;
+
+	/* Don't update the stats for pg_class.  See swap_relation_files. */
+	if (OIDOldHeap != RelationRelationId)
+	{
+		simple_heap_update(relRelation, &reltup->t_self, reltup);
+
+		/* keep the catalog indexes up to date */
+		CatalogUpdateIndexes(relRelation, reltup);
+	}
+	else
+		CacheInvalidateRelcacheByTuple(reltup);
+
+	/* Clean up. */
+	heap_freetuple(reltup);
+	heap_close(relRelation, RowExclusiveLock);
+
+	/* Make the update visible */
+	CommandCounterIncrement();
+}
+
+/*
+ * Change dependency links for objects that are being swapped.
+ *
+ * 'tabletype' can be "TOAST table", "aoseg", "aoblkdir".
+ * It is used for printing error messages.
+ */
+static void
+changeDependencyLinks(Oid baseOid1, Oid baseOid2, Oid oid1, Oid oid2,
+					  const char *tabletype)
+{
+	ObjectAddress baseobject, newobject;
+	long		count;
+
+	/* Delete old dependencies */
+	if (oid1)
+	{
+		count = deleteDependencyRecordsFor(RelationRelationId, oid1, false);
+		if (count != 1)
+			elog(ERROR, "expected one dependency record for %s table, found %ld",
+				 tabletype, count);
+	}
+	
+	if (oid2)
+	{
+		count = deleteDependencyRecordsFor(RelationRelationId, oid2, false);
+		if (count != 1)
+			elog(ERROR, "expected one dependency record for %s table, found %ld",
+				 tabletype, count);
+	}
+
+	/* Register new dependencies */
+	baseobject.classId = RelationRelationId;
+	baseobject.objectSubId = 0;
+	newobject.classId = RelationRelationId;
+	newobject.objectSubId = 0;
+	
+	if (oid1)
+	{
+		baseobject.objectId = baseOid1;
+		newobject.objectId = oid1;
+		recordDependencyOn(&newobject, &baseobject, DEPENDENCY_INTERNAL);
+	}
+	
+	if (oid2)
+	{
+		baseobject.objectId = baseOid2;
+		newobject.objectId = oid2;
+		recordDependencyOn(&newobject, &baseobject, DEPENDENCY_INTERNAL);
+	}
 }
 
 /*
@@ -1129,16 +1284,20 @@ copy_heap_data(Oid OIDNewHeap, Oid OIDOldHeap, Oid OIDOldIndex, bool verbose,
  * Lastly, if r2 and its toast table and toast index (if any) are mapped,
  * their OIDs are emitted into mapped_tables[].  This is hacky but beats
  * having to look the information up again later in finish_heap_swap.
+ *
+ * GPDB: also swap aoseg, aoblkdir links.
  */
-static void
+void
 swap_relation_files(Oid r1, Oid r2, bool target_is_pg_class,
 					bool swap_toast_by_content,
+					bool swap_stats,
 					bool is_internal,
 					TransactionId frozenXid,
 					MultiXactId cutoffMulti,
 					Oid *mapped_tables)
 {
-	Relation	relRelation;
+	Relation	relRelation,
+				rel;
 	HeapTuple	reltup1,
 				reltup2;
 	Form_pg_class relform1,
@@ -1146,6 +1305,7 @@ swap_relation_files(Oid r1, Oid r2, bool target_is_pg_class,
 	Oid			relfilenode1,
 				relfilenode2;
 	Oid			swaptemp;
+	char		swapchar;
 	CatalogIndexState indstate;
 
 	/* We need writable copies of both pg_class tuples. */
@@ -1241,16 +1401,8 @@ swap_relation_files(Oid r1, Oid r2, bool target_is_pg_class,
 	 * and then fail to commit the pg_class update.
 	 */
 
-	/* set rel1's frozen Xid and minimum MultiXid */
-	if (relform1->relkind != RELKIND_INDEX)
-	{
-		Assert(TransactionIdIsNormal(frozenXid));
-		relform1->relfrozenxid = frozenXid;
-		Assert(MultiXactIdIsValid(cutoffMulti));
-		relform1->relminmxid = cutoffMulti;
-	}
-
 	/* swap size statistics too, since new rel has freshly-updated stats */
+	if (swap_stats)
 	{
 		int32		swap_pages;
 		float4		swap_tuples;
@@ -1267,6 +1419,32 @@ swap_relation_files(Oid r1, Oid r2, bool target_is_pg_class,
 		swap_allvisible = relform1->relallvisible;
 		relform1->relallvisible = relform2->relallvisible;
 		relform2->relallvisible = swap_allvisible;
+	}
+
+	/*
+	 * Swap relstorage so we will later know how to drop the temporary table with
+	 * the right Storage Manager (i.e. Buffer Pool or Append-Only).
+	 */
+	swapchar = relform1->relstorage;
+	relform1->relstorage = relform2->relstorage;
+	relform2->relstorage = swapchar;
+
+	/*
+	 * This needs to be performed after the relkind and relstorage has been
+	 * swapped to correctly reflect the relfrozenxid.
+	 */
+	if (TransactionIdIsValid(relform1->relfrozenxid))
+	{
+		Assert(TransactionIdIsNormal(frozenXid));
+		relform1->relfrozenxid = frozenXid;
+		Assert(MultiXactIdIsValid(cutoffMulti));
+		relform1->relminmxid = cutoffMulti;
+		/*
+		 * Don't know partition parent or not here but passing false is perfect
+		 * for assertion, as valid relfrozenxid means it shouldn't be parent.
+		 */
+		Assert(should_have_valid_relfrozenxid(relform1->relkind,
+											  relform1->relstorage, false));
 	}
 
 	/*
@@ -1320,6 +1498,7 @@ swap_relation_files(Oid r1, Oid r2, bool target_is_pg_class,
 									relform2->reltoastrelid,
 									target_is_pg_class,
 									swap_toast_by_content,
+									swap_stats,
 									is_internal,
 									frozenXid,
 									cutoffMulti,
@@ -1344,9 +1523,6 @@ swap_relation_files(Oid r1, Oid r2, bool target_is_pg_class,
 			 * something more selective than deleteDependencyRecordsFor() to
 			 * get rid of just the link we want.
 			 */
-			ObjectAddress baseobject,
-						toastobject;
-			long		count;
 
 			/*
 			 * We disallow this case for system catalogs, to avoid the
@@ -1358,46 +1534,9 @@ swap_relation_files(Oid r1, Oid r2, bool target_is_pg_class,
 				elog(ERROR, "cannot swap toast files by links for system catalogs");
 
 			/* Delete old dependencies */
-			if (relform1->reltoastrelid)
-			{
-				count = deleteDependencyRecordsFor(RelationRelationId,
-												   relform1->reltoastrelid,
-												   false);
-				if (count != 1)
-					elog(ERROR, "expected one dependency record for TOAST table, found %ld",
-						 count);
-			}
-			if (relform2->reltoastrelid)
-			{
-				count = deleteDependencyRecordsFor(RelationRelationId,
-												   relform2->reltoastrelid,
-												   false);
-				if (count != 1)
-					elog(ERROR, "expected one dependency record for TOAST table, found %ld",
-						 count);
-			}
-
-			/* Register new dependencies */
-			baseobject.classId = RelationRelationId;
-			baseobject.objectSubId = 0;
-			toastobject.classId = RelationRelationId;
-			toastobject.objectSubId = 0;
-
-			if (relform1->reltoastrelid)
-			{
-				baseobject.objectId = r1;
-				toastobject.objectId = relform1->reltoastrelid;
-				recordDependencyOn(&toastobject, &baseobject,
-								   DEPENDENCY_INTERNAL);
-			}
-
-			if (relform2->reltoastrelid)
-			{
-				baseobject.objectId = r2;
-				toastobject.objectId = relform2->reltoastrelid;
-				recordDependencyOn(&toastobject, &baseobject,
-								   DEPENDENCY_INTERNAL);
-			}
+			changeDependencyLinks(r1, r2,
+								  relform1->reltoastrelid, relform2->reltoastrelid,
+								  "TOAST");
 		}
 	}
 
@@ -1423,12 +1562,25 @@ swap_relation_files(Oid r1, Oid r2, bool target_is_pg_class,
 							toastIndex2,
 							target_is_pg_class,
 							swap_toast_by_content,
+							swap_stats,
 							is_internal,
 							InvalidTransactionId,
 							InvalidMultiXactId,
 							mapped_tables);
 	}
 
+	/* Send statistics from QE to QD */
+	if (Gp_role == GP_ROLE_EXECUTE && swap_stats && !IsSystemClass(r1, relform1))
+	{
+		rel = relation_open(r1, AccessShareLock);
+
+		vac_send_relstats_to_qd(rel,
+								relform1->relpages,
+								relform1->reltuples,
+								relform1->relallvisible);
+
+		relation_close(rel, AccessShareLock);
+	}
 	/* Clean up. */
 	heap_freetuple(reltup1);
 	heap_freetuple(reltup2);
@@ -1463,6 +1615,7 @@ void
 finish_heap_swap(Oid OIDOldHeap, Oid OIDNewHeap,
 				 bool is_system_catalog,
 				 bool swap_toast_by_content,
+				 bool swap_stats,
 				 bool check_constraints,
 				 bool is_internal,
 				 TransactionId frozenXid,
@@ -1482,7 +1635,9 @@ finish_heap_swap(Oid OIDOldHeap, Oid OIDNewHeap,
 	 */
 	swap_relation_files(OIDOldHeap, OIDNewHeap,
 						(OIDOldHeap == RelationRelationId),
-						swap_toast_by_content, is_internal,
+						swap_toast_by_content,
+						swap_stats,
+						is_internal,
 						frozenXid, cutoffMulti, mapped_tables);
 
 	/*

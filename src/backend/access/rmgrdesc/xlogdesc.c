@@ -20,6 +20,9 @@
 #include "utils/guc.h"
 #include "utils/timestamp.h"
 
+#include "access/twophase.h"
+#include "cdb/cdbpublic.h"
+
 /*
  * GUC support
  */
@@ -32,17 +35,66 @@ const struct config_enum_entry wal_level_options[] = {
 };
 
 void
-xlog_desc(StringInfo buf, uint8 xl_info, char *rec)
+UnpackCheckPointRecord(XLogRecord *record, CheckpointExtendedRecord *ckptExtended)
 {
-	uint8		info = xl_info & ~XLR_INFO_MASK;
+	char *current_record_ptr;
+	int remainderLen;
+
+	if (record->xl_len == sizeof(CheckPoint))
+	{
+		/* Special (for bootstrap, xlog switch, maybe others) */
+		ckptExtended->dtxCheckpoint = NULL;
+		ckptExtended->dtxCheckpointLen = 0;
+		ckptExtended->ptas = NULL;
+		return;
+	}
+
+	/* Normal checkpoint Record */
+	Assert(record->xl_len > sizeof(CheckPoint));
+
+	current_record_ptr = ((char*)XLogRecGetData(record)) + sizeof(CheckPoint);
+	remainderLen = record->xl_len - sizeof(CheckPoint);
+
+	/* Start of distributed transaction information */
+	ckptExtended->dtxCheckpoint = (TMGXACT_CHECKPOINT *)current_record_ptr;
+	ckptExtended->dtxCheckpointLen =
+		TMGXACT_CHECKPOINT_BYTES((ckptExtended->dtxCheckpoint)->committedCount);
+
+	/*
+	 * The master prepared transaction aggregate state (ptas) will be skipped
+	 * when gp_before_filespace_setup is ON.
+	 */
+	if (remainderLen > ckptExtended->dtxCheckpointLen)
+	{
+		current_record_ptr = current_record_ptr + ckptExtended->dtxCheckpointLen;
+		remainderLen -= ckptExtended->dtxCheckpointLen;
+
+		/* Finally, point to prepared transaction information */
+		ckptExtended->ptas = (prepared_transaction_agg_state *) current_record_ptr;
+		Assert(remainderLen == PREPARED_TRANSACTION_CHECKPOINT_BYTES(ckptExtended->ptas->count));
+	}
+	else
+	{
+		Assert(remainderLen == ckptExtended->dtxCheckpointLen);
+		ckptExtended->ptas = NULL;
+	}
+}
+
+void
+xlog_desc(StringInfo buf, XLogRecord *record)
+{
+	uint8		info = record->xl_info & ~XLR_INFO_MASK;
+	char		*rec = XLogRecGetData(record);
 
 	if (info == XLOG_CHECKPOINT_SHUTDOWN ||
 		info == XLOG_CHECKPOINT_ONLINE)
 	{
 		CheckPoint *checkpoint = (CheckPoint *) rec;
 
+		CheckpointExtendedRecord ckptExtended;
+
 		appendStringInfo(buf, "checkpoint: redo %X/%X; "
-						 "tli %u; prev tli %u; fpw %s; xid %u/%u; oid %u; multi %u; offset %u; "
+						 "tli %u; prev tli %u; fpw %s; xid %u/%u; oid %u; relfilenode %u; multi %u; offset %u; "
 						 "oldest xid %u in DB %u; oldest multi %u in DB %u; "
 						 "oldest running xid %u; %s",
 				(uint32) (checkpoint->redo >> 32), (uint32) checkpoint->redo,
@@ -51,6 +103,7 @@ xlog_desc(StringInfo buf, uint8 xl_info, char *rec)
 						 checkpoint->fullPageWrites ? "true" : "false",
 						 checkpoint->nextXidEpoch, checkpoint->nextXid,
 						 checkpoint->nextOid,
+						 checkpoint->nextRelfilenode,
 						 checkpoint->nextMulti,
 						 checkpoint->nextMultiOffset,
 						 checkpoint->oldestXid,
@@ -59,6 +112,21 @@ xlog_desc(StringInfo buf, uint8 xl_info, char *rec)
 						 checkpoint->oldestMultiDB,
 						 checkpoint->oldestActiveXid,
 				 (info == XLOG_CHECKPOINT_SHUTDOWN) ? "shutdown" : "online");
+
+		UnpackCheckPointRecord(record, &ckptExtended);
+
+		if (ckptExtended.dtxCheckpointLen > 0)
+		{
+			appendStringInfo(buf,
+				 ", checkpoint record data length = %u, DTX committed count %d, DTX data length %u",
+							 record->xl_len,
+							 ckptExtended.dtxCheckpoint->committedCount,
+							 ckptExtended.dtxCheckpointLen);
+			if (ckptExtended.ptas != NULL)
+				appendStringInfo(buf,
+								 ", prepared transaction agg state count = %d",
+								 ckptExtended.ptas->count);
+		}
 	}
 	else if (info == XLOG_NOOP)
 	{
@@ -70,6 +138,13 @@ xlog_desc(StringInfo buf, uint8 xl_info, char *rec)
 
 		memcpy(&nextOid, rec, sizeof(Oid));
 		appendStringInfo(buf, "nextOid: %u", nextOid);
+	}
+	else if (info == XLOG_NEXTRELFILENODE)
+	{
+		Oid			nextRelfilenode;
+
+		memcpy(&nextRelfilenode, rec, sizeof(Oid));
+		appendStringInfo(buf, "nextRelfilenode: %u", nextRelfilenode);
 	}
 	else if (info == XLOG_SWITCH)
 	{
