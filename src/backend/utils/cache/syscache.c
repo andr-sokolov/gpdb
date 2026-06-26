@@ -3,6 +3,8 @@
  * syscache.c
  *	  System cache management routines
  *
+ * Portions Copyright (c) 2007-2010, Greenplum inc
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -20,6 +22,9 @@
  */
 #include "postgres.h"
 
+#include "miscadmin.h"
+
+#include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/sysattr.h"
 #include "catalog/indexing.h"
@@ -47,6 +52,8 @@
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_opfamily.h"
+#include "catalog/pg_partition.h"
+#include "catalog/pg_partition_rule.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_range.h"
 #include "catalog/pg_rewrite.h"
@@ -63,6 +70,8 @@
 #include "catalog/pg_ts_template.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_user_mapping.h"
+#include "catalog/pg_resgroup.h"
+#include "catalog/pg_extprotocol.h"
 #include "utils/rel.h"
 #include "utils/catcache.h"
 #include "utils/syscache.h"
@@ -245,8 +254,7 @@ static const struct cachedesc cacheinfo[] = {
 		},
 		8
 	},
-	{
-		CastRelationId,			/* CASTSOURCETARGET */
+	{CastRelationId,			/* CASTSOURCETARGET */
 		CastSourceTargetIndexId,
 		2,
 		{
@@ -308,7 +316,7 @@ static const struct cachedesc cacheinfo[] = {
 			Anum_pg_conversion_connamespace,
 			Anum_pg_conversion_conforencoding,
 			Anum_pg_conversion_contoencoding,
-			ObjectIdAttributeNumber,
+			ObjectIdAttributeNumber
 		},
 		8
 	},
@@ -411,6 +419,28 @@ static const struct cachedesc cacheinfo[] = {
 		},
 		8
 	},
+	{ExtprotocolRelationId,		/* EXTPROTOCOLOID */
+		ExtprotocolOidIndexId,
+		1,
+		{
+			ObjectIdAttributeNumber,
+			0,
+			0,
+			0
+		},
+		128
+	},
+	{ExtprotocolRelationId,		/* EXTPROTOCOLNAME */
+		ExtprotocolPtcnameIndexId,
+		1,
+		{
+			Anum_pg_extprotocol_ptcname,
+			0,
+			0,
+			0
+		},
+		128
+	},
 	{ForeignDataWrapperRelationId,		/* FOREIGNDATAWRAPPERNAME */
 		ForeignDataWrapperNameIndexId,
 		1,
@@ -465,6 +495,17 @@ static const struct cachedesc cacheinfo[] = {
 			0
 		},
 		4
+	},
+	{GpPolicyRelationId,	/* GPPOLICYID */
+		GpPolicyLocalOidIndexId,
+		1,
+		{
+			Anum_gp_policy_localoid,
+			0,
+			0,
+			0
+		},
+		1024
 	},
 	{IndexRelationId,			/* INDEXRELID */
 		IndexRelidIndexId,
@@ -565,6 +606,28 @@ static const struct cachedesc cacheinfo[] = {
 		},
 		8
 	},
+	{PartitionRelationId,		/* PARTOID */
+		PartitionOidIndexId,
+		1,
+		{
+			ObjectIdAttributeNumber,
+			0,
+			0,
+			0
+		},
+		1024
+	},
+	{PartitionRuleRelationId,	/* PARTRULEOID */
+		PartitionRuleOidIndexId,
+		1,
+		{
+			ObjectIdAttributeNumber,
+			0,
+			0,
+			0
+		},
+		256
+	},
 	{ProcedureRelationId,		/* PROCNAMEARGSNSP */
 		ProcedureNameArgsNspIndexId,
 		3,
@@ -614,6 +677,28 @@ static const struct cachedesc cacheinfo[] = {
 		1,
 		{
 			ObjectIdAttributeNumber,
+			0,
+			0,
+			0
+		},
+		128
+	},
+	{ResGroupRelationId,		/* RESGROUPOID */
+		ResGroupOidIndexId,
+		1,
+		{
+			ObjectIdAttributeNumber,
+			0,
+			0,
+			0
+		},
+		128
+	},
+	{ResGroupRelationId,		/* RESGROUPNAME */
+		ResGroupRsgnameIndexId,
+		1,
+		{
+			Anum_pg_resgroup_rsgname,
 			0,
 			0,
 			0

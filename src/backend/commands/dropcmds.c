@@ -27,6 +27,7 @@
 #include "parser/parse_type.h"
 #include "utils/builtins.h"
 #include "utils/syscache.h"
+#include "cdb/cdbvars.h"
 
 
 static void does_not_exist_skipping(ObjectType objtype,
@@ -408,13 +409,20 @@ does_not_exist_skipping(ObjectType objtype, List *objname, List *objargs)
 				args = strVal(linitial(objargs));
 			}
 			break;
+		case OBJECT_EXTPROTOCOL:
+			msg = gettext_noop("protocol \"%s\" does not exist, skipping");
+			name = NameListToString(objname);
+			break;
 		default:
 			elog(ERROR, "unexpected object type (%d)", (int) objtype);
 			break;
 	}
 
-	if (!args)
-		ereport(NOTICE, (errmsg(msg, name)));
-	else
-		ereport(NOTICE, (errmsg(msg, name, args)));
+	if (Gp_role != GP_ROLE_EXECUTE)
+	{
+		if (!args)
+			ereport(NOTICE, (errmsg(msg, name)));
+		else
+			ereport(NOTICE, (errmsg(msg, name, args)));
+	}
 }

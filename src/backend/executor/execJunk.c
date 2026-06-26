@@ -275,8 +275,8 @@ ExecFilterJunk(JunkFilter *junkfilter, TupleTableSlot *slot)
 	 * Extract all the values of the old tuple.
 	 */
 	slot_getallattrs(slot);
-	old_values = slot->tts_values;
-	old_isnull = slot->tts_isnull;
+	old_values = slot_get_values(slot); 
+	old_isnull = slot_get_isnull(slot);
 
 	/*
 	 * get info from the junk filter
@@ -290,8 +290,8 @@ ExecFilterJunk(JunkFilter *junkfilter, TupleTableSlot *slot)
 	 * Prepare to build a virtual result tuple.
 	 */
 	ExecClearTuple(resultSlot);
-	values = resultSlot->tts_values;
-	isnull = resultSlot->tts_isnull;
+	values = slot_get_values(resultSlot); 
+	isnull = slot_get_isnull(resultSlot); 
 
 	/*
 	 * Transpose data into proper fields of the new tuple.

@@ -4,6 +4,8 @@
  * bootparse.y
  *	  yacc grammar for the "bootstrap" mode (BKI file format)
  *
+ * Portions Copyright (c) 2006-2009, Greenplum inc
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -31,7 +33,9 @@
 #include "catalog/pg_am.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_authid.h"
+#include "catalog/pg_auth_members.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_database.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/toasting.h"
@@ -54,6 +58,16 @@
 
 #define atooid(x)	((Oid) strtoul((x), NULL, 10))
 
+/*
+ * Bison doesn't allocate anything that needs to live across parser calls,
+ * so we can easily have it use palloc instead of malloc.  This prevents
+ * memory leaks if we error out during parsing.  Note this only works with
+ * bison >= 2.0.  However, in bison 1.875 the default is to use alloca()
+ * if possible, so there's not really much problem anyhow, at least if
+ * you're building with gcc.
+ */
+#define YYMALLOC palloc
+#define YYFREE   pfree
 
 /*
  * Bison doesn't allocate anything that needs to live across parser calls,
@@ -220,8 +234,10 @@ Boot_CreateStmt:
 												   $3,
 												   InvalidOid,
 												   tupdesc,
+												   /* relam */ InvalidOid,
 												   RELKIND_RELATION,
 												   RELPERSISTENCE_PERMANENT,
+												   RELSTORAGE_HEAP,
 												   shared_relation,
 												   mapped_relation,
 												   true);
@@ -240,18 +256,24 @@ Boot_CreateStmt:
 													  BOOTSTRAP_SUPERUSERID,
 													  tupdesc,
 													  NIL,
+													  /* relam */ InvalidOid,
 													  RELKIND_RELATION,
 													  RELPERSISTENCE_PERMANENT,
+													  RELSTORAGE_HEAP,
 													  shared_relation,
 													  mapped_relation,
 													  true,
 													  0,
 													  ONCOMMIT_NOOP,
+													  NULL,			/*CDB*/
 													  (Datum) 0,
 													  false,
 													  true,
-													  false);
-						elog(DEBUG4, "relation created with OID %u", id);
+													  false,
+													  /* valid_opts */ false,
+													  /* is_part_child */ false,
+													  /* is_part_parent */ false);
+						elog(DEBUG4, "relation created with oid %u", id);
 					}
 					do_end();
 				}

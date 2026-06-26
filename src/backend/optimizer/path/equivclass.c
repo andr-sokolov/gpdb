@@ -1982,8 +1982,7 @@ add_child_rel_equivalences(PlannerInfo *root,
 				Relids		new_nullable_relids;
 
 				child_expr = (Expr *)
-					adjust_appendrel_attrs(root,
-										   (Node *) cur_em->em_expr,
+					adjust_appendrel_attrs(root, (Node *) cur_em->em_expr,
 										   appinfo);
 
 				/*

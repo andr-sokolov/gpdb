@@ -37,6 +37,9 @@ CATALOG(pg_largeobject,2613) BKI_WITHOUT_OIDS
 	bytea		data;			/* Data for page (may be zero-length) */
 } FormData_pg_largeobject;
 
+/* GPDB added foreign key definitions for gpcheckcat. */
+/* none */
+
 /* ----------------
  *		Form_pg_largeobject corresponds to a pointer to a tuple with
  *		the format of pg_largeobject relation.

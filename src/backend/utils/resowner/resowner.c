@@ -21,10 +21,14 @@
 #include "postgres.h"
 
 #include "access/hash.h"
+#include "cdb/cdbvars.h"
+#include "storage/bufmgr.h"
 #include "storage/predicate.h"
 #include "storage/proc.h"
+#include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/resource_manager.h"
 #include "utils/resowner_private.h"
 #include "utils/snapmgr.h"
 
@@ -206,6 +210,15 @@ ResourceOwnerRelease(ResourceOwner owner,
 	/* Rather than PG_TRY at every level of recursion, set it up once */
 	ResourceOwner save;
 
+	/*
+	 * Greenplum: For some reason we've been calling this when the owner is NULL.
+	 */
+	if (owner == NULL)
+	{
+		elogif(Debug_print_full_dtm, LOG, "ResourceOwnerRelease found owner = NULL");
+		return;
+	}
+
 	save = CurrentResourceOwner;
 	PG_TRY();
 	{
@@ -228,7 +241,7 @@ ResourceOwnerReleaseInternal(ResourceOwner owner,
 {
 	ResourceOwner child;
 	ResourceOwner save;
-	ResourceReleaseCallbackItem *item;
+	ResourceReleaseCallbackItem *item, *next;
 
 	/* Recurse to handle descendants */
 	for (child = owner->firstchild; child != NULL; child = child->nextchild)
@@ -306,6 +319,9 @@ ResourceOwnerReleaseInternal(ResourceOwner owner,
 			{
 				ProcReleaseLocks(isCommit);
 				ReleasePredicateLocks(isCommit);
+				
+				if (Gp_role == GP_ROLE_DISPATCH && IsResQueueEnabled())
+ 					ResLockWaitCancel();
 			}
 		}
 		else
@@ -354,14 +370,16 @@ ResourceOwnerReleaseInternal(ResourceOwner owner,
 		while (owner->ncatrefs > 0)
 		{
 			if (isCommit)
-				PrintCatCacheLeakWarning(owner->catrefs[owner->ncatrefs - 1]);
+				PrintCatCacheLeakWarning(owner->catrefs[owner->ncatrefs - 1],
+                                         owner->name);
 			ReleaseCatCache(owner->catrefs[owner->ncatrefs - 1]);
 		}
 		/* Ditto for catcache lists */
 		while (owner->ncatlistrefs > 0)
 		{
 			if (isCommit)
-				PrintCatCacheListLeakWarning(owner->catlistrefs[owner->ncatlistrefs - 1]);
+				PrintCatCacheListLeakWarning(owner->catlistrefs[owner->ncatlistrefs - 1],
+                                             owner->name);
 			ReleaseCatCacheList(owner->catlistrefs[owner->ncatlistrefs - 1]);
 		}
 		/* Ditto for plancache references */
@@ -399,8 +417,11 @@ ResourceOwnerReleaseInternal(ResourceOwner owner,
 	}
 
 	/* Let add-on modules get a chance too */
-	for (item = ResourceRelease_callbacks; item; item = item->next)
+	for (item = ResourceRelease_callbacks; item; item = next)
+	{
+		next = item->next;
 		(*item->callback) (phase, isCommit, isTopLevel, item->arg);
+	}
 
 	CurrentResourceOwner = save;
 }
@@ -1338,4 +1359,22 @@ PrintDSMLeakWarning(dsm_segment *seg)
 	elog(WARNING,
 		 "dynamic shared memory leak: segment %u still referenced",
 		 dsm_segment_handle(seg));
+}
+
+/*
+ * Cdb: walk through a resource owner and it's childrens
+ */
+void
+CdbResourceOwnerWalker(ResourceOwner owner, ResourceWalkerCallback callback)
+{
+	ResourceOwner child;
+
+	if (!owner)
+		return;
+
+	(*callback)(owner);
+
+	/* Recurse to handle descendants */
+	for (child = owner->firstchild; child != NULL; child = child->nextchild)
+		CdbResourceOwnerWalker(child, callback);
 }

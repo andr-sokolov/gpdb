@@ -15,6 +15,9 @@
 
 #include "access/htup.h"
 #include "storage/buf.h"
+#include "utils/rel.h"
+
+#include "cdb/cdbdistributedsnapshot.h"  /* DistributedSnapshotWithLocalMapping */
 
 
 typedef struct SnapshotData *Snapshot;
@@ -27,7 +30,7 @@ typedef struct SnapshotData *Snapshot;
  * The specific semantics of a snapshot are encoded by the "satisfies"
  * function.
  */
-typedef bool (*SnapshotSatisfiesFunc) (HeapTuple htup,
+typedef bool (*SnapshotSatisfiesFunc) (Relation relation, HeapTuple htup,
 										   Snapshot snapshot, Buffer buffer);
 
 /*
@@ -84,6 +87,7 @@ typedef struct SnapshotData
 	bool		suboverflowed;	/* has the subxip array overflowed? */
 	bool		takenDuringRecovery;	/* recovery-shaped snapshot? */
 	bool		copied;			/* false if it's a static snapshot */
+	bool		haveDistribSnapshot; /* True if this snapshot is distributed. */
 
 	/*
 	 * note: all ids in subxip[] are >= xmin, but we don't bother filtering
@@ -92,6 +96,13 @@ typedef struct SnapshotData
 	CommandId	curcid;			/* in my xact, CID < curcid are visible */
 	uint32		active_count;	/* refcount on ActiveSnapshot stack */
 	uint32		regd_count;		/* refcount on RegisteredSnapshotList */
+
+	/*
+	 * GP: Global information about which transactions are visible for a
+	 * distributed transaction, with cached local xids
+	 */
+	DistributedSnapshotWithLocalMapping	distribSnapshotWithLocalMapping;
+
 } SnapshotData;
 
 /*

@@ -33,6 +33,8 @@ typedef enum
 	PROCSIG_NOTIFY_INTERRUPT,	/* listen/notify interrupt */
 	PROCSIG_WALSND_INIT_STOPPING,	/* ask walsenders to prepare for shutdown  */
 
+	PROCSIG_QUERY_FINISH,		/* query finish */
+
 	/* Recovery conflict reasons */
 	PROCSIG_RECOVERY_CONFLICT_DATABASE,
 	PROCSIG_RECOVERY_CONFLICT_TABLESPACE,
@@ -40,7 +42,7 @@ typedef enum
 	PROCSIG_RECOVERY_CONFLICT_SNAPSHOT,
 	PROCSIG_RECOVERY_CONFLICT_BUFFERPIN,
 	PROCSIG_RECOVERY_CONFLICT_STARTUP_DEADLOCK,
-
+	PROCSIG_RESOURCE_GROUP_MOVE_QUERY,	/* move query to a new resource group */
 	NUM_PROCSIGNALS				/* Must be last! */
 } ProcSignalReason;
 
@@ -56,5 +58,6 @@ extern int SendProcSignal(pid_t pid, ProcSignalReason reason,
 
 extern void procsignal_sigusr1_handler(SIGNAL_ARGS);
 extern PGDLLIMPORT bool set_latch_on_sigusr1;
+extern bool AmIInSIGUSR1Handler(void);
 
 #endif   /* PROCSIGNAL_H */

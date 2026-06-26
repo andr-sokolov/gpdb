@@ -14,6 +14,7 @@
 #ifndef TYPECMDS_H
 #define TYPECMDS_H
 
+#include "catalog/dependency.h"
 #include "access/htup.h"
 #include "catalog/dependency.h"
 #include "nodes/parsenodes.h"
@@ -51,5 +52,8 @@ extern Oid AlterTypeNamespaceInternal(Oid typeOid, Oid nspOid,
 						   bool isImplicitArray,
 						   bool errorOnTableType,
 						   ObjectAddresses *objsMoved);
+extern void AlterTypeArray(Oid typeOid, Oid arrayOid);
+
+extern void AlterType(AlterTypeStmt *stmt);
 
 #endif   /* TYPECMDS_H */

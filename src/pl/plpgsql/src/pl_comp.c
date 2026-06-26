@@ -32,6 +32,8 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
+#include "cdb/cdbvars.h"
+#include "parser/parser.h"
 
 /* ----------
  * Our own local and global variables
@@ -451,14 +453,33 @@ do_compile(FunctionCallInfo fcinfo,
 				}
 
 				/* Remember arguments in appropriate arrays */
-				if (argmode == PROARGMODE_IN ||
-					argmode == PROARGMODE_INOUT ||
-					argmode == PROARGMODE_VARIADIC)
-					in_arg_varnos[num_in_args++] = argvariable->dno;
-				if (argmode == PROARGMODE_OUT ||
-					argmode == PROARGMODE_INOUT ||
-					argmode == PROARGMODE_TABLE)
-					out_arg_variables[num_out_args++] = argvariable;
+				switch (argmode)
+				{
+					/* input modes */
+					case PROARGMODE_IN:
+					case PROARGMODE_VARIADIC:
+						in_arg_varnos[num_in_args++] = argvariable->dno;
+						break;
+
+					/* output modes */
+					case PROARGMODE_OUT:
+					case PROARGMODE_TABLE:
+						out_arg_variables[num_out_args++] = argvariable;
+						break;
+
+					/* both */
+					case PROARGMODE_INOUT:
+						in_arg_varnos[num_in_args++] = argvariable->dno;
+						out_arg_variables[num_out_args++] = argvariable;
+						break;
+
+					default:
+						ereport(ERROR, 
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("plpgsql functions do not support argmode '%c'",
+										argmode)));
+						break;								 
+				}
 
 				/* Add to namespace under the $n name */
 				add_parameter_name(argitemtype, argvariable->dno, buf);
@@ -736,7 +757,33 @@ do_compile(FunctionCallInfo fcinfo,
 	/*
 	 * Now parse the function's text
 	 */
-	parse_rc = plpgsql_yyparse();
+	/*
+	 * In GPDB, temporarily disable escape_string_warning, if we're in a QE
+	 * node. When we're parsing a PL/pgSQL function, e.g. in a CREATE FUNCTION
+	 * command, you should've gotten the same warning from the QD node already.
+	 * We could probably disable the warning in QE nodes altogether, not just
+	 * in PL/pgSQL, but it can be useful for catching escaping bugs, when
+	 * internal queries are dispatched from QD to QEs.
+	 */
+	bool            save_escape_string_warning = escape_string_warning;
+	PG_TRY();
+	{
+		if (Gp_role == GP_ROLE_EXECUTE)
+			escape_string_warning = false;
+
+		parse_rc = plpgsql_yyparse();
+
+		if (Gp_role == GP_ROLE_EXECUTE)
+			escape_string_warning = save_escape_string_warning;
+	}
+	PG_CATCH();
+	{
+		if (Gp_role == GP_ROLE_EXECUTE)
+			escape_string_warning = save_escape_string_warning;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
 	if (parse_rc != 0)
 		elog(ERROR, "plpgsql parser returned %d", parse_rc);
 	function->action = plpgsql_parse_result;
