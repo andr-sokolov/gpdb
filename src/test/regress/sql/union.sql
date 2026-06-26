@@ -131,7 +131,7 @@ SELECT q1 FROM int8_tbl INTERSECT (((SELECT q2 FROM int8_tbl UNION ALL SELECT q2
 
 SELECT q1 FROM int8_tbl UNION ALL SELECT q2 FROM int8_tbl EXCEPT SELECT q1 FROM int8_tbl ORDER BY 1;
 
-SELECT q1 FROM int8_tbl UNION ALL (((SELECT q2 FROM int8_tbl EXCEPT SELECT q1 FROM int8_tbl ORDER BY 1)));
+SELECT q1 FROM int8_tbl UNION ALL (((SELECT q2 FROM int8_tbl EXCEPT SELECT q1 FROM int8_tbl ORDER BY 1))); --order none
 
 (((SELECT q1 FROM int8_tbl UNION ALL SELECT q2 FROM int8_tbl))) EXCEPT SELECT q1 FROM int8_tbl ORDER BY 1;
 
@@ -147,7 +147,7 @@ ORDER BY q2,q1;
 SELECT q1 FROM int8_tbl EXCEPT SELECT q2 FROM int8_tbl ORDER BY q2 LIMIT 1;
 
 -- But this should work:
-SELECT q1 FROM int8_tbl EXCEPT (((SELECT q2 FROM int8_tbl ORDER BY q2 LIMIT 1)));
+SELECT q1 FROM int8_tbl EXCEPT (((SELECT q2 FROM int8_tbl ORDER BY q2 LIMIT 1))) ORDER BY 1;
 
 --
 -- New syntaxes (7.1) permit new tests
@@ -213,6 +213,8 @@ CREATE INDEX t1c_ab_idx on t1c ((a || b));
 set enable_seqscan = on;
 set enable_indexonlyscan = off;
 
+-- NOTE: GPDB planner chooses a seqscan rather than indexscan for t1.
+-- This is a side-effect of disabling pull-up for simple union all in GPDB.
 explain (costs off)
   SELECT * FROM
   (SELECT a || b AS ab FROM t1

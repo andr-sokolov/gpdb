@@ -140,10 +140,20 @@ LogicalDecodingProcessRecord(LogicalDecodingContext *ctx, XLogRecord *record)
 		case RM_GIST_ID:
 		case RM_SEQ_ID:
 		case RM_SPGIST_ID:
+		case RM_BITMAP_ID:
+		case RM_DISTRIBUTEDLOG_ID:
 			/* just deal with xid, and done */
 			ReorderBufferProcessXid(ctx->reorder, record->xl_xid,
 									buf.origptr);
 			break;
+
+		case RM_APPEND_ONLY_ID:
+			/*
+			 * GPDB_94_MERGE_FIXME: logical decoding hasn't been implemented for
+			 * append-only tables yet.
+			 */
+			break;
+
 		case RM_NEXT_ID:
 			elog(ERROR, "unexpected RM_NEXT_ID rmgr_id: %u", (RmgrIds) buf.record.xl_rmid);
 	}
@@ -851,7 +861,9 @@ DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 			 * We can only figure this out after reassembling the
 			 * transactions.
 			 */
+#if 0
 			tuple->tuple.t_tableOid = InvalidOid;
+#endif
 
 			tuple->tuple.t_len = datalen
 				+ offsetof(HeapTupleHeaderData, t_bits);
@@ -907,7 +919,9 @@ DecodeXLogTuple(char *data, Size len, ReorderBufferTupleBuf *tuple)
 	ItemPointerSetInvalid(&tuple->tuple.t_self);
 
 	/* we can only figure this out after reassembling the transactions */
+#if 0
 	tuple->tuple.t_tableOid = InvalidOid;
+#endif
 
 	/* data is not stored aligned, copy to aligned storage */
 	memcpy((char *) &xlhdr,

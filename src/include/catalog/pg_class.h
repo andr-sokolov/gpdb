@@ -22,8 +22,9 @@
 #include "catalog/genbki.h"
 
 /* ----------------
- *		pg_class definition.  cpp turns this into
- *		typedef struct FormData_pg_class
+ *		postgres.h contains the system type definitions and the
+ *		CATALOG(), BKI_BOOTSTRAP and DATA() sugar words so this file
+ *		can be read by both genbki.sh and the C compiler.
  * ----------------
  */
 #define RelationRelationId	1259
@@ -52,6 +53,7 @@ CATALOG(pg_class,1259) BKI_BOOTSTRAP BKI_ROWTYPE_OID(83) BKI_SCHEMA_MACRO
 	bool		relisshared;	/* T if shared across databases */
 	char		relpersistence; /* see RELPERSISTENCE_xxx constants below */
 	char		relkind;		/* see RELKIND_xxx constants below */
+	char		relstorage;		/* see RELSTORAGE_xxx constants below */
 	int16		relnatts;		/* number of user attributes */
 
 	/*
@@ -78,6 +80,14 @@ CATALOG(pg_class,1259) BKI_BOOTSTRAP BKI_ROWTYPE_OID(83) BKI_SCHEMA_MACRO
 #endif
 } FormData_pg_class;
 
+/* GPDB added foreign key definitions for gpcheckcat. */
+FOREIGN_KEY(relnamespace REFERENCES pg_namespace(oid));
+FOREIGN_KEY(reltype REFERENCES pg_type(oid));
+FOREIGN_KEY(relowner REFERENCES pg_authid(oid));
+FOREIGN_KEY(relam REFERENCES pg_am(oid));
+FOREIGN_KEY(reltablespace REFERENCES pg_tablespace(oid));
+FOREIGN_KEY(reltoastrelid REFERENCES pg_class(oid));
+
 /* Size of fixed part of pg_class tuples, not counting var-length fields */
 #define CLASS_TUPLE_SIZE \
 	 (offsetof(FormData_pg_class,relminmxid) + sizeof(TransactionId))
@@ -94,7 +104,7 @@ typedef FormData_pg_class *Form_pg_class;
  * ----------------
  */
 
-#define Natts_pg_class					29
+#define Natts_pg_class					30
 #define Anum_pg_class_relname			1
 #define Anum_pg_class_relnamespace		2
 #define Anum_pg_class_reltype			3
@@ -111,19 +121,21 @@ typedef FormData_pg_class *Form_pg_class;
 #define Anum_pg_class_relisshared		14
 #define Anum_pg_class_relpersistence	15
 #define Anum_pg_class_relkind			16
-#define Anum_pg_class_relnatts			17
-#define Anum_pg_class_relchecks			18
-#define Anum_pg_class_relhasoids		19
-#define Anum_pg_class_relhaspkey		20
-#define Anum_pg_class_relhasrules		21
-#define Anum_pg_class_relhastriggers	22
-#define Anum_pg_class_relhassubclass	23
-#define Anum_pg_class_relispopulated	24
-#define Anum_pg_class_relreplident		25
-#define Anum_pg_class_relfrozenxid		26
-#define Anum_pg_class_relminmxid		27
-#define Anum_pg_class_relacl			28
-#define Anum_pg_class_reloptions		29
+#define Anum_pg_class_relstorage		17 /* GPDB specific */
+GPDB_COLUMN_DEFAULT(relstorage, h);
+#define Anum_pg_class_relnatts			18
+#define Anum_pg_class_relchecks			19
+#define Anum_pg_class_relhasoids		20
+#define Anum_pg_class_relhaspkey		21
+#define Anum_pg_class_relhasrules		22
+#define Anum_pg_class_relhastriggers	23
+#define Anum_pg_class_relhassubclass	24
+#define Anum_pg_class_relispopulated	25
+#define Anum_pg_class_relreplident		26
+#define Anum_pg_class_relfrozenxid		27
+#define Anum_pg_class_relminmxid		28
+#define Anum_pg_class_relacl			29
+#define Anum_pg_class_reloptions		30
 
 /* ----------------
  *		initial contents of pg_class
@@ -142,9 +154,9 @@ DATA(insert OID = 1247 (  pg_type		PGNSP 71 0 PGUID 0 0 0 0 0 0 0 f f p r 30 0 t
 DESCR("");
 DATA(insert OID = 1249 (  pg_attribute	PGNSP 75 0 PGUID 0 0 0 0 0 0 0 f f p r 21 0 f f f f f t n 3 1 _null_ _null_ ));
 DESCR("");
-DATA(insert OID = 1255 (  pg_proc		PGNSP 81 0 PGUID 0 0 0 0 0 0 0 f f p r 27 0 t f f f f t n 3 1 _null_ _null_ ));
+DATA(insert OID = 1255 (  pg_proc		PGNSP 81 0 PGUID 0 0 0 0 0 0 0 f f p r 29 0 t f f f f t n 3 1 _null_ _null_ ));
 DESCR("");
-DATA(insert OID = 1259 (  pg_class		PGNSP 83 0 PGUID 0 0 0 0 0 0 0 f f p r 29 0 t f f f f t n 3 1 _null_ _null_ ));
+DATA(insert OID = 1259 (  pg_class		PGNSP 83 0 PGUID 0 0 0 0 0 0 0 f f p r 30 0 t f f f f t n 3 1 _null_ _null_ ));
 DESCR("");
 
 
@@ -155,7 +167,11 @@ DESCR("");
 #define		  RELKIND_VIEW			  'v'		/* view */
 #define		  RELKIND_COMPOSITE_TYPE  'c'		/* composite type */
 #define		  RELKIND_FOREIGN_TABLE   'f'		/* foreign table */
+#define		  RELKIND_UNCATALOGED	  'u'		/* not yet cataloged */
 #define		  RELKIND_MATVIEW		  'm'		/* materialized view */
+#define		  RELKIND_AOSEGMENTS	  'o'		/* AO segment files and eof's */
+#define		  RELKIND_AOBLOCKDIR	  'b'		/* AO block directory */
+#define		  RELKIND_AOVISIMAP		  'M'		/* AO visibility map */
 
 #define		  RELPERSISTENCE_PERMANENT	'p'		/* regular table */
 #define		  RELPERSISTENCE_UNLOGGED	'u'		/* unlogged permanent table */
@@ -173,4 +189,44 @@ DESCR("");
  * has the same meaning as 'd'
  */
 #define		  REPLICA_IDENTITY_INDEX	'i'
+
+/*
+ * relstorage describes how a relkind is physically stored in the database.
+ *
+ * RELSTORAGE_HEAP    - stored on disk using heap storage.
+ * RELSTORAGE_AOROWS  - stored on disk using append only storage.
+ * RELSTORAGE_AOCOLS  - stored on dist using append only column storage.
+ * RELSTORAGE_VIRTUAL - has virtual storage, meaning, relation has no
+ *						data directly stored forit  (right now this
+ *						relates to views and comp types).
+ * RELSTORAGE_EXTERNAL-	stored externally using external tables.
+ * RELSTORAGE_FOREIGN - stored in another server.  
+ */
+#define		  RELSTORAGE_HEAP	'h'
+#define		  RELSTORAGE_AOROWS	'a'
+#define 	  RELSTORAGE_AOCOLS	'c'
+#define		  RELSTORAGE_VIRTUAL	'v'
+#define		  RELSTORAGE_EXTERNAL 'x'
+#define		  RELSTORAGE_FOREIGN 'f'
+
+static inline bool relstorage_is_heap(char c)
+{
+	return (c == RELSTORAGE_HEAP);
+}
+
+static inline bool relstorage_is_ao(char c)
+{
+	return (c == RELSTORAGE_AOROWS || c == RELSTORAGE_AOCOLS);
+}
+
+static inline bool relstorage_is_external(char c)
+{
+	return (c == RELSTORAGE_EXTERNAL);
+}
+
+static inline bool relstorage_is_foreign(char c)
+{
+	return (c == RELSTORAGE_FOREIGN);
+}
+
 #endif   /* PG_CLASS_H */

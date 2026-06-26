@@ -1,8 +1,10 @@
 -- money check
 
-CREATE TABLE moneytmp (a money) WITH OIDS;
+-- In PostgreSQL, this test uses WITH OIDS, but in GPDB, OIDs are not unique
+-- across segments, so use a 'serial' column instead.
+CREATE TABLE moneytmp (a money, oid serial);
 
-\copy moneytmp from 'data/cash.data'
+\copy moneytmp (a) from 'data/cash.data'
 
 SET enable_seqscan=on;
 

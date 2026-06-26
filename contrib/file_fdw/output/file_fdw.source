@@ -7,7 +7,9 @@ DROP ROLE IF EXISTS file_fdw_superuser, file_fdw_user, no_priv_user;
 RESET client_min_messages;
 CREATE ROLE file_fdw_superuser LOGIN SUPERUSER; -- is a superuser
 CREATE ROLE file_fdw_user LOGIN;                -- has priv and user mapping
+NOTICE:  resource queue required -- using default resource queue "pg_default"
 CREATE ROLE no_priv_user LOGIN;                 -- has priv but no user mapping
+NOTICE:  resource queue required -- using default resource queue "pg_default"
 -- Install file_fdw
 CREATE EXTENSION file_fdw;
 -- file_fdw_superuser owns fdw-related objects
@@ -33,22 +35,14 @@ CREATE USER MAPPING FOR no_priv_user SERVER file_server;
 -- validator tests
 CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (format 'xml');  -- ERROR
 ERROR:  COPY format "xml" not recognized
-CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (format 'text', header 'true');      -- ERROR
-ERROR:  COPY HEADER available only in CSV mode
 CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (format 'text', quote ':');          -- ERROR
 ERROR:  COPY quote available only in CSV mode
-CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (format 'text', escape ':');         -- ERROR
-ERROR:  COPY escape available only in CSV mode
 CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (format 'binary', header 'true');    -- ERROR
-ERROR:  COPY HEADER available only in CSV mode
+ERROR:  COPY cannot specify HEADER in BINARY mode
 CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (format 'binary', quote ':');        -- ERROR
 ERROR:  COPY quote available only in CSV mode
-CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (format 'binary', escape ':');       -- ERROR
-ERROR:  COPY escape available only in CSV mode
 CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (format 'text', delimiter 'a');      -- ERROR
 ERROR:  COPY delimiter cannot be "a"
-CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (format 'text', escape '-');         -- ERROR
-ERROR:  COPY escape available only in CSV mode
 CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (format 'csv', quote '-', null '=-=');   -- ERROR
 ERROR:  CSV quote character must not appear in the NULL specification
 CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (format 'csv', delimiter '-', null '=-=');    -- ERROR
@@ -56,11 +50,11 @@ ERROR:  COPY delimiter must not appear in the NULL specification
 CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (format 'csv', delimiter '-', quote '-');    -- ERROR
 ERROR:  COPY delimiter and quote must be different
 CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (format 'csv', delimiter '---');     -- ERROR
-ERROR:  COPY delimiter must be a single one-byte character
+ERROR:  COPY delimiter must be a single one-byte character, or 'off'
 CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (format 'csv', quote '---');         -- ERROR
 ERROR:  COPY quote must be a single one-byte character
 CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (format 'csv', escape '---');        -- ERROR
-ERROR:  COPY escape must be a single one-byte character
+ERROR:  COPY escape in CSV format must be a single character
 CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (format 'text', delimiter '\');       -- ERROR
 ERROR:  COPY delimiter cannot be "\"
 CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (format 'text', delimiter '.');       -- ERROR
@@ -178,6 +172,7 @@ EXPLAIN (VERBOSE, COSTS FALSE) SELECT * FROM agg_csv;
  Foreign Scan on public.agg_csv
    Output: a, b
    Foreign File: @abs_srcdir@/data/agg.csv
+ Optimizer: Postgres query optimizer
 
 \t off
 PREPARE st(int) AS SELECT * FROM agg_csv WHERE a = $1;
@@ -250,6 +245,7 @@ EXPLAIN (VERBOSE, COSTS FALSE) SELECT * FROM agg_text WHERE a > 0;
    Output: a, b
    Filter: (agg_text.a > 0)
    Foreign File: @abs_srcdir@/data/agg.data
+ Optimizer: Postgres query optimizer
 
 \t off
 -- privilege tests for object

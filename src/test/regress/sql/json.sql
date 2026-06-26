@@ -131,7 +131,7 @@ SELECT json_agg(q)
          FROM generate_series(1,2) x,
               generate_series(4,5) y) q;
 
-SELECT json_agg(q)
+SELECT json_agg(q order by q)
   FROM rows q;
 
 -- non-numeric output
@@ -470,7 +470,7 @@ INSERT INTO foo VALUES (847001,'t15','GE1043');
 INSERT INTO foo VALUES (847002,'t16','GE1043');
 INSERT INTO foo VALUES (847003,'sub-alpha','GESS90');
 
-SELECT json_build_object('turbines',json_object_agg(serial_num,json_build_object('name',name,'type',type)))
+SELECT json_build_object('turbines',json_object_agg(serial_num,json_build_object('name',name,'type',type) order by serial_num))
 FROM foo;
 
 -- json_object
@@ -521,6 +521,12 @@ select * from json_to_record('{"a":1,"b":"foo","c":"bar"}')
 
 select * from json_to_recordset('[{"a":1,"b":"foo","d":false},{"a":2,"b":"bar","c":true}]')
     as x(a int, b text, c boolean);
+
+-- checking proisstrict settings
+
+select '[{"a":1}]'::json->0->'b';
+select '[{"a":1}]'::json->1;
+select '[{"a":1}]'::json->1->'a';
 
 select * from json_to_recordset('[{"a":1,"b":{"d":"foo"},"c":true},{"a":2,"c":false,"b":{"d":"bar"}}]')
     as x(a int, b json, c boolean);

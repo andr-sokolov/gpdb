@@ -43,6 +43,9 @@ CATALOG(pg_namespace,2615)
 #endif
 } FormData_pg_namespace;
 
+/* GPDB added foreign key definitions for gpcheckcat. */
+FOREIGN_KEY(nspowner REFERENCES pg_authid(oid));
+
 /* ----------------
  *		Form_pg_namespace corresponds to a pointer to a tuple with
  *		the format of pg_namespace relation.
@@ -76,6 +79,25 @@ DATA(insert OID = 2200 ( "public" PGUID _null_ ));
 DESCR("standard public schema");
 #define PG_PUBLIC_NAMESPACE 2200
 
+/*
+ * GPDB-specific built-in namespaces.
+ *
+ * NOTE: pg_dump has BM_BITMAPINDEX_NAMESPACE's value hard-coded in the
+ * getTables() query.
+ */
+DATA(insert OID = 6104 ( "pg_aoseg" PGUID _null_ ));
+DESCR("Reserved schema for Append Only segment list and eof tables");
+#define PG_AOSEGMENT_NAMESPACE 6104
+DATA(insert OID = 7012  ( "pg_bitmapindex" PGUID _null_ ));
+DESCR("Reserved schema for internal relations of bitmap indexes");
+#define PG_BITMAPINDEX_NAMESPACE 7012
+
+#define IsBuiltInNameSpace(namespaceId) \
+	(namespaceId == PG_CATALOG_NAMESPACE || \
+	 namespaceId == PG_TOAST_NAMESPACE || \
+	 namespaceId == PG_BITMAPINDEX_NAMESPACE || \
+	 namespaceId == PG_PUBLIC_NAMESPACE || \
+	 namespaceId == PG_AOSEGMENT_NAMESPACE)
 
 /*
  * prototypes for functions in pg_namespace.c

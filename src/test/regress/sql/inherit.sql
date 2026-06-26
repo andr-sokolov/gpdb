@@ -1,7 +1,7 @@
 --
 -- Test inheritance features
 --
-CREATE TABLE a (aa TEXT);
+CREATE TABLE a (dummy serial, aa TEXT);
 CREATE TABLE b (bb TEXT) INHERITS (a);
 CREATE TABLE c (cc TEXT) INHERITS (a);
 CREATE TABLE d (dd TEXT) INHERITS (b,c,a);
@@ -157,6 +157,7 @@ DROP TABLE firstparent, secondparent, jointchild, thirdparent, otherchild;
 
 -- Test changing the type of inherited columns
 insert into d values('test','one','two','three');
+alter table z drop constraint z_pkey;
 alter table a alter column aa type integer using bit_length(aa);
 select * from d;
 
@@ -353,6 +354,8 @@ ALTER TABLE ONLY test_constraints DROP CONSTRAINT test_constraints_val1_val2_key
 DROP TABLE test_constraints_inh;
 DROP TABLE test_constraints;
 
+-- start_ignore
+-- GPDB does not support exclusion constraints, so no need to run this test
 CREATE TABLE test_ex_constraints (
     c circle,
     EXCLUDE USING gist (c WITH &&)
@@ -364,6 +367,7 @@ ALTER TABLE test_ex_constraints DROP CONSTRAINT test_ex_constraints_c_excl;
 \d+ test_ex_constraints_inh
 DROP TABLE test_ex_constraints_inh;
 DROP TABLE test_ex_constraints;
+-- end_ignore
 
 -- Test non-inheritable foreign key contraints
 CREATE TABLE test_primary_constraints(id int PRIMARY KEY);
@@ -422,7 +426,8 @@ order by 1, 2;
 --
 
 create temp table patest0 (id, x) as
-  select x, x from generate_series(0,1000) x;
+  select x, x from generate_series(0,1000) x
+  distributed by (id);
 create temp table patest1() inherits (patest0);
 insert into patest1
   select x, x from generate_series(0,1000) x;
@@ -436,15 +441,19 @@ analyze patest0;
 analyze patest1;
 analyze patest2;
 
+set enable_seqscan=off;
+set enable_bitmapscan=off;
 explain (costs off)
-select * from patest0 join (select f1 from int4_tbl limit 1) ss on id = f1;
-select * from patest0 join (select f1 from int4_tbl limit 1) ss on id = f1;
+select * from patest0 join (select f1 from int4_tbl where f1 < 10 and f1 > -10 limit 1) ss on id = f1;
+select * from patest0 join (select f1 from int4_tbl where f1 < 10 and f1 > -10 limit 1) ss on id = f1;
 
 drop index patest2i;
 
 explain (costs off)
-select * from patest0 join (select f1 from int4_tbl limit 1) ss on id = f1;
-select * from patest0 join (select f1 from int4_tbl limit 1) ss on id = f1;
+select * from patest0 join (select f1 from int4_tbl where f1 < 10 and f1 > -10 limit 1) ss on id = f1;
+select * from patest0 join (select f1 from int4_tbl where f1 < 10 and f1 > -10 limit 1) ss on id = f1;
+reset enable_seqscan;
+reset enable_bitmapscan;
 
 drop table patest0 cascade;
 
@@ -477,11 +486,16 @@ select min(1-id) from matest0;
 reset enable_indexscan;
 
 set enable_seqscan = off;  -- plan with fewest seqscans should be merge
+-- GPDB_92_MERGE_FIXME: the cost of bitmap scan is not correct?
+-- the cost of merge append with index scan is bigger than the cost
+-- of append with bitmapscan + sort
+set enable_bitmapscan = off; 
 explain (verbose, costs off) select * from matest0 order by 1-id;
 select * from matest0 order by 1-id;
 explain (verbose, costs off) select min(1-id) from matest0;
 select min(1-id) from matest0;
 reset enable_seqscan;
+reset enable_bitmapscan;
 
 drop table matest0 cascade;
 
@@ -534,6 +548,8 @@ SELECT thousand, random()::integer FROM tenk1
 ORDER BY thousand, tenthous;
 
 -- Check min/max aggregate optimization
+-- GPDB: simple union all pull up is disabled in pull_up_subqueries(), so the
+-- min/max optimization doesn't kick in.
 explain (costs off)
 SELECT min(x) FROM
   (SELECT unique1 AS x FROM tenk1 a
@@ -589,3 +605,29 @@ insert into cnullchild values(null);
 select * from cnullparent;
 select * from cnullparent where f1 = 2;
 drop table cnullparent cascade;
+
+-- Test that replicated table can't inherit a parent table, and it also
+-- can't be inherited by a child table.
+-- 1. Replicated table can't inherit a parent table.
+CREATE TABLE parent (t text) DISTRIBUTED BY (t);
+-- This is not allowed: should fail
+CREATE TABLE child () INHERITS (parent) DISTRIBUTED REPLICATED;
+
+CREATE TABLE child (t text) DISTRIBUTED REPLICATED;
+-- should fail
+ALTER TABLE child INHERIT parent;
+DROP TABLE child, parent;
+
+-- 2. Replicated table can't be inherited
+CREATE TABLE parent (t text) DISTRIBUTED REPLICATED;
+-- should fail
+CREATE TABLE child () INHERITS (parent) DISTRIBUTED REPLICATED;
+CREATE TABLE child () INHERITS (parent) DISTRIBUTED BY (t);
+
+CREATE TABLE child (t text) DISTRIBUTED REPLICATED;
+ALTER TABLE child INHERIT parent;
+
+CREATE TABLE child2(t text) DISTRIBUTED BY (t);
+ALTER TABLE child2 INHERIT parent;
+
+DROP TABLE child, child2, parent;

@@ -5,6 +5,8 @@ CREATE TEMP TABLE x (
 	d text,
 	e text
 ) WITH OIDS;
+NOTICE:  OIDS=TRUE is not recommended for user-created tables
+HINT:  Use OIDS=FALSE to prevent wrap-around of the OID counter.
 CREATE FUNCTION fn_x_before () RETURNS TRIGGER AS '
   BEGIN
 		NEW.e := ''before trigger fired''::text;
@@ -22,9 +24,21 @@ FOR EACH ROW EXECUTE PROCEDURE fn_x_after();
 CREATE TRIGGER trg_x_before BEFORE INSERT ON x
 FOR EACH ROW EXECUTE PROCEDURE fn_x_before();
 COPY x (a, b, c, d, e) from stdin;
+ERROR:  function cannot execute on a QE slice because it issues a non-SELECT statement
+CONTEXT:  SQL statement "UPDATE x set e='after trigger fired' where c='stuff'"
+PL/pgSQL function fn_x_after() line 3 at SQL statement
 COPY x (b, d) from stdin;
+ERROR:  function cannot execute on a QE slice because it issues a non-SELECT statement
+CONTEXT:  SQL statement "UPDATE x set e='after trigger fired' where c='stuff'"
+PL/pgSQL function fn_x_after() line 3 at SQL statement
 COPY x (b, d) from stdin;
+ERROR:  function cannot execute on a QE slice because it issues a non-SELECT statement
+CONTEXT:  SQL statement "UPDATE x set e='after trigger fired' where c='stuff'"
+PL/pgSQL function fn_x_after() line 3 at SQL statement
 COPY x (a, b, c, d, e) from stdin;
+ERROR:  function cannot execute on a QE slice because it issues a non-SELECT statement
+CONTEXT:  SQL statement "UPDATE x set e='after trigger fired' where c='stuff'"
+PL/pgSQL function fn_x_after() line 3 at SQL statement
 -- non-existent column in column list: should fail
 COPY x (xyz) from stdin;
 ERROR:  column "xyz" of relation "x" does not exist
@@ -47,38 +61,22 @@ ERROR:  extra data after last expected column
 CONTEXT:  COPY x, line 1: "2002	232	40	50	60	70	80"
 -- various COPY options: delimiters, oids, NULL string, encoding
 COPY x (b, c, d, e) from stdin with oids delimiter ',' null 'x';
+ERROR:  function cannot execute on a QE slice because it issues a non-SELECT statement
+CONTEXT:  SQL statement "UPDATE x set e='after trigger fired' where c='stuff'"
+PL/pgSQL function fn_x_after() line 3 at SQL statement
 COPY x from stdin WITH DELIMITER AS ';' NULL AS '';
+ERROR:  function cannot execute on a QE slice because it issues a non-SELECT statement
+CONTEXT:  SQL statement "UPDATE x set e='after trigger fired' where c='stuff'"
+PL/pgSQL function fn_x_after() line 3 at SQL statement
 COPY x from stdin WITH DELIMITER AS ':' NULL AS E'\\X' ENCODING 'sql_ascii';
+ERROR:  function cannot execute on a QE slice because it issues a non-SELECT statement
+CONTEXT:  SQL statement "UPDATE x set e='after trigger fired' where c='stuff'"
+PL/pgSQL function fn_x_after() line 3 at SQL statement
 -- check results of copy in
 SELECT * FROM x;
-   a   | b  |     c      |   d    |          e           
--------+----+------------+--------+----------------------
-  9999 |    | \N         | NN     | before trigger fired
- 10000 | 21 | 31         | 41     | before trigger fired
- 10001 | 22 | 32         | 42     | before trigger fired
- 10002 | 23 | 33         | 43     | before trigger fired
- 10003 | 24 | 34         | 44     | before trigger fired
- 10004 | 25 | 35         | 45     | before trigger fired
- 10005 | 26 | 36         | 46     | before trigger fired
-     6 |    | 45         | 80     | before trigger fired
-     7 |    | x          | \x     | before trigger fired
-     8 |    | ,          | \,     | before trigger fired
-  3000 |    | c          |        | before trigger fired
-  4000 |    | C          |        | before trigger fired
-  4001 |  1 | empty      |        | before trigger fired
-  4002 |  2 | null       |        | before trigger fired
-  4003 |  3 | Backslash  | \      | before trigger fired
-  4004 |  4 | BackslashX | \X     | before trigger fired
-  4005 |  5 | N          | N      | before trigger fired
-  4006 |  6 | BackslashN | \N     | before trigger fired
-  4007 |  7 | XX         | XX     | before trigger fired
-  4008 |  8 | Delimiter  | :      | before trigger fired
-     1 |  1 | stuff      | test_1 | after trigger fired
-     2 |  2 | stuff      | test_2 | after trigger fired
-     3 |  3 | stuff      | test_3 | after trigger fired
-     4 |  4 | stuff      | test_4 | after trigger fired
-     5 |  5 | stuff      | test_5 | after trigger fired
-(25 rows)
+ a | b | c | d | e 
+---+---+---+---+---
+(0 rows)
 
 -- COPY w/ oids on a table w/o oids should fail
 CREATE TABLE no_oids (
@@ -94,83 +92,8 @@ COPY no_oids TO stdout WITH OIDS;
 ERROR:  table "no_oids" does not have OIDs
 -- check copy out
 COPY x TO stdout;
-9999	\N	\\N	NN	before trigger fired
-10000	21	31	41	before trigger fired
-10001	22	32	42	before trigger fired
-10002	23	33	43	before trigger fired
-10003	24	34	44	before trigger fired
-10004	25	35	45	before trigger fired
-10005	26	36	46	before trigger fired
-6	\N	45	80	before trigger fired
-7	\N	x	\\x	before trigger fired
-8	\N	,	\\,	before trigger fired
-3000	\N	c	\N	before trigger fired
-4000	\N	C	\N	before trigger fired
-4001	1	empty		before trigger fired
-4002	2	null	\N	before trigger fired
-4003	3	Backslash	\\	before trigger fired
-4004	4	BackslashX	\\X	before trigger fired
-4005	5	N	N	before trigger fired
-4006	6	BackslashN	\\N	before trigger fired
-4007	7	XX	XX	before trigger fired
-4008	8	Delimiter	:	before trigger fired
-1	1	stuff	test_1	after trigger fired
-2	2	stuff	test_2	after trigger fired
-3	3	stuff	test_3	after trigger fired
-4	4	stuff	test_4	after trigger fired
-5	5	stuff	test_5	after trigger fired
 COPY x (c, e) TO stdout;
-\\N	before trigger fired
-31	before trigger fired
-32	before trigger fired
-33	before trigger fired
-34	before trigger fired
-35	before trigger fired
-36	before trigger fired
-45	before trigger fired
-x	before trigger fired
-,	before trigger fired
-c	before trigger fired
-C	before trigger fired
-empty	before trigger fired
-null	before trigger fired
-Backslash	before trigger fired
-BackslashX	before trigger fired
-N	before trigger fired
-BackslashN	before trigger fired
-XX	before trigger fired
-Delimiter	before trigger fired
-stuff	after trigger fired
-stuff	after trigger fired
-stuff	after trigger fired
-stuff	after trigger fired
-stuff	after trigger fired
 COPY x (b, e) TO stdout WITH NULL 'I''m null';
-I'm null	before trigger fired
-21	before trigger fired
-22	before trigger fired
-23	before trigger fired
-24	before trigger fired
-25	before trigger fired
-26	before trigger fired
-I'm null	before trigger fired
-I'm null	before trigger fired
-I'm null	before trigger fired
-I'm null	before trigger fired
-I'm null	before trigger fired
-1	before trigger fired
-2	before trigger fired
-3	before trigger fired
-4	before trigger fired
-5	before trigger fired
-6	before trigger fired
-7	before trigger fired
-8	before trigger fired
-1	after trigger fired
-2	after trigger fired
-3	after trigger fired
-4	after trigger fired
-5	after trigger fired
 CREATE TEMP TABLE y (
 	col1 text,
 	col2 text
@@ -444,10 +367,13 @@ alter table check_con_tbl add check (check_con_function(check_con_tbl.*));
  f1     | integer |           | plain   |              | 
 Check constraints:
     "check_con_tbl_check" CHECK (check_con_function(check_con_tbl.*))
+Distributed by: (f1)
 
+-- GPDB: Change from 1 (value in PG) to 2 for copy to make test deterministic.
+-- 2 and null are on seg1 in a 3-seg test environment.
 copy check_con_tbl from stdin;
-NOTICE:  input = {"f1":1}
-CONTEXT:  COPY check_con_tbl, line 1: "1"
+NOTICE:  input = {"f1":2}
+CONTEXT:  COPY check_con_tbl, line 1: "2"
 NOTICE:  input = {"f1":null}
 CONTEXT:  COPY check_con_tbl, line 2: "\N"
 copy check_con_tbl from stdin;
@@ -459,7 +385,7 @@ CONTEXT:  COPY check_con_tbl, line 1: "0"
 select * from check_con_tbl;
  f1 
 ----
-  1
+  2
    
 (2 rows)
 
@@ -469,3 +395,29 @@ DROP FUNCTION truncate_in_subxact();
 DROP TABLE x, y;
 DROP FUNCTION fn_x_before();
 DROP FUNCTION fn_x_after();
+CREATE TABLE check_copy_with_oids (a int) WITH OIDS;
+NOTICE:  OIDS=TRUE is not recommended for user-created tables
+HINT:  Use OIDS=FALSE to prevent wrap-around of the OID counter.
+COPY check_copy_with_oids FROM stdin WITH (oids);
+SELECT oid, * from check_copy_with_oids;
+  oid  | a 
+-------+---
+ 12346 | 2
+ 12347 | 3
+ 12345 | 1
+(3 rows)
+
+DROP TABLE check_copy_with_oids;
+-- When error reject limit is set, copy should be able to continue after hit a corrupted end-of-copy marker 
+CREATE TABLE copy_eoc_marker(a int, b int);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'a' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+COPY copy_eoc_marker FROM stdin LOG ERRORS SEGMENT REJECT LIMIT 5;
+NOTICE:  found 2 data formatting errors (2 or more input rows), rejected related input data
+SELECT * FROM copy_eoc_marker;
+  a  | b  
+-----+----
+ 123 | 20
+(1 row)
+
+DROP TABLE copy_eoc_marker;

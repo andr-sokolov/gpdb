@@ -58,7 +58,7 @@ help(const char *progname)
 	printf(_("  -?, --help     show this help, then exit\n"));
 	printf(_("\nIf no output file is specified, the name is formed by adding .c to the\n"
 			 "input file name, after stripping off .pgc if present.\n"));
-	printf(_("\nReport bugs to <pgsql-bugs@postgresql.org>.\n"));
+	printf(_("\nReport bugs to <bugs@greenplum.org>.\n"));
 }
 
 static void
@@ -192,6 +192,7 @@ main(int argc, char *const argv[])
 				header_mode = true;
 				/* this must include "-c" to make sense */
 				/* so do not place a "break;" here */
+				/* fallthrough */
 			case 'c':
 				auto_create_c = true;
 				break;

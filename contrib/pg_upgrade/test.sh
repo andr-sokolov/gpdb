@@ -45,18 +45,20 @@ case $testhost in
 		# script; the outcome mimics pg_regress.c:make_temp_sockdir().
 		PGHOST=$PG_REGRESS_SOCK_DIR
 		if [ "x$PGHOST" = x ]; then
-			set +e
-			dir=`(umask 077 &&
-				  mktemp -d /tmp/pg_upgrade_check-XXXXXX) 2>/dev/null`
-			if [ ! -d "$dir" ]; then
+			{
+				dir=`(umask 077 &&
+					  mktemp -d /tmp/pg_upgrade_check-XXXXXX) 2>/dev/null` &&
+				[ -d "$dir" ]
+			} ||
+			{
 				dir=/tmp/pg_upgrade_check-$$-$RANDOM
 				(umask 077 && mkdir "$dir")
-				if [ ! -d "$dir" ]; then
-					echo "could not create socket temporary directory in \"/tmp\""
-					exit 1
-				fi
-			fi
-			set -e
+			} ||
+			{
+				echo "could not create socket temporary directory in \"/tmp\""
+				exit 1
+			}
+
 			PGHOST=$dir
 			trap 'rm -rf "$PGHOST"' 0
 			trap 'exit 3' 1 2 13 15

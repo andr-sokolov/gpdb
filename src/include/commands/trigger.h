@@ -15,6 +15,9 @@
 
 #include "nodes/execnodes.h"
 #include "nodes/parsenodes.h"
+#include "utils/rel.h"
+#include "storage/buf.h"
+#include "executor/instrument.h"
 
 /*
  * TriggerData is the node type that is passed as fmgr "context" info
@@ -120,6 +123,14 @@ extern Oid	renametrig(RenameStmt *stmt);
 extern void EnableDisableTrigger(Relation rel, const char *tgname,
 					 char fires_when, bool skip_system);
 
+/*cdb: export the following macro and function for nodeRowTrigger.c */
+#define GetModifiedColumns(relinfo, estate) \
+	(rt_fetch((relinfo)->ri_RangeTableIndex, (estate)->es_range_table)->modifiedCols)
+extern bool TriggerEnabled(EState *estate, ResultRelInfo *relinfo,
+			   Trigger *trigger, TriggerEvent event,
+			   Bitmapset *modifiedCols,
+			   HeapTuple oldtup, HeapTuple newtup);
+
 extern void RelationBuildTriggers(Relation relation);
 
 extern TriggerDesc *CopyTriggerDesc(TriggerDesc *trigdesc);
@@ -209,6 +220,12 @@ extern bool RI_Initial_Check(Trigger *trigger,
 
 extern int	RI_FKey_trigger_type(Oid tgfoid);
 
+extern HeapTuple ExecCallTriggerFunc(TriggerData *trigdata,
+ 					int tgindx,
+ 					FmgrInfo *finfo,
+ 					Instrumentation *instr,
+ 					MemoryContext per_tuple_context);
+ 
 extern Datum pg_trigger_depth(PG_FUNCTION_ARGS);
 
 #endif   /* TRIGGER_H */

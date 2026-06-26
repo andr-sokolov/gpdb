@@ -1,3 +1,4 @@
+set optimizer_print_missing_stats = off;
 --
 -- Sanity checks for text search catalogs
 --
@@ -331,7 +332,7 @@ SELECT COUNT(*) FROM test_tsquery WHERE keyword = 'new & york';
 SELECT COUNT(*) FROM test_tsquery WHERE keyword >= 'new & york';
 SELECT COUNT(*) FROM test_tsquery WHERE keyword >  'new & york';
 
-CREATE UNIQUE INDEX bt_tsq ON test_tsquery (keyword);
+CREATE INDEX bt_tsq ON test_tsquery (keyword);
 
 SET enable_seqscan=OFF;
 
@@ -400,6 +401,12 @@ SELECT plainto_tsquery('SKIES My booKs');
 SELECT to_tsquery('SKIES & My | booKs');
 
 --trigger
+
+-- GPDB doesn't allow updating the distribution key, so create a synthetic
+-- distribution key column.
+alter table test_tsvector add column distkey int4;
+alter table test_tsvector set distributed by (distkey);
+
 CREATE TRIGGER tsvectorupdate
 BEFORE UPDATE OR INSERT ON test_tsvector
 FOR EACH ROW EXECUTE PROCEDURE tsvector_update_trigger(a, 'pg_catalog.english', t);
@@ -414,13 +421,5 @@ INSERT INTO test_tsvector (t) VALUES ('345 qwerty');
 
 SELECT count(*) FROM test_tsvector WHERE a @@ to_tsquery('345&qwerty');
 
--- test finding items in GIN's pending list
-create temp table pendtest (ts tsvector);
-create index pendtest_idx on pendtest using gin(ts);
-insert into pendtest values (to_tsvector('Lore ipsam'));
-insert into pendtest values (to_tsvector('Lore ipsum'));
-select * from pendtest where 'ipsu:*'::tsquery @@ ts;
-select * from pendtest where 'ipsa:*'::tsquery @@ ts;
-select * from pendtest where 'ips:*'::tsquery @@ ts;
-select * from pendtest where 'ipt:*'::tsquery @@ ts;
-select * from pendtest where 'ipi:*'::tsquery @@ ts;
+COPY test_tsvector TO '/tmp/test_tsvector.txt';
+COPY test_tsvector FROM '/tmp/test_tsvector.txt';

@@ -1,6 +1,9 @@
 -- money check
-CREATE TABLE moneytmp (a money) WITH OIDS;
-\copy moneytmp from 'data/cash.data'
+-- In PostgreSQL, this test uses WITH OIDS, but in GPDB, OIDs are not unique
+-- across segments, so use a 'serial' column instead.
+CREATE TABLE moneytmp (a money, oid serial);
+NOTICE:  CREATE TABLE will create implicit sequence "moneytmp_oid_seq" for serial column "moneytmp.oid"
+\copy moneytmp (a) from 'data/cash.data'
 SET enable_seqscan=on;
 SELECT count(*) FROM moneytmp WHERE a <  '22649.64';
  count 

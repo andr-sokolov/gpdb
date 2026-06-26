@@ -250,6 +250,9 @@ SELECT '' AS to_char_8, to_char(d1, 'YYYYTH YYYYth Jth')
 SELECT '' AS to_char_9, to_char(d1, 'YYYY A.D. YYYY a.d. YYYY bc HH:MI:SS P.M. HH:MI:SS p.m. HH:MI:SS pm')
    FROM TIMESTAMPTZ_TBL;
 
+SELECT '' AS to_char_10, to_char(d1, 'YYYY WW IYYY IYY IY I IW') 
+   FROM TIMESTAMPTZ_TBL;
+
 SELECT '' AS to_char_10, to_char(d1, 'IYYY IYY IY I IW IDDD ID')
    FROM TIMESTAMPTZ_TBL;
 
@@ -283,7 +286,7 @@ INSERT INTO TIMESTAMPTZ_TST VALUES(3, '10000 Mar 12 23:58:48 IST');
 INSERT INTO TIMESTAMPTZ_TST VALUES(4, '100000312 23:58:48 IST');
 INSERT INTO TIMESTAMPTZ_TST VALUES(4, '1000000312 23:58:48 IST');
 --Verify data
-SELECT * FROM TIMESTAMPTZ_TST ORDER BY a;
+SELECT * FROM TIMESTAMPTZ_TST;
 --Cleanup
 DROP TABLE TIMESTAMPTZ_TST;
 
@@ -322,6 +325,65 @@ SELECT make_timestamptz(2008, 12, 10, 10, 10, 10, 'EDT');
 SELECT make_timestamptz(2014, 12, 10, 10, 10, 10, 'PST8PDT');
 
 RESET TimeZone;
+
+-- TO_TIMESTAMP()
+SELECT '' AS to_timestamp_1, to_timestamp('0097/Feb/16 --> 08:14:30', 'YYYY/Mon/DD --> HH:MI:SS');
+	
+SELECT '' AS to_timestamp_2, to_timestamp('97/2/16 8:14:30', 'FMYYYY/FMMM/FMDD FMHH:FMMI:FMSS');
+
+SELECT '' AS to_timestamp_3, to_timestamp('1985 January 12', 'YYYY FMMonth DD');
+
+SELECT '' AS to_timestamp_4, to_timestamp('My birthday-> Year: 1976, Month: May, Day: 16',
+										  '"My birthday-> Year" YYYY, "Month:" FMMonth, "Day:" DD');
+
+SELECT '' AS to_timestamp_5, to_timestamp('1,582nd VIII 21', 'Y,YYYth FMRM DD');
+
+SELECT '' AS to_timestamp_6, to_timestamp('15 "text between quote marks" 98 54 45', 
+										  E'HH "\\text between quote marks\\"" YY MI SS');
+    
+SELECT '' AS to_timestamp_7, to_timestamp('05121445482000', 'MMDDHHMISSYYYY');    
+
+SELECT '' AS to_timestamp_8, to_timestamp('2000January09Sunday', 'YYYYFMMonthDDFMDay');
+
+SELECT '' AS to_timestamp_9, to_timestamp('97/Feb/16', 'YYMonDD');
+
+SELECT '' AS to_timestamp_10, to_timestamp('19971116', 'YYYYMMDD');
+
+SELECT '' AS to_timestamp_11, to_timestamp('20000-1116', 'YYYY-MMDD');
+
+SELECT '' AS to_timestamp_12, to_timestamp('9-1116', 'Y-MMDD');
+
+SELECT '' AS to_timestamp_13, to_timestamp('95-1116', 'YY-MMDD');
+
+SELECT '' AS to_timestamp_14, to_timestamp('995-1116', 'YYY-MMDD');
+
+SELECT '' AS to_timestamp_15, to_timestamp('2005426', 'YYYYWWD');
+
+SELECT '' AS to_timestamp_16, to_timestamp('2005300', 'YYYYDDD');
+
+SELECT '' AS to_timestamp_17, to_timestamp('2005527', 'IYYYIWID');
+
+SELECT '' AS to_timestamp_18, to_timestamp('005527', 'IYYIWID');
+
+SELECT '' AS to_timestamp_19, to_timestamp('05527', 'IYIWID');
+
+SELECT '' AS to_timestamp_20, to_timestamp('5527', 'IIWID');
+
+SELECT '' AS to_timestamp_21, to_timestamp('2005364', 'IYYYIDDD');
+
+-- MPP-18998
+create table dttm_com
+(id int primary key,
+t1 timestamp not null,
+t2 timestamp not null,
+d1 date not null,
+d2 date not null )
+distributed by (id);
+insert into dttm_com values
+     (1, now(), current_timestamp, now(), current_date),
+     (2, current_timestamp, localtimestamp::date, current_date::date, date_in(date_out(current_date))),
+     (3, now(), current_timestamp, now(), current_date);
+select id from dttm_com where d1 <> current_date;
 
 --
 -- Test behavior with a dynamic (time-varying) timezone abbreviation.

@@ -28,7 +28,8 @@
 #include "pgtime.h"				/* for pg_time_t */
 
 
-#define PG_BACKEND_VERSIONSTR "postgres (PostgreSQL) " PG_VERSION "\n"
+#define PG_VERSIONSTR "postgres (Greenplum Database) " PG_VERSION "\n"
+#define PG_BACKEND_VERSIONSTR "postgres (Greenplum Database) " PG_VERSION "\n"
 
 #define InvalidPid				(-1)
 
@@ -81,6 +82,8 @@
 /* these are marked volatile because they are set by signal handlers: */
 extern PGDLLIMPORT volatile bool InterruptPending;
 extern PGDLLIMPORT volatile bool QueryCancelPending;
+extern PGDLLIMPORT volatile bool QueryCancelCleanup; /* GPDB only */
+extern PGDLLIMPORT volatile bool QueryFinishPending;
 extern PGDLLIMPORT volatile bool ProcDiePending;
 extern PGDLLIMPORT volatile sig_atomic_t ConfigReloadPending;
 
@@ -88,20 +91,57 @@ extern volatile bool ClientConnectionLost;
 
 /* these are marked volatile because they are examined by signal handlers: */
 extern PGDLLIMPORT volatile bool ImmediateInterruptOK;
-extern PGDLLIMPORT volatile uint32 InterruptHoldoffCount;
-extern PGDLLIMPORT volatile uint32 QueryCancelHoldoffCount;
-extern PGDLLIMPORT volatile uint32 CritSectionCount;
+extern PGDLLIMPORT volatile bool ImmediateDieOK;
+extern PGDLLIMPORT volatile bool TermSignalReceived;
+extern PGDLLIMPORT volatile int32 InterruptHoldoffCount;
+extern PGDLLIMPORT volatile int32 QueryCancelHoldoffCount;
+extern PGDLLIMPORT volatile int32 CritSectionCount;
 
 /* in tcop/postgres.c */
-extern void ProcessInterrupts(void);
+extern void ProcessInterrupts(const char* filename, int lineno);
+
+/* Hook get notified when QueryCancelPending or ProcDiePending is raised */
+typedef void (*cancel_pending_hook_type) (void);
+extern PGDLLIMPORT cancel_pending_hook_type cancel_pending_hook;
+
+/*
+ * We don't want to include the entire vmem_tracker.h, and so,
+ * declare the only function we use from vmem_tracker.h.
+ */
+extern void RedZoneHandler_DetectRunawaySession(void);
+
+/*
+ * These should be in backoff.h, but we need the in CHECK_FOR_INTERRUPTS(),
+ * and we don't want to include the entire backoff.h here.
+ */
+extern int backoffTickCounter;
+extern int gp_resqueue_priority_local_interval;
+
+extern void BackoffBackendTickExpired(void);
+
+static inline void
+BackoffBackendTick(void)
+{
+	backoffTickCounter++;
+
+	if (backoffTickCounter >= gp_resqueue_priority_local_interval)
+	{
+		/* Enough time has passed. Perform backoff. */
+		BackoffBackendTickExpired();
+	}
+}
 
 #ifndef WIN32
 
 #define CHECK_FOR_INTERRUPTS() \
 do { \
 	if (InterruptPending) \
-		ProcessInterrupts(); \
+		ProcessInterrupts(__FILE__, __LINE__); \
+	BackoffBackendTick(); \
+	ReportOOMConsumption(); \
+	RedZoneHandler_DetectRunawaySession();\
 } while(0)
+
 #else							/* WIN32 */
 
 #define CHECK_FOR_INTERRUPTS() \
@@ -109,35 +149,58 @@ do { \
 	if (UNBLOCKED_SIGNAL_QUEUE()) \
 		pgwin32_dispatch_queued_signals(); \
 	if (InterruptPending) \
-		ProcessInterrupts(); \
+		ProcessInterrupts(__FILE__, __LINE__); \
 } while(0)
 #endif   /* WIN32 */
 
 
-#define HOLD_INTERRUPTS()  (InterruptHoldoffCount++)
+#define HOLD_INTERRUPTS() \
+do { \
+	if (InterruptHoldoffCount < 0) \
+		elog(PANIC, "Hold interrupt holdoff count is bad (%d)", InterruptHoldoffCount); \
+	InterruptHoldoffCount++; \
+} while(0)
 
 #define RESUME_INTERRUPTS() \
 do { \
-	Assert(InterruptHoldoffCount > 0); \
+	if (InterruptHoldoffCount <= 0) \
+		elog(PANIC, "Resume interrupt holdoff count is bad (%d)", InterruptHoldoffCount); \
 	InterruptHoldoffCount--; \
 } while(0)
 
-#define HOLD_CANCEL_INTERRUPTS()  (QueryCancelHoldoffCount++)
+#define HOLD_CANCEL_INTERRUPTS() \
+do{ \
+    if (QueryCancelHoldoffCount < 0) \
+        elog(PANIC, "Hold cancel interrupt holdoff count is bad (%d)", QueryCancelHoldoffCount); \
+    QueryCancelHoldoffCount++; \
+} while(0)
 
 #define RESUME_CANCEL_INTERRUPTS() \
 do { \
-	Assert(QueryCancelHoldoffCount > 0); \
-	QueryCancelHoldoffCount--; \
+    if (QueryCancelHoldoffCount <= 0) \
+        elog(PANIC, "Resume cancel interrupt holdoff count is bad (%d)", QueryCancelHoldoffCount); \
+    QueryCancelHoldoffCount--; \
 } while(0)
 
-#define START_CRIT_SECTION()  (CritSectionCount++)
+#define START_CRIT_SECTION() \
+do { \
+	if (CritSectionCount < 0) \
+		elog(PANIC, "Start critical section count is bad (%d)", CritSectionCount); \
+	CritSectionCount++; \
+} while(0)
 
 #define END_CRIT_SECTION() \
 do { \
-	Assert(CritSectionCount > 0); \
+	if (CritSectionCount <= 0) \
+		elog(PANIC, "End critical section count is bad (%d)", CritSectionCount); \
 	CritSectionCount--; \
 } while(0)
 
+/* check CritSectionCount without modification */
+#define ASSERT_IN_CRIT_SECTION() \
+do { \
+	Assert(CritSectionCount > 0); \
+} while(0)
 
 /*****************************************************************************
  *	  globals.h --															 *
@@ -151,6 +214,7 @@ extern bool IsPostmasterEnvironment;
 extern PGDLLIMPORT bool IsUnderPostmaster;
 extern bool IsBackgroundWorker;
 extern bool IsBinaryUpgrade;
+extern bool ConvertMasterDataDirToSegment;
 
 extern PGDLLIMPORT bool ExitOnAnyError;
 
@@ -160,6 +224,7 @@ extern PGDLLIMPORT int NBuffers;
 extern PGDLLIMPORT int MaxBackends;
 extern PGDLLIMPORT int MaxConnections;
 extern PGDLLIMPORT int max_worker_processes;
+extern int gp_workfile_max_entries;
 
 extern PGDLLIMPORT int MyProcPid;
 extern PGDLLIMPORT pg_time_t MyStartTime;
@@ -174,6 +239,16 @@ extern char pkglib_path[];
 #ifdef EXEC_BACKEND
 extern char postgres_exec_path[];
 #endif
+
+extern PGDLLIMPORT int gpperfmon_port; 
+
+/* for pljava */
+extern PGDLLIMPORT char* pljava_vmoptions;
+extern PGDLLIMPORT char* pljava_classpath;
+extern PGDLLIMPORT int   pljava_statement_cache_size;
+extern PGDLLIMPORT bool  pljava_debug;
+extern PGDLLIMPORT bool  pljava_release_lingering_savepoints;
+extern PGDLLIMPORT bool  pljava_classpath_insecure;
 
 /*
  * done in storage/backendid.h for now.
@@ -239,8 +314,12 @@ extern PGDLLIMPORT int IntervalStyle;
 
 extern bool enableFsync;
 extern PGDLLIMPORT bool allowSystemTableMods;
+extern PGDLLIMPORT int planner_work_mem;
 extern PGDLLIMPORT int work_mem;
 extern PGDLLIMPORT int maintenance_work_mem;
+extern PGDLLIMPORT int statement_mem;
+extern PGDLLIMPORT int max_statement_mem;
+extern PGDLLIMPORT int gp_vmem_limit_per_query;
 
 extern int	VacuumCostPageHit;
 extern int	VacuumCostPageMiss;
@@ -255,6 +334,8 @@ extern int	VacuumPageDirty;
 extern int	VacuumCostBalance;
 extern bool VacuumCostActive;
 
+extern int gp_vmem_protect_limit;
+extern int gp_vmem_protect_gang_cache_limit;
 
 /* in tcop/postgres.c */
 
@@ -283,6 +364,18 @@ extern void PreventCommandDuringRecovery(const char *cmdname);
 extern int	trace_recovery_messages;
 extern int	trace_recovery(int trace_level);
 
+/*
+ * database which is used by dtx recovery, gdd, fts, etc for catalog access.
+ * We are not using template1 since it seems that users would like to recreate
+ * the template1 database for customization sometimes. That means template1
+ * could be dropped and then recreated and thus that will break dtx recovery,
+ * gdd, fts, etc. Also template1 is the default template for the 'create
+ * database' command. Using template1 will make that command fail: "ERROR:
+ * source database "template1" is being accessed by other users" "DETAIL:
+ * There are 2 other sessions using the database."
+ */
+#define DB_FOR_COMMON_ACCESS	"postgres"
+
 /*****************************************************************************
  *	  pdir.h --																 *
  *			POSTGRES directory path definitions.                             *
@@ -301,6 +394,9 @@ extern char *GetUserNameFromId(Oid roleid);
 extern Oid	GetUserId(void);
 extern Oid	GetOuterUserId(void);
 extern Oid	GetSessionUserId(void);
+extern void 	SetSessionUserId(Oid, bool);
+extern Oid	GetAuthenticatedUserId(void);
+extern bool IsAuthenticatedUserSuperUser(void);
 extern void GetUserIdAndSecContext(Oid *userid, int *sec_context);
 extern void SetUserIdAndSecContext(Oid userid, int sec_context);
 extern bool InLocalUserIdChange(void);
@@ -318,6 +414,7 @@ extern void ChangeToDataDir(void);
 
 /* in utils/misc/superuser.c */
 extern bool superuser(void);	/* current user is superuser */
+extern bool procRoleIsSuperuser(void); /* proc role id is superuser */
 extern bool superuser_arg(Oid roleid);	/* given user is superuser */
 
 
@@ -405,6 +502,7 @@ extern AuxProcType MyAuxProcType;
  *****************************************************************************/
 
 /* in utils/init/postinit.c */
+extern bool FindMyDatabase(const char *dbname, Oid *db_id, Oid *db_tablespace);
 extern void pg_split_opts(char **argv, int *argcp, char *optstr);
 extern void InitializeMaxBackends(void);
 extern void InitPostgres(const char *in_dbname, Oid dboid, const char *username,

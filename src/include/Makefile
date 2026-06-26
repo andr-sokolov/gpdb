@@ -13,7 +13,7 @@ top_builddir = ../..
 include $(top_builddir)/src/Makefile.global
 
 
-all: pg_config.h pg_config_ext.h pg_config_os.h
+all: pg_config.h pg_config_ext.h pg_config_os.h check_oids
 
 
 # Subdirectories containing headers for server-side dev
@@ -21,9 +21,11 @@ SUBDIRS = access bootstrap catalog commands common datatype \
 	executor fe_utils foreign \
 	lib libpq mb nodes optimizer parser postmaster regex replication \
 	rewrite storage tcop snowball snowball/libstemmer tsearch \
-	tsearch/dicts utils port port/win32 port/win32_msvc \
+	tsearch/dicts utils port port/atomics port/win32 port/win32_msvc \
 	port/win32_msvc/sys port/win32/arpa port/win32/netinet \
 	port/win32/sys portability
+
+SUBDIRS += cdb gpmon
 
 # Install all headers
 install: all installdirs
@@ -70,6 +72,8 @@ uninstall:
 # heuristic...
 	rm -rf $(addprefix '$(DESTDIR)$(includedir_server)'/, $(SUBDIRS) *.h)
 
+check_oids:
+	(cd $(abs_top_srcdir)/src/include/catalog/ && ./duplicate_oids) 
 
 clean:
 	rm -f utils/fmgroids.h utils/errcodes.h parser/gram.h utils/probes.h catalog/schemapg.h

@@ -24,7 +24,7 @@ all: $(subsysfilename)
 endif
 
 SUBSYS.o: $(SUBDIROBJS) $(OBJS)
-	$(LD) $(LDREL) $(LDOUT) $@ $^
+	$(LD) $(LDREL) $(LDOUT) $@ $^ $(LDOPTS)
 
 objfiles.txt: Makefile $(SUBDIROBJS) $(OBJS)
 # Don't rebuild the list if only the OBJS have changed.
@@ -44,5 +44,11 @@ $(call recurse,clean)
 clean: clean-local
 clean-local:
 	rm -f $(subsysfilename) $(OBJS)
+	@if [ -d $(CURDIR)/test ]; then $(MAKE) -C $(CURDIR)/test clean; fi
+
+$(call recurse,unittest-check)
+unittest-check: unittest-check-local
+unittest-check-local:
+	@if [ -d $(CURDIR)/test ]; then $(MAKE) -C $(CURDIR)/test check; fi
 
 $(call recurse,coverage)

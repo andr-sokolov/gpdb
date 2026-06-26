@@ -22,7 +22,7 @@ EXECUTE prepstmt2(123);
 
 -- recreate the temp table (this demonstrates that the raw plan is
 -- purely textual and doesn't depend on OIDs, for instance)
-CREATE TEMP TABLE pcachetest AS SELECT * FROM int8_tbl ORDER BY 2;
+CREATE TEMP TABLE pcachetest AS SELECT * FROM int8_tbl;
 
 EXECUTE prepstmt;
 EXECUTE prepstmt2(123);
@@ -59,7 +59,7 @@ EXECUTE vprep;
 create function cache_test(int) returns int as $$
 declare total int;
 begin
-	create temp table t1(f1 int);
+	create temp table t1(f1 int) distributed by (f1);
 	insert into t1 values($1);
 	insert into t1 values(11);
 	insert into t1 values(12);
@@ -147,12 +147,53 @@ create function cachebug() returns void as $$
 declare r int;
 begin
   drop table if exists temptable cascade;
+  -- Ignore NOTICE about missing DISTRIBUTED BY. It was annoying here, as
+  -- usually you would only see it on the first invocation, but sometimes
+  -- you'd also get it on the second invocation, if the plan cache
+  -- got invalidated in between the invocations.
+  set client_min_messages=warning;
   create temp table temptable as select * from generate_series(1,3) as f1;
+  reset client_min_messages;
   create temp view vv as select * from temptable;
-  for r in select * from vv loop
+  for r in select * from vv order by f1 loop
     raise notice '%', r;
   end loop;
 end$$ language plpgsql;
 
 select cachebug();
 select cachebug();
+
+-- Test plan_cache_mode
+
+create table test_mode (a int);
+-- GPDB:setting the number of rows slightly higher to get a plan with
+-- Index Only Scan (similar to upstream)
+insert into test_mode select 1 from generate_series(1,15000) union all select 2;
+create index on test_mode (a);
+analyze test_mode;
+
+prepare test_mode_pp (int) as select count(*) from test_mode where a = $1;
+
+-- up to 5 executions, custom plan is used
+explain (costs off) execute test_mode_pp(2);
+
+-- force generic plan
+set plan_cache_mode to force_generic_plan;
+explain (costs off) execute test_mode_pp(2);
+
+-- get to generic plan by 5 executions
+set plan_cache_mode to auto;
+execute test_mode_pp(1); -- 1x
+execute test_mode_pp(1); -- 2x
+execute test_mode_pp(1); -- 3x
+execute test_mode_pp(1); -- 4x
+execute test_mode_pp(1); -- 5x
+
+-- we should now get a really bad plan
+explain (costs off) execute test_mode_pp(2);
+
+-- but we can force a custom plan
+set plan_cache_mode to force_custom_plan;
+explain (costs off) execute test_mode_pp(2);
+
+drop table test_mode;

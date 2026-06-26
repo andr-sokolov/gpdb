@@ -24,7 +24,6 @@
 #include "fmgr.h"
 #include "libpq/md5.h"
 
-
 PG_MODULE_MAGIC;
 
 /* Saved hook value in case of unload */
