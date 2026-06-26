@@ -7,16 +7,22 @@
 subdir =
 top_builddir = .
 include $(top_builddir)/src/Makefile.global
+OS := $(shell uname -s)
 
 $(call recurse,all install,src config)
 
 all:
-	+@echo "All of PostgreSQL successfully made. Ready to install."
+	$(MAKE) -C gpAux/extensions all
+	$(MAKE) -C gpAux/gpperfmon all
+	$(MAKE) -C gpAux/platform all
+	$(MAKE) -C gpMgmt all
+	$(MAKE) -C gpcontrib all
+	+@echo "All of Greenplum Database successfully made. Ready to install."
 
 docs:
 	$(MAKE) -C doc all
 
-$(call recurse,world,doc src config contrib,all)
+$(call recurse,world,doc src config contrib gpcontrib,all)
 world:
 	+@echo "PostgreSQL, contrib, and documentation successfully made. Ready to install."
 
@@ -27,48 +33,121 @@ html man:
 	$(MAKE) -C doc $@
 
 install:
-	+@echo "PostgreSQL installation complete."
+	$(MAKE) -C gpMgmt $@
+	$(MAKE) -C gpAux/extensions $@
+	$(MAKE) -C gpAux/gpperfmon $@
+	$(MAKE) -C gpAux/platform $@
+	$(MAKE) -C gpcontrib $@
+	+@echo "Greenplum Database installation complete."
 
 install-docs:
 	$(MAKE) -C doc install
 
-$(call recurse,install-world,doc src config contrib,install)
+$(call recurse,install-world,doc src config contrib gpcontrib,install)
 install-world:
 	+@echo "PostgreSQL, contrib, and documentation installation complete."
 
 # build src/ before contrib/
 install-world-contrib-recurse: install-world-src-recurse
 
-$(call recurse,installdirs uninstall coverage init-po update-po,doc src config)
+$(call recurse,installdirs uninstall coverage,doc src config contrib gpcontrib)
 
-$(call recurse,distprep,doc src config contrib)
+$(call recurse,distprep,doc src config contrib gpcontrib)
 
 # clean, distclean, etc should apply to contrib too, even though
 # it's not built by default
-$(call recurse,clean,doc contrib src config)
+$(call recurse,clean,doc contrib gpcontrib src config)
 clean:
 # Garbage from autoconf:
 	@rm -rf autom4te.cache/
+# leap over gpAux/Makefile into subdirectories to avoid circular dependency.
+# gpAux/Makefile is the entry point for the enterprise build, which ends up
+# calling top-level configure and this Makefile
+	$(MAKE) -C gpAux/extensions $@
+	$(MAKE) -C gpAux/gpperfmon $@
+	$(MAKE) -C gpAux/platform $@
+	$(MAKE) -C gpMgmt $@
 
 # Important: distclean `src' last, otherwise Makefile.global
 # will be gone too soon.
 distclean maintainer-clean:
-	$(MAKE) -C doc $@
+#	$(MAKE) -C doc $@
+	$(MAKE) -C gpAux/extensions $@
+	$(MAKE) -C gpAux/gpperfmon $@
+	$(MAKE) -C gpAux/platform $@
 	$(MAKE) -C contrib $@
+	$(MAKE) -C gpcontrib $@
 	$(MAKE) -C config $@
+	$(MAKE) -C gpMgmt $@
 	$(MAKE) -C src $@
 	rm -f config.cache config.log config.status GNUmakefile
 # Garbage from autoconf:
 	@rm -rf autom4te.cache/
+
+installcheck-resgroup:
+	$(MAKE) -C src/test/isolation2 $@
+
+# Create or destroy a demo cluster.
+create-demo-cluster:
+	$(MAKE) -C gpAux/gpdemo create-demo-cluster
+
+destroy-demo-cluster:
+	$(MAKE) -C gpAux/gpdemo destroy-demo-cluster
 
 check check-tests: all
 
 check check-tests installcheck installcheck-parallel installcheck-tests:
 	$(MAKE) -C src/test/regress $@
 
-$(call recurse,check-world,src/test src/pl src/interfaces/ecpg contrib src/bin,check)
+$(call recurse,check-world,src/test src/pl src/interfaces/ecpg contrib src/bin gpcontrib,check)
 
-$(call recurse,installcheck-world,src/test src/pl src/interfaces/ecpg contrib src/bin,installcheck)
+# This is a top-level target that runs "all" regression test suites against
+# a running server. This is what the CI pipeline runs.
+.PHONY: installcheck-world
+
+# Run all ICW targets in different directories under a recurse call, so
+# that make -k works as expected. Order is significant here (for some reason,
+# which probably indicates that we're relying on undefined behavior... we should
+# probably pull anything order-dependent out of recurse() and back into the
+# recipe body).
+ICW_TARGETS  = src/test src/pl src/interfaces/gppc
+ICW_TARGETS += contrib/amcheck contrib/auto_explain contrib/citext
+ICW_TARGETS += contrib/formatter_fixedwidth
+ICW_TARGETS += contrib/extprotocol
+ifneq ($(OS),Darwin)
+	ICW_TARGETS += contrib/dblink contrib/postgres_fdw
+endif
+ICW_TARGETS += contrib/indexscan contrib/hstore contrib/pgcrypto
+# sslinfo depends on openssl
+ifeq ($(with_openssl), yes)
+ICW_TARGETS += contrib/sslinfo
+endif
+ICW_TARGETS += gpcontrib src/bin gpMgmt/bin
+
+$(call recurse,installcheck-world, $(ICW_TARGETS),installcheck)
+
+# GPDB: Postgres disables the SSL tests during ICW because of the TCP port that
+# it opens to other users on the same machine during testing. GPDB makes no such
+# security guarantees during tests: currently, it is unsafe to run
+# installcheck-world on a machine with untrusted users.
+$(call recurse,installcheck-world, \
+			   src/test/ssl,check)
+
+.PHONY: installcheck-gpcheckcat
+installcheck-world: installcheck-gpcheckcat
+installcheck-gpcheckcat:
+	gpcheckcat -A
+$(call recurse,installcheck-world,gpcontrib/gp_replica_check,installcheck)
+$(call recurse,installcheck-world,contrib/pg_upgrade,check)
+
+# Run mock tests, that don't require a running server. Arguably these should
+# be part of [install]check-world, but we treat them more like part of
+# compilation than regression testing, in the CI. But they are too heavy-weight
+# to put into "make all", either.
+.PHONY : unittest-check
+unittest-check:
+	$(MAKE) -C src/backend unittest-check
+	$(MAKE) -C src/bin unittest-check
 
 GNUmakefile: GNUmakefile.in $(top_builddir)/config.status
 	./config.status $@
@@ -103,10 +182,10 @@ distdir:
 	  fi || exit; \
 	done
 	$(MAKE) -C $(distdir) distprep
-	$(MAKE) -C $(distdir)/doc/src/sgml/ INSTALL
-	cp $(distdir)/doc/src/sgml/INSTALL $(distdir)/
+	#$(MAKE) -C $(distdir)/doc/src/sgml/ INSTALL
+	#cp $(distdir)/doc/src/sgml/INSTALL $(distdir)/
 	$(MAKE) -C $(distdir) distclean
-	rm -f $(distdir)/README.git
+	#rm -f $(distdir)/README.git
 
 distcheck: dist
 	rm -rf $(dummy)

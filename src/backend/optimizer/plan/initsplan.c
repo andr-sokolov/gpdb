@@ -3,6 +3,8 @@
  * initsplan.c
  *	  Target list, qualification, joininfo initialization routines
  *
+ * Portions Copyright (c) 2006-2008, Greenplum inc
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -15,6 +17,7 @@
 #include "postgres.h"
 
 #include "catalog/pg_type.h"
+#include "cdb/cdbmutate.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
 #include "optimizer/joininfo.h"
@@ -29,6 +32,10 @@
 #include "parser/analyze.h"
 #include "rewrite/rewriteManip.h"
 #include "utils/lsyscache.h"
+
+#include "access/heapam.h"
+#include "nodes/makefuncs.h"
+#include "parser/parsetree.h"
 
 
 /* These parameters are set by GUC */
@@ -69,8 +76,6 @@ static bool check_outerjoin_delay(PlannerInfo *root, Relids *relids_p,
 static bool check_equivalence_delay(PlannerInfo *root,
 						RestrictInfo *restrictinfo);
 static bool check_redundant_nullability_qual(PlannerInfo *root, Node *clause);
-static void check_mergejoinable(RestrictInfo *restrictinfo);
-static void check_hashjoinable(RestrictInfo *restrictinfo);
 
 
 /*****************************************************************************
@@ -170,8 +175,8 @@ build_base_rel_tlists(PlannerInfo *root, List *final_tlist)
  *	  be true before deconstruct_jointree begins, and false after that.)
  */
 void
-add_vars_to_targetlist(PlannerInfo *root, List *vars,
-					   Relids where_needed, bool create_new_ph)
+add_vars_to_targetlist_x(PlannerInfo *root, List *vars,
+						 Relids where_needed, bool create_new_ph, bool force)
 {
 	ListCell   *temp;
 
@@ -187,7 +192,26 @@ add_vars_to_targetlist(PlannerInfo *root, List *vars,
 			RelOptInfo *rel = find_base_rel(root, var->varno);
 			int			attno = var->varattno;
 
-			if (bms_is_subset(where_needed, rel->relids))
+			/* Pseudo column? */
+			if (attno <= FirstLowInvalidHeapAttributeNumber)
+			{
+				CdbRelColumnInfo *rci = cdb_find_pseudo_column(root, var);
+
+				/* Add to targetlist. */
+				if (bms_is_empty(rci->where_needed))
+				{
+					Assert(rci->targetresno == 0);
+					rci->targetresno = list_length(rel->reltargetlist);
+					rel->reltargetlist = lappend(rel->reltargetlist, copyObject(var));
+				}
+
+				/* Note relids which are consumers of the data from this column. */
+				rci->where_needed = bms_add_members(rci->where_needed, where_needed);
+				continue;
+			}
+
+			/* System-defined attribute, whole row, or user-defined attribute */
+			if (bms_is_subset(where_needed, rel->relids) && !force)
 				continue;
 			Assert(attno >= rel->min_attr && attno <= rel->max_attr);
 			attno -= rel->min_attr;
@@ -199,7 +223,7 @@ add_vars_to_targetlist(PlannerInfo *root, List *vars,
 											 copyObject(var));
 			}
 			rel->attr_needed[attno] = bms_add_members(rel->attr_needed[attno],
-													  where_needed);
+													   where_needed);
 		}
 		else if (IsA(node, PlaceHolderVar))
 		{
@@ -215,6 +239,12 @@ add_vars_to_targetlist(PlannerInfo *root, List *vars,
 	}
 }
 
+void
+add_vars_to_targetlist(PlannerInfo *root, List *vars, Bitmapset *where_needed,
+					   bool create_new_ph)
+{
+	add_vars_to_targetlist_x(root, vars, where_needed, create_new_ph, false);
+}
 
 /*****************************************************************************
  *
@@ -741,7 +771,8 @@ deconstruct_jointree(PlannerInfo *root)
 								 &postponed_qual_list);
 
 	/* Shouldn't be any leftover quals */
-	Assert(postponed_qual_list == NIL);
+	if (postponed_qual_list != NIL)
+		elog(ERROR, "JOIN qualification may not refer to other relations.");
 
 	return result;
 }
@@ -872,13 +903,13 @@ deconstruct_recurse(PlannerInfo *root, Node *jtnode, bool below_outer_join,
 	{
 		JoinExpr   *j = (JoinExpr *) jtnode;
 		List	   *child_postponed_quals = NIL;
-		Relids		leftids,
-					rightids,
-					left_inners,
-					right_inners,
-					nonnullable_rels,
-					nullable_rels,
-					ojscope;
+		Relids		leftids = NULL;
+		Relids		rightids = NULL;
+		Relids		left_inners = NULL;
+		Relids		right_inners = NULL;
+		Relids		nonnullable_rels;
+		Relids		nullable_rels;
+		Relids		ojscope;
 		List	   *leftjoinlist,
 				   *rightjoinlist;
 		List	   *my_quals;
@@ -909,7 +940,7 @@ deconstruct_recurse(PlannerInfo *root, Node *jtnode, bool below_outer_join,
 													&rightids, &right_inners,
 													&child_postponed_quals);
 				*qualscope = bms_union(leftids, rightids);
-				*inner_join_rels = *qualscope;
+				*inner_join_rels = bms_copy(*qualscope);
 				/* Inner join adds no restrictions for quals */
 				nonnullable_rels = NULL;
 				/* and it doesn't force anything to null, either */
@@ -917,6 +948,7 @@ deconstruct_recurse(PlannerInfo *root, Node *jtnode, bool below_outer_join,
 				break;
 			case JOIN_LEFT:
 			case JOIN_ANTI:
+			case JOIN_LASJ_NOTIN:
 				leftjoinlist = deconstruct_recurse(root, j->larg,
 												   below_outer_join,
 												   &leftids, &left_inners,
@@ -941,6 +973,7 @@ deconstruct_recurse(PlannerInfo *root, Node *jtnode, bool below_outer_join,
 													&child_postponed_quals);
 				*qualscope = bms_union(leftids, rightids);
 				*inner_join_rels = bms_union(left_inners, right_inners);
+				*inner_join_rels = bms_add_members(*inner_join_rels, rightids);
 				/* Semi join adds no restrictions for quals */
 				nonnullable_rels = NULL;
 
@@ -999,7 +1032,20 @@ deconstruct_recurse(PlannerInfo *root, Node *jtnode, bool below_outer_join,
 				 * We should not be postponing any quals past an outer join.
 				 * If this Assert fires, pull_up_subqueries() messed up.
 				 */
-				Assert(j->jointype == JOIN_INNER);
+				/*
+				 * GPDB_94_MERGE_FIXME: In GPDB, SEMI JOIN may come here, since
+				 * GPDB pulls up correlated ANY_SUBLINK. Consider the query
+				 * below:
+				 *
+				 * select * from A where exists (select * from B where A.i in
+				 * (select C.i from C where C.i = B.i));
+				 *
+				 * We are unsure if postponing quals past a semi-join is always
+				 * semantically correct, see discussion on mailing list here:
+				 * "Regarding postponing quals past an semi join"
+				 * https://groups.google.com/a/greenplum.org/d/msg/gpdb-dev/YHYNIUZnecI/Rlum0VD3FwAJ
+				 */
+				Assert(j->jointype == JOIN_INNER || j->jointype == JOIN_SEMI);
 				*postponed_qual_list = lappend(*postponed_qual_list, pq);
 			}
 		}
@@ -1105,7 +1151,7 @@ deconstruct_recurse(PlannerInfo *root, Node *jtnode, bool below_outer_join,
  *	left_rels: the base Relids syntactically on outer side of join
  *	right_rels: the base Relids syntactically on inner side of join
  *	inner_join_rels: base Relids participating in inner joins below this one
- *	jointype: what it says (must always be LEFT, FULL, SEMI, or ANTI)
+ *	jointype: what it says (must always be LEFT, FULL, SEMI, ANTI, or LASJ)
  *	clause: the outer join's join condition (in implicit-AND format)
  *
  * The node should eventually be appended to root->join_info_list, but we
@@ -1164,6 +1210,7 @@ make_outerjoininfo(PlannerInfo *root,
 							LCS_asString(rc->strength))));
 	}
 
+	/* If it's a full join, no need to be very smart */
 	sjinfo->syn_lefthand = left_rels;
 	sjinfo->syn_righthand = right_rels;
 	sjinfo->jointype = jointype;
@@ -1249,7 +1296,7 @@ make_outerjoininfo(PlannerInfo *root,
 		 * min_lefthand + min_righthand.  This is because there might be other
 		 * OJs below this one that this one can commute with, but we cannot
 		 * commute with them if we don't with this one.)  Also, if the current
-		 * join is a semijoin or antijoin, we must preserve ordering
+		 * join is a semijoin, antijoin or lasj, we must preserve ordering
 		 * regardless of strictness.
 		 *
 		 * Note: I believe we have to insist on being strict for at least one
@@ -1259,6 +1306,7 @@ make_outerjoininfo(PlannerInfo *root,
 		{
 			if (bms_overlap(clause_relids, otherinfo->syn_righthand) &&
 				(jointype == JOIN_SEMI || jointype == JOIN_ANTI ||
+				 jointype == JOIN_LASJ_NOTIN ||
 				 !bms_overlap(strict_relids, otherinfo->min_righthand)))
 			{
 				min_lefthand = bms_add_members(min_lefthand,
@@ -1280,7 +1328,7 @@ make_outerjoininfo(PlannerInfo *root,
 		 * confuse join_is_legal (see discussion in backend/optimizer/README).
 		 *
 		 * Also, we must preserve ordering anyway if either the current join
-		 * or the lower OJ is either a semijoin or an antijoin.
+		 * or the lower OJ is a semijoin, antijoin or lasj.
 		 *
 		 * Here, we have to consider that "our join condition" includes any
 		 * clauses that syntactically appeared above the lower OJ and below
@@ -1299,8 +1347,10 @@ make_outerjoininfo(PlannerInfo *root,
 				!bms_overlap(clause_relids, otherinfo->min_lefthand) ||
 				jointype == JOIN_SEMI ||
 				jointype == JOIN_ANTI ||
+				jointype == JOIN_LASJ_NOTIN ||
 				otherinfo->jointype == JOIN_SEMI ||
 				otherinfo->jointype == JOIN_ANTI ||
+				otherinfo->jointype == JOIN_LASJ_NOTIN ||
 				!otherinfo->lhs_strict || otherinfo->delay_upper_joins)
 			{
 				min_righthand = bms_add_members(min_righthand,
@@ -1779,6 +1829,16 @@ distribute_qual_to_rels(PlannerInfo *root, Node *clause,
 
 	/* No EC special case applies, so push it into the clause lists */
 	distribute_restrictinfo_to_rels(root, restrictinfo);
+
+	/*
+	 * The predicate propagation code (gen_implied_quals()) might be able to
+	 * derive other clauses from this, though, so remember this qual for later.
+	 * (We cannot do predicate propagation yet, because we haven't built all
+	 * the equivalence classes yet.)
+	 * We do not consider it if it is an outer-join qual.
+	 */
+	if (outerjoin_nonnullable == NULL)
+		root->non_eq_clauses = lappend(root->non_eq_clauses, restrictinfo);
 }
 
 /*
@@ -1979,6 +2039,43 @@ check_redundant_nullability_qual(PlannerInfo *root, Node *clause)
 	return false;
 }
 
+static bool
+rel_need_upper(PlannerInfo *root, RelOptInfo *rel)
+{
+	switch (rel->rtekind)
+	{
+		case RTE_RELATION:
+			return GpPolicyIsPartitioned(rel->cdbpolicy) ||
+				GpPolicyIsReplicated(rel->cdbpolicy);
+
+		case RTE_SUBQUERY:
+			/* play it safe */
+			return true;
+
+		case RTE_FUNCTION:
+			/* XXX: depends on EXECUTE ON directive */
+			return false;
+
+		case RTE_VALUES:
+			return false;
+
+		case RTE_TABLEFUNCTION:
+			/* no correlated subqueries are allowed in a tablefunctions. So not sure
+			 * if this can happen */
+			return true;
+
+		case RTE_CTE:
+			/* play it safe */
+			return true;
+
+		case RTE_VOID:
+		case RTE_JOIN:
+		default:
+			/* shouldn't happen */
+			elog(ERROR, "unexpected RTE kind %d", rel->rtekind);
+	}
+}
+
 /*
  * distribute_restrictinfo_to_rels
  *	  Push a completed RestrictInfo into the proper restriction or join
@@ -1995,6 +2092,9 @@ distribute_restrictinfo_to_rels(PlannerInfo *root,
 	Relids		relids = restrictinfo->required_relids;
 	RelOptInfo *rel;
 
+	if (contains_outer_params((Node *) restrictinfo->clause, root))
+		restrictinfo->contain_outer_query_references = true;
+
 	switch (bms_membership(relids))
 	{
 		case BMS_SINGLETON:
@@ -2006,8 +2106,25 @@ distribute_restrictinfo_to_rels(PlannerInfo *root,
 			rel = find_base_rel(root, bms_singleton_member(relids));
 
 			/* Add clause to rel's restriction list */
-			rel->baserestrictinfo = lappend(rel->baserestrictinfo,
-											restrictinfo);
+			if (restrictinfo->contain_outer_query_references &&
+				rel_need_upper(root, rel) &&
+				root->config->force_singleQE)
+			{
+				List	   *vars = pull_var_clause((Node *) restrictinfo->clause,
+												   PVC_RECURSE_AGGREGATES,
+												   PVC_RECURSE_PLACEHOLDERS);
+
+				add_vars_to_targetlist_x(root, vars, relids,
+										 false, /* create_new_ph */
+										 true /* force */);
+				list_free(vars);
+
+				rel->upperrestrictinfo = lappend(rel->upperrestrictinfo,
+												 restrictinfo);
+			}
+			else
+				rel->baserestrictinfo = lappend(rel->baserestrictinfo,
+												restrictinfo);
 			break;
 		case BMS_MULTIPLE:
 
@@ -2160,7 +2277,7 @@ build_implied_join_equality(Oid opno,
 									 true,		/* is_pushed_down */
 									 false,		/* outerjoin_delayed */
 									 false,		/* pseudoconstant */
-									 qualscope, /* required_relids */
+									 qualscope,	/* required_relids */
 									 NULL,		/* outer_relids */
 									 nullable_relids);	/* nullable_relids */
 
@@ -2187,7 +2304,7 @@ build_implied_join_equality(Oid opno,
  *	  the operator is a mergejoinable operator.  The arguments can be
  *	  anything --- as long as there are no volatile functions in them.
  */
-static void
+void
 check_mergejoinable(RestrictInfo *restrictinfo)
 {
 	Expr	   *clause = restrictinfo->clause;
@@ -2224,12 +2341,25 @@ check_mergejoinable(RestrictInfo *restrictinfo)
  *	  the operator is a hashjoinable operator.  The arguments can be
  *	  anything --- as long as there are no volatile functions in them.
  */
-static void
+void
 check_hashjoinable(RestrictInfo *restrictinfo)
 {
 	Expr	   *clause = restrictinfo->clause;
 	Oid			opno;
 	Node	   *leftarg;
+
+	/**
+	 * If this is a IS NOT FALSE boolean test, we can peek underneath.
+	 */
+	if (IsA(clause, BooleanTest))
+	{
+		BooleanTest *bt = (BooleanTest *) clause;
+
+		if (bt->booltesttype == IS_NOT_FALSE)
+		{
+			clause = bt->arg;
+		}
+	}
 
 	if (restrictinfo->pseudoconstant)
 		return;

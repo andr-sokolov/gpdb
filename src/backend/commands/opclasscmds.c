@@ -25,6 +25,7 @@
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/objectaccess.h"
+#include "catalog/oid_dispatch.h"
 #include "catalog/pg_amop.h"
 #include "catalog/pg_amproc.h"
 #include "catalog/pg_namespace.h"
@@ -45,6 +46,9 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 #include "utils/tqual.h"
+
+#include "cdb/cdbvars.h"
+#include "cdb/cdbdisp_query.h"
 
 
 /*
@@ -718,6 +722,16 @@ DefineOpClass(CreateOpClassStmt *stmt)
 	InvokeObjectPostCreateHook(OperatorClassRelationId, opclassoid, 0);
 
 	heap_close(rel, RowExclusiveLock);
+	
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									GetAssignedOidsForDispatch(),
+									NULL);
+	}
 
 	return opclassoid;
 }
@@ -760,7 +774,20 @@ DefineOpFamily(CreateOpFamilyStmt *stmt)
 				 errmsg("must be superuser to create an operator family")));
 
 	/* Insert pg_opfamily catalog entry */
-	return CreateOpFamily(stmt->amname, opfname, namespaceoid, amoid);
+	Oid			opfamilyoid;
+	opfamilyoid = CreateOpFamily(stmt->amname, opfname, namespaceoid, amoid);
+
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									GetAssignedOidsForDispatch(),
+									NULL);
+	}
+
+	return opfamilyoid;
 }
 
 
@@ -827,6 +854,13 @@ AlterOpFamily(AlterOpFamilyStmt *stmt)
 						 maxOpNumber, maxProcNumber,
 						 stmt->items);
 
+	if (Gp_role == GP_ROLE_DISPATCH)
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									GetAssignedOidsForDispatch(),
+									NULL);
 	return opfamilyoid;
 }
 

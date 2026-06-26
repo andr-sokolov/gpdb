@@ -53,6 +53,39 @@ extern Oid TypeCreate(Oid newTypeOid,
 		   bool typeNotNull,
 		   Oid typeCollation);
 
+extern Oid TypeCreateWithOptions(Oid newtypeOid,
+		   const char *typeName,
+		   Oid typeNamespace,
+		   Oid relationOid,
+		   char relationKind,
+		   Oid ownerId,
+		   int16 internalSize,
+		   char typeType,
+		   char typeCategory,
+		   bool typePreferred,
+		   char typDelim,
+		   Oid inputProcedure,
+		   Oid outputProcedure,
+		   Oid receiveProcedure,
+		   Oid sendProcedure,
+		   Oid typmodinProcedure,
+		   Oid typmodoutProcedure,
+		   Oid analyzeProcedure,
+		   Oid elementType,
+		   bool isImplicitArray,
+		   Oid arrayType,
+		   Oid baseType,
+		   const char *defaultTypeValue,
+		   char *defaultTypeBin,
+		   bool passedByValue,
+		   char alignment,
+		   char storage,
+		   int32 typeMod,
+		   int32 typNDims,
+		   bool typeNotNull,
+		   Oid typeCollation,
+		   Datum typoptions);
+
 extern void GenerateTypeDependencies(Oid typeObjectId,
 						 Form_pg_type typeForm,
 						 Node *defaultExpr,
@@ -69,5 +102,7 @@ extern char *makeArrayTypeName(const char *typeName, Oid typeNamespace);
 
 extern bool moveArrayTypeName(Oid typeOid, const char *typeName,
 				  Oid typeNamespace);
+
+extern void add_type_encoding(Oid typid, Datum typoptions);
 
 #endif   /* PG_TYPE_FN_H */

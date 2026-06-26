@@ -476,9 +476,11 @@ yield {'tab': [['first', 1], ['second', 2]],
               {'first': 'fourth', 'second': 4}]}
 $$ LANGUAGE plpythonu;
 SELECT * FROM composite_types_table();
-ERROR:  PL/Python functions cannot return type table_record[]
-DETAIL:  PL/Python does not support conversion to arrays of row types.
-CONTEXT:  PL/Python function "composite_types_table"
+ERROR:  malformed record literal: "first"
+DETAIL:  Missing left parenthesis.
+HINT:  To return a composite type in an array, return the composite type as a Python tuple, e.g. "[('foo')]"
+CONTEXT:  while creating return value
+PL/Python function "composite_types_table"
 -- check what happens if the output record descriptor changes
 CREATE FUNCTION return_record(t text) RETURNS record AS $$
 return {'t': t, 'val': 10}

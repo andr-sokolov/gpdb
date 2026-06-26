@@ -137,6 +137,8 @@
 #include "utils/timestamp.h"
 #include "utils/tqual.h"
 
+#include "tcop/idle_resource_cleaner.h"
+
 
 /*
  * Maximum size of a NOTIFY payload, including terminating NULL.  This
@@ -1918,8 +1920,7 @@ asyncQueueReadAllNotifications(void)
 			 * possibly transmitting them to our frontend.  Copy only the part
 			 * of the page we will actually inspect.
 			 */
-			slotno = SimpleLruReadPage_ReadOnly(AsyncCtl, curpage,
-												InvalidTransactionId);
+			slotno = SimpleLruReadPage_ReadOnly(AsyncCtl, curpage, InvalidTransactionId);
 			if (curpage == QUEUE_POS_PAGE(head))
 			{
 				/* we only want to read as far as head */
@@ -2033,7 +2034,7 @@ asyncQueueProcessPageEntries(volatile QueuePosition *current,
 		/* Ignore messages destined for other databases */
 		if (qe->dboid == MyDatabaseId)
 		{
-			if (XidInMVCCSnapshot(qe->xid, snapshot))
+			if (XidInMVCCSnapshot_Local(qe->xid, snapshot))
 			{
 				/*
 				 * The source transaction is still in progress, so we can't
@@ -2147,6 +2148,7 @@ static void
 ProcessIncomingNotify(void)
 {
 	bool		catchup_enabled;
+	bool		client_wait_timeout_enabled;
 
 	/* We *must* reset the flag */
 	notifyInterruptOccurred = 0;
@@ -2157,6 +2159,7 @@ ProcessIncomingNotify(void)
 
 	/* Must prevent catchup interrupt while I am running */
 	catchup_enabled = DisableCatchupInterrupt();
+	client_wait_timeout_enabled = DisableClientWaitTimeoutInterrupt();
 
 	if (Trace_notify)
 		elog(DEBUG1, "ProcessIncomingNotify");
@@ -2185,6 +2188,9 @@ ProcessIncomingNotify(void)
 
 	if (catchup_enabled)
 		EnableCatchupInterrupt();
+
+	if (client_wait_timeout_enabled)
+		EnableClientWaitTimeoutInterrupt();
 }
 
 /*

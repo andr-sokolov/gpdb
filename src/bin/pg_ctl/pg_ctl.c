@@ -50,6 +50,10 @@
 typedef long pgpid_t;
 
 
+/* postgres version ident string */
+#define PM_VERSIONSTR "postgres (Greenplum Database) " PG_VERSION "\n"
+
+
 typedef enum
 {
 	SMART_MODE,
@@ -78,6 +82,10 @@ typedef enum
 
 static bool do_wait = false;
 static bool wait_set = false;
+#define USEC_PER_SEC	1000000
+
+#define WAITS_PER_SEC	10		/* should divide USEC_PER_SEC evenly */
+
 static int	wait_seconds = DEFAULT_WAIT;
 static bool wait_seconds_arg = false;
 static bool silent_mode = false;
@@ -91,6 +99,8 @@ static char *post_opts = NULL;
 static const char *progname;
 static char *log_file = NULL;
 static char *exec_path = NULL;
+static char *wrapper = NULL;
+static char *wrapper_args = NULL;
 static char *register_servicename = "PostgreSQL";		/* FIXME: + version ID? */
 static char *register_username = NULL;
 static char *register_password = NULL;
@@ -105,12 +115,13 @@ static char backup_file[MAXPGPATH];
 static char recovery_file[MAXPGPATH];
 static char promote_file[MAXPGPATH];
 
+static volatile pgpid_t postmasterPID = -1;
+
 #if defined(WIN32) || defined(__CYGWIN__)
 static DWORD pgctl_start_type = SERVICE_AUTO_START;
 static SERVICE_STATUS status;
 static SERVICE_STATUS_HANDLE hStatus = (SERVICE_STATUS_HANDLE) 0;
 static HANDLE shutdownHandles[2];
-static pid_t postmasterPID = -1;
 
 #define shutdownEvent	  shutdownHandles[0]
 #define postmasterProcess shutdownHandles[1]
@@ -167,6 +178,13 @@ static void read_post_opts(void);
 
 static PGPing test_postmaster_connection(pgpid_t pm_pid, bool do_checkpoint);
 static bool postmaster_is_alive(pid_t pid);
+
+static char postopts_file[MAXPGPATH];
+static char backup_file[MAXPGPATH];
+static char recovery_file[MAXPGPATH];
+static char promote_file[MAXPGPATH];
+static char pid_file[MAXPGPATH];
+static char backup_file[MAXPGPATH];
 
 #if defined(HAVE_GETRLIMIT) && defined(RLIMIT_CORE)
 static void unlimit_core_size(void);
@@ -440,6 +458,7 @@ free_readfile(char **optlines)
 static pgpid_t
 start_postmaster(void)
 {
+	char		launcher[MAXPGPATH] = "";
 	char		cmd[MAXPGPATH];
 
 #ifndef WIN32
@@ -466,17 +485,39 @@ start_postmaster(void)
 	/* fork succeeded, in child */
 
 	/*
+	 * If possible, detach the postmaster process from the launching process
+	 * group and make it a group leader, so that it doesn't get signaled along
+	 * with the current group that launched it.
+	 */
+#ifdef HAVE_SETSID
+	if (setsid() < 0)
+	{
+		write_stderr(_("%s: could not start server due to setsid() failure: %s\n"),
+					 progname, strerror(errno));
+		exit(1);
+	}
+#endif
+
+	if (wrapper != NULL)
+	{
+		if (wrapper_args != NULL)
+			snprintf(launcher, MAXPGPATH, "%s %s", wrapper, wrapper_args);
+		else
+			snprintf(launcher, MAXPGPATH, "%s", wrapper);
+	}
+
+	/*
 	 * Since there might be quotes to handle here, it is easier simply to pass
 	 * everything to a shell to process them.  Use exec so that the postmaster
 	 * has the same PID as the current child process.
 	 */
 	if (log_file != NULL)
-		snprintf(cmd, MAXPGPATH, "exec \"%s\" %s%s < \"%s\" >> \"%s\" 2>&1",
-				 exec_path, pgdata_opt, post_opts,
+		snprintf(cmd, MAXPGPATH, "exec %s \"%s\" %s%s < \"%s\" >> \"%s\" 2>&1",
+				 launcher, exec_path, pgdata_opt, post_opts,
 				 DEVNULL, log_file);
 	else
-		snprintf(cmd, MAXPGPATH, "exec \"%s\" %s%s < \"%s\" 2>&1",
-				 exec_path, pgdata_opt, post_opts, DEVNULL);
+		snprintf(cmd, MAXPGPATH, "exec %s \"%s\" %s%s < \"%s\" 2>&1",
+				 launcher, exec_path, pgdata_opt, post_opts, DEVNULL);
 
 	(void) execl("/bin/sh", "/bin/sh", "-c", cmd, (char *) NULL);
 
@@ -538,6 +579,7 @@ test_postmaster_connection(pgpid_t pm_pid, bool do_checkpoint)
 	PGPing		ret = PQPING_NO_RESPONSE;
 	char		connstr[MAXPGPATH * 2 + 256];
 	int			i;
+	static const char *backend_options = "'-c gp_session_role=utility'";
 
 	/* if requested wait time is zero, return "still starting up" code */
 	if (wait_seconds <= 0)
@@ -545,7 +587,7 @@ test_postmaster_connection(pgpid_t pm_pid, bool do_checkpoint)
 
 	connstr[0] = '\0';
 
-	for (i = 0; i < wait_seconds; i++)
+	for (i = 0; i < wait_seconds * WAITS_PER_SEC; i++)
 	{
 		/* Do we need a connection string? */
 		if (connstr[0] == '\0')
@@ -675,8 +717,8 @@ test_postmaster_connection(pgpid_t pm_pid, bool do_checkpoint)
 						 * timeout first.
 						 */
 						snprintf(connstr, sizeof(connstr),
-						"dbname=postgres port=%d host='%s' connect_timeout=5",
-								 portnum, host_str);
+						"dbname=postgres port=%d host='%s' connect_timeout=5 options=%s",
+								 portnum, host_str, backend_options);
 					}
 				}
 			}
@@ -693,7 +735,8 @@ test_postmaster_connection(pgpid_t pm_pid, bool do_checkpoint)
 		if (connstr[0] != '\0')
 		{
 			ret = PQping(connstr);
-			if (ret == PQPING_OK || ret == PQPING_NO_ATTEMPT)
+			if (ret == PQPING_OK || ret == PQPING_NO_ATTEMPT ||
+				ret == PQPING_MIRROR_READY)
 				break;
 		}
 
@@ -717,24 +760,28 @@ test_postmaster_connection(pgpid_t pm_pid, bool do_checkpoint)
 #endif
 
 		/* No response, or startup still in process; wait */
-#if defined(WIN32)
-		if (do_checkpoint)
+		if (i % WAITS_PER_SEC == 0)
 		{
-			/*
-			 * Increment the wait hint by 6 secs (connection timeout + sleep)
-			 * We must do this to indicate to the SCM that our startup time is
-			 * changing, otherwise it'll usually send a stop signal after 20
-			 * seconds, despite incrementing the checkpoint counter.
-			 */
-			status.dwWaitHint += 6000;
-			status.dwCheckPoint++;
-			SetServiceStatus(hStatus, (LPSERVICE_STATUS) &status);
-		}
-		else
+#ifdef WIN32
+			if (do_checkpoint)
+			{
+				/*
+				 * Increment the wait hint by 6 secs (connection timeout +
+				 * sleep).  We must do this to indicate to the SCM that our
+				 * startup time is changing, otherwise it'll usually send a
+				 * stop signal after 20 seconds, despite incrementing the
+				 * checkpoint counter.
+				 */
+				status.dwWaitHint += 6000;
+				status.dwCheckPoint++;
+				SetServiceStatus(hStatus, (LPSERVICE_STATUS) &status);
+			}
+			else
 #endif
-			print_msg(".");
+				print_msg(".");
+		}
 
-		pg_usleep(1000000);		/* 1 sec */
+		pg_usleep(USEC_PER_SEC / WAITS_PER_SEC);
 	}
 
 	/* return result of last call to PQping */
@@ -816,6 +863,30 @@ read_post_opts(void)
 	}
 }
 
+/*
+ * SIGINT signal handler used while waiting for postmaster to start up.
+ * Forwards the SIGINT to the postmaster process, asking it to shut down,
+ * before terminating pg_ctl itself. This way, if the user hits CTRL-C while
+ * waiting for the server to start up, the server launch is aborted.
+ */
+static void
+trap_sigint_during_startup(int sig)
+{
+	if (postmasterPID != -1)
+	{
+		if (kill(postmasterPID, SIGINT) != 0)
+			write_stderr(_("%s: could not send stop signal (PID: %ld): %s\n"),
+						 progname, (pgpid_t) postmasterPID, strerror(errno));
+	}
+
+	/*
+	 * Clear the signal handler, and send the signal again, to terminate the
+	 * process as normal.
+	 */
+	pqsignal(SIGINT, SIG_DFL);
+	raise(SIGINT);
+}
+
 static char *
 find_other_exec_or_die(const char *argv0, const char *target, const char *versionstr)
 {
@@ -854,7 +925,7 @@ do_init(void)
 	char		cmd[MAXPGPATH];
 
 	if (exec_path == NULL)
-		exec_path = find_other_exec_or_die(argv0, "initdb", "initdb (PostgreSQL) " PG_VERSION "\n");
+		exec_path = find_other_exec_or_die(argv0, "initdb", "initdb (Greenplum Database) " PG_VERSION "\n");
 
 	if (pgdata_opt == NULL)
 		pgdata_opt = "";
@@ -924,6 +995,17 @@ do_start(void)
 
 	if (do_wait)
 	{
+		/*
+		 * If the user interrupts the startup (e.g. with CTRL-C), we'd like to
+		 * abort the server launch.  Install a signal handler that will
+		 * forward SIGINT to the postmaster process, while we wait.
+		 *
+		 * (We don't bother to reset the signal handler after the launch, as
+		 * we're about to exit, anyway.)
+		 */
+		postmasterPID = pm_pid;
+		pqsignal(SIGINT, trap_sigint_during_startup);
+
 		print_msg(_("waiting for server to start..."));
 
 		switch (test_postmaster_connection(pm_pid, false))
@@ -935,6 +1017,10 @@ do_start(void)
 			case PQPING_REJECT:
 				print_msg(_(" stopped waiting\n"));
 				print_msg(_("server is still starting up\n"));
+				break;
+			case PQPING_MIRROR_READY:
+				print_msg(_(" done\n"));
+				print_msg(_("server started in mirror mode\n"));
 				break;
 			case PQPING_NO_RESPONSE:
 				print_msg(_(" stopped waiting\n"));
@@ -1015,12 +1101,13 @@ do_stop(void)
 
 		print_msg(_("waiting for server to shut down..."));
 
-		for (cnt = 0; cnt < wait_seconds; cnt++)
+		for (cnt = 0; cnt < wait_seconds * WAITS_PER_SEC; cnt++)
 		{
 			if ((pid = get_pgpid(false)) != 0)
 			{
-				print_msg(".");
-				pg_usleep(1000000);		/* 1 sec */
+				if (cnt % WAITS_PER_SEC == 0)
+					print_msg(".");
+				pg_usleep(USEC_PER_SEC / WAITS_PER_SEC);
 			}
 			else
 				break;
@@ -1105,12 +1192,13 @@ do_restart(void)
 
 		/* always wait for restart */
 
-		for (cnt = 0; cnt < wait_seconds; cnt++)
+		for (cnt = 0; cnt < wait_seconds * WAITS_PER_SEC; cnt++)
 		{
 			if ((pid = get_pgpid(false)) != 0)
 			{
-				print_msg(".");
-				pg_usleep(1000000);		/* 1 sec */
+				if (cnt % WAITS_PER_SEC == 0)
+					print_msg(".");
+				pg_usleep(USEC_PER_SEC / WAITS_PER_SEC);
 			}
 			else
 				break;
@@ -2046,6 +2134,9 @@ CreateRestrictedProcess(char *cmd, PROCESS_INFORMATION *processInfo, bool as_ser
 		}
 	}
 
+#ifndef __CYGWIN__
+    AddUserToTokenDacl(processInfo->hProcess);
+#endif
 
 	CloseHandle(restrictedToken);
 
@@ -2097,6 +2188,7 @@ do_help(void)
 	printf(_("  -w                     wait until operation completes\n"));
 	printf(_("  -W                     do not wait until operation completes\n"));
 	printf(_("  -?, --help             show this help, then exit\n"));
+	printf(_("  --gp-version           output Greenplum version information, then exit\n"));
 	printf(_("(The default is to wait for shutdown, but not for start or restart.)\n\n"));
 	printf(_("If the -D option is omitted, the environment variable PGDATA is used.\n"));
 
@@ -2133,7 +2225,7 @@ do_help(void)
 	printf(_("  demand     start service on demand\n"));
 #endif
 
-	printf(_("\nReport bugs to <pgsql-bugs@postgresql.org>.\n"));
+	printf(_("\nReport bugs to <bugs@greenplum.org>.\n"));
 }
 
 
@@ -2290,6 +2382,8 @@ main(int argc, char **argv)
 		{"silent", no_argument, NULL, 's'},
 		{"timeout", required_argument, NULL, 't'},
 		{"core-files", no_argument, NULL, 'c'},
+		{"wrapper", optional_argument, NULL, 'q'},
+		{"wrapper-args", optional_argument, NULL, 'Q'},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -2324,7 +2418,12 @@ main(int argc, char **argv)
 		}
 		else if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)
 		{
-			puts("pg_ctl (PostgreSQL) " PG_VERSION);
+			printf("%s (Greenplum Database) %s\n", progname, PG_VERSION);
+			exit(0);
+		}
+		else if (strcmp(argv[1], "--gp-version") == 0)
+		{
+			printf("%s (Greenplum Database) %s\n", progname, GP_VERSION);
 			exit(0);
 		}
 	}
@@ -2432,6 +2531,12 @@ main(int argc, char **argv)
 					break;
 				case 'c':
 					allow_core_files = true;
+					break;
+				case 'q':
+					wrapper = pg_strdup(optarg);
+					break;
+				case 'Q':
+					wrapper_args = pg_strdup(optarg);
 					break;
 				default:
 					/* getopt_long already issued a suitable error message */

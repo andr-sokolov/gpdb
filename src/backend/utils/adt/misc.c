@@ -28,12 +28,14 @@
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "parser/keywords.h"
+#include "postmaster/fts.h"
 #include "postmaster/syslogger.h"
 #include "rewrite/rewriteHandler.h"
 #include "storage/fd.h"
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
+#include "utils/backend_cancel.h"
 #include "utils/lsyscache.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
@@ -89,7 +91,7 @@ current_query(PG_FUNCTION_ARGS)
 #define SIGNAL_BACKEND_ERROR 1
 #define SIGNAL_BACKEND_NOPERMISSION 2
 static int
-pg_signal_backend(int pid, int sig)
+pg_signal_backend(int pid, int sig, char *msg)
 {
 	PGPROC	   *proc = BackendPidGetProc(pid);
 
@@ -114,6 +116,18 @@ pg_signal_backend(int pid, int sig)
 
 	if (!(superuser() || proc->roleId == GetUserId()))
 		return SIGNAL_BACKEND_NOPERMISSION;
+
+	/* If the user supplied a message to the signalled backend */
+	if (msg != NULL)
+	{
+		int		r;
+
+		r = SetBackendCancelMessage(pid, msg);
+
+		if (r != -1 && r != strlen(msg))
+			ereport(NOTICE,
+					(errmsg("message is too long and has been truncated")));
+	}
 
 	/*
 	 * Can the process we just validated above end, followed by the pid being
@@ -146,7 +160,23 @@ pg_signal_backend(int pid, int sig)
 Datum
 pg_cancel_backend(PG_FUNCTION_ARGS)
 {
-	int			r = pg_signal_backend(PG_GETARG_INT32(0), SIGINT);
+	int			r = pg_signal_backend(PG_GETARG_INT32(0), SIGINT, NULL);
+
+	if (r == SIGNAL_BACKEND_NOPERMISSION)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 (errmsg("must be superuser or have the same role to cancel queries running in other server processes"))));
+
+	PG_RETURN_BOOL(r == SIGNAL_BACKEND_SUCCESS);
+}
+
+Datum
+pg_cancel_backend_msg(PG_FUNCTION_ARGS)
+{
+	pid_t		pid = PG_GETARG_INT32(0);
+	char 	   *msg = text_to_cstring(PG_GETARG_TEXT_PP(1));
+
+	int			r = pg_signal_backend(pid, SIGINT, msg);
 
 	if (r == SIGNAL_BACKEND_NOPERMISSION)
 		ereport(ERROR,
@@ -163,7 +193,24 @@ pg_cancel_backend(PG_FUNCTION_ARGS)
 Datum
 pg_terminate_backend(PG_FUNCTION_ARGS)
 {
-	int			r = pg_signal_backend(PG_GETARG_INT32(0), SIGTERM);
+	int			r = pg_signal_backend(PG_GETARG_INT32(0), SIGTERM, NULL);
+
+	if (r == SIGNAL_BACKEND_NOPERMISSION)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 (errmsg("must be superuser or have the same role to terminate other server processes"))));
+
+	PG_RETURN_BOOL(r == SIGNAL_BACKEND_SUCCESS);
+}
+
+Datum
+pg_terminate_backend_msg(PG_FUNCTION_ARGS)
+{
+	pid_t		pid = PG_GETARG_INT32(0);
+	char 	   *msg = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	int			r;
+
+	r = pg_signal_backend(pid, SIGTERM, msg);
 
 	if (r == SIGNAL_BACKEND_NOPERMISSION)
 		ereport(ERROR,
@@ -179,7 +226,7 @@ pg_terminate_backend(PG_FUNCTION_ARGS)
 Datum
 pg_reload_conf(PG_FUNCTION_ARGS)
 {
-	if (!superuser())
+	if (!am_ftshandler && !superuser())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 (errmsg("must be superuser to signal the postmaster"))));
@@ -254,7 +301,7 @@ pg_tablespace_databases(PG_FUNCTION_ARGS)
 				fctx->location = psprintf("base");
 			else
 				fctx->location = psprintf("pg_tblspc/%u/%s", tablespaceOid,
-										  TABLESPACE_VERSION_DIRECTORY);
+										  GP_TABLESPACE_VERSION_DIRECTORY);
 
 			fctx->dirdesc = AllocateDir(fctx->location);
 
@@ -357,6 +404,13 @@ pg_tablespace_location(PG_FUNCTION_ARGS)
 				(errmsg("symbolic link \"%s\" target is too long",
 						sourcepath)));
 	targetpath[rllen] = '\0';
+	
+	get_parent_directory(targetpath);
+	if (strcmp(targetpath, "") == 0)
+		ereport(ERROR,
+				(errmsg("path to tablespace is not a valid path: \"%s\"",
+					sourcepath)));
+
 
 	PG_RETURN_TEXT_P(cstring_to_text(targetpath));
 #else
