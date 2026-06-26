@@ -534,14 +534,10 @@ regoperin(PG_FUNCTION_ARGS)
 
 		while (HeapTupleIsValid(tuple = systable_getnext(sysscan)))
 		{
-			result = HeapTupleGetOid(tuple);
+			result = (RegProcedure) HeapTupleGetOid(tuple);
 			if (++matches > 1)
 				break;
 		}
-
-		systable_endscan(sysscan);
-		heap_close(hdesc, AccessShareLock);
-
 		if (matches == 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_FUNCTION),

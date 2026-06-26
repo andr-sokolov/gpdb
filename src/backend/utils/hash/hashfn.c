@@ -17,6 +17,12 @@
  *	  to poor performance of hash tables.  In most cases a hash
  *	  function should use hash_any() or its variant hash_uint32().
  *
+ * NOTES
+ *	  It is expected that every bit of a hash function's 32-bit result is
+ *	  as random as every other; failure to ensure this is likely to lead
+ *	  to poor performance of hash tables.  In most cases a hash
+ *	  function should use hash_any() or its variant hash_uint32().
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -64,6 +70,15 @@ oid_hash(const void *key, Size keysize)
 {
 	Assert(keysize == sizeof(Oid));
 	return DatumGetUInt32(hash_uint32((uint32) *((const Oid *) key)));
+}
+
+/*
+ * int32_hash: hash function for int32: no-op
+ */
+uint32
+int32_hash(const void *key, Size keysize)
+{
+	return *(uint32 *)key;
 }
 
 /*

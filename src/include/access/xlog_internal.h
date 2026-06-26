@@ -227,6 +227,13 @@ typedef struct xl_end_of_recovery
 	TimeLineID	PrevTimeLineID; /* previous TLI we forked off from */
 } xl_end_of_recovery;
 
+typedef struct CheckpointExtendedRecord
+{
+	struct TMGXACT_CHECKPOINT *dtxCheckpoint;
+	uint32				dtxCheckpointLen;
+	struct prepared_transaction_agg_state  *ptas;
+} CheckpointExtendedRecord;
+
 /*
  * XLogRecord is defined in xlog.h, but we avoid #including that to keep
  * this file includable in stand-alone programs.
@@ -244,10 +251,16 @@ struct XLogRecord;
 typedef struct RmgrData
 {
 	const char *rm_name;
-	void		(*rm_redo) (XLogRecPtr lsn, struct XLogRecord *rptr);
-	void		(*rm_desc) (StringInfo buf, uint8 xl_info, char *rec);
+	void		(*rm_redo) (XLogRecPtr beginLoc, XLogRecPtr lsn, struct XLogRecord *rptr);
+	void		(*rm_desc) (StringInfo buf, struct XLogRecord *record);
 	void		(*rm_startup) (void);
 	void		(*rm_cleanup) (void);
+
+	/*
+	 * rm_mask takes as input a page modified by the resource manager and masks
+	 * out bits that shouldn't be flagged by wal_consistency_checking.
+	 */
+	void		(*rm_mask) (char *pagedata, BlockNumber blkno);
 } RmgrData;
 
 extern const RmgrData RmgrTable[];

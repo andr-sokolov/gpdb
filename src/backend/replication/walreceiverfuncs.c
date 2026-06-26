@@ -29,6 +29,7 @@
 #include "storage/pmsignal.h"
 #include "storage/shmem.h"
 #include "utils/timestamp.h"
+#include "utils/guc.h"
 
 WalRcvData *WalRcv = NULL;
 
@@ -99,7 +100,14 @@ WalRcvRunning(void)
 			SpinLockAcquire(&walrcv->mutex);
 
 			if (walrcv->walRcvState == WALRCV_STARTING)
+			{
 				state = walrcv->walRcvState = WALRCV_STOPPED;
+
+				elogif(debug_xlog_record_read, LOG,
+					   "Set walreceiver state to %s as it has taken too"
+					   "long to start up",
+					   WalRcvGetStateString(walrcv->walRcvState));
+			}
 
 			SpinLockRelease(&walrcv->mutex);
 		}
@@ -169,6 +177,10 @@ ShutdownWalRcv(void)
 	volatile WalRcvData *walrcv = WalRcv;
 	pid_t		walrcvpid = 0;
 
+	elogif(debug_xlog_record_read, LOG,
+		   "walrcv shutdown -- Shutdown request with current walrcv state %s",
+		   WalRcvGetStateString(walrcv->walRcvState));
+
 	/*
 	 * Request walreceiver to stop. Walreceiver will switch to WALRCV_STOPPED
 	 * mode once it's finished, and will also request postmaster to not
@@ -214,6 +226,10 @@ ShutdownWalRcv(void)
 
 		pg_usleep(100000);		/* 100ms */
 	}
+
+	elogif(debug_xlog_record_read, LOG,
+		   "walrcv shutdown -- Shutdown performed with current walrcv state %s",
+		   WalRcvGetStateString(walrcv->walRcvState));
 }
 
 /*

@@ -81,20 +81,36 @@ typedef struct HeapUpdateFailureData
  * ----------------
  */
 
+
+typedef enum
+{
+	LockTupleWait,		/* wait for lock until it's acquired */
+	LockTupleNoWait,	/* if can't get lock right away, report error */
+	LockTupleIfNotLocked/* if can't get lock right away, give up. no error */
+} LockTupleWaitType;
+
 /* in heap/heapam.c */
 extern Relation relation_open(Oid relationId, LOCKMODE lockmode);
-extern Relation try_relation_open(Oid relationId, LOCKMODE lockmode);
+extern Relation try_relation_open(Oid relationId, LOCKMODE lockmode, 
+								  bool noWait);
 extern Relation relation_openrv(const RangeVar *relation, LOCKMODE lockmode);
 extern Relation relation_openrv_extended(const RangeVar *relation,
-						 LOCKMODE lockmode, bool missing_ok);
+						 LOCKMODE lockmode, bool missing_ok, bool noWait);
 extern void relation_close(Relation relation, LOCKMODE lockmode);
 
 extern Relation heap_open(Oid relationId, LOCKMODE lockmode);
 extern Relation heap_openrv(const RangeVar *relation, LOCKMODE lockmode);
+extern Relation try_heap_open(Oid relationId, LOCKMODE lockmode, bool noWait);
 extern Relation heap_openrv_extended(const RangeVar *relation,
 					 LOCKMODE lockmode, bool missing_ok);
 
 #define heap_close(r,l)  relation_close(r,l)
+
+/* CDB */
+extern Relation CdbOpenRelation(Oid relid, LOCKMODE reqmode, bool *lockUpgraded);
+extern Relation CdbTryOpenRelation(Oid relid, LOCKMODE reqmode, bool *lockUpgraded);
+extern Relation CdbOpenRelationRv(const RangeVar *relation, LOCKMODE reqmode, 
+								  bool noWait, bool *lockUpgraded);
 
 /* struct definition appears in relscan.h */
 typedef struct HeapScanDescData *HeapScanDesc;
@@ -135,18 +151,18 @@ extern BulkInsertState GetBulkInsertState(void);
 extern void FreeBulkInsertState(BulkInsertState);
 
 extern Oid heap_insert(Relation relation, HeapTuple tup, CommandId cid,
-			int options, BulkInsertState bistate);
+					   int options, BulkInsertState bistate, TransactionId xid);
 extern void heap_multi_insert(Relation relation, HeapTuple *tuples, int ntuples,
-				  CommandId cid, int options, BulkInsertState bistate);
+				  CommandId cid, int options, BulkInsertState bistate, TransactionId xid);
 extern HTSU_Result heap_delete(Relation relation, ItemPointer tid,
 			CommandId cid, Snapshot crosscheck, bool wait,
-			HeapUpdateFailureData *hufd);
+			HeapUpdateFailureData *hufd, bool isSplitUpdate);
 extern HTSU_Result heap_update(Relation relation, ItemPointer otid,
 			HeapTuple newtup,
 			CommandId cid, Snapshot crosscheck, bool wait,
 			HeapUpdateFailureData *hufd, LockTupleMode *lockmode);
 extern HTSU_Result heap_lock_tuple(Relation relation, HeapTuple tuple,
-				CommandId cid, LockTupleMode mode, bool nowait,
+				CommandId cid, LockTupleMode mode, LockTupleWaitType waittype,
 				bool follow_update,
 				Buffer *buffer, HeapUpdateFailureData *hufd);
 extern void heap_inplace_update(Relation relation, HeapTuple tuple);
@@ -157,12 +173,10 @@ extern bool heap_tuple_needs_freeze(HeapTupleHeader tuple, TransactionId cutoff_
 						MultiXactId cutoff_multi, Buffer buf);
 
 extern Oid	simple_heap_insert(Relation relation, HeapTuple tup);
+extern Oid frozen_heap_insert(Relation relation, HeapTuple tup);
 extern void simple_heap_delete(Relation relation, ItemPointer tid);
 extern void simple_heap_update(Relation relation, ItemPointer otid,
 				   HeapTuple tup);
-
-extern void heap_markpos(HeapScanDesc scan);
-extern void heap_restrpos(HeapScanDesc scan);
 
 extern void heap_sync(Relation relation);
 

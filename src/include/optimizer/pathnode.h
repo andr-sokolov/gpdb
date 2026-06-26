@@ -4,6 +4,8 @@
  *	  prototypes for pathnode.c, relnode.c.
  *
  *
+ * Portions Copyright (c) 2005-2008, Greenplum inc
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -15,23 +17,37 @@
 #define PATHNODE_H
 
 #include "nodes/relation.h"
+#include "cdb/cdbdef.h"                 /* CdbVisitOpt */
 
 
 /*
  * prototypes for pathnode.c
  */
+
+extern CdbVisitOpt pathnode_walk_node(Path *path,
+			       CdbVisitOpt (*walker)(Path *path, void *context),
+			       void *context);
+
 extern int compare_path_costs(Path *path1, Path *path2,
 				   CostSelector criterion);
 extern int compare_fractional_path_costs(Path *path1, Path *path2,
 							  double fraction);
 extern void set_cheapest(RelOptInfo *parent_rel);
 extern void add_path(RelOptInfo *parent_rel, Path *new_path);
+extern void cdb_add_join_path(PlannerInfo *root, RelOptInfo *parent_rel, JoinType orig_jointype,
+				  Relids required_outer, JoinPath *new_path);
+extern Path *create_seqscan_path(PlannerInfo *root, RelOptInfo *rel,
+					Relids required_outer);
+extern ExternalPath *create_external_path(PlannerInfo *root, RelOptInfo *rel,
+					Relids required_outer);
+extern AppendOnlyPath *create_appendonly_path(PlannerInfo *root, RelOptInfo *rel,
+					Relids required_outer);
+extern AOCSPath *create_aocs_path(PlannerInfo *root, RelOptInfo *rel,
+					Relids required_outer);
 extern bool add_path_precheck(RelOptInfo *parent_rel,
 				  Cost startup_cost, Cost total_cost,
 				  List *pathkeys, Relids required_outer);
 
-extern Path *create_seqscan_path(PlannerInfo *root, RelOptInfo *rel,
-					Relids required_outer);
 extern IndexPath *create_index_path(PlannerInfo *root,
 				  IndexOptInfo *index,
 				  List *indexclauses,
@@ -56,7 +72,8 @@ extern BitmapOrPath *create_bitmap_or_path(PlannerInfo *root,
 					  List *bitmapquals);
 extern TidPath *create_tidscan_path(PlannerInfo *root, RelOptInfo *rel,
 					List *tidquals, Relids required_outer);
-extern AppendPath *create_append_path(RelOptInfo *rel, List *subpaths,
+extern AppendPath *create_append_path(PlannerInfo *root, RelOptInfo *rel,
+				   List *subpaths,
 				   Relids required_outer);
 extern MergeAppendPath *create_merge_append_path(PlannerInfo *root,
 						 RelOptInfo *rel,
@@ -64,18 +81,30 @@ extern MergeAppendPath *create_merge_append_path(PlannerInfo *root,
 						 List *pathkeys,
 						 Relids required_outer);
 extern ResultPath *create_result_path(List *quals);
-extern MaterialPath *create_material_path(RelOptInfo *rel, Path *subpath);
+extern MaterialPath *create_material_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath);
 extern UniquePath *create_unique_path(PlannerInfo *root, RelOptInfo *rel,
 				   Path *subpath, SpecialJoinInfo *sjinfo);
+extern UniquePath *create_unique_rowid_path(PlannerInfo *root,
+						 RelOptInfo *rel,
+                         Path        *subpath,
+                         Relids       distinct_relids,
+						 Relids       required_outer);
 extern Path *create_subqueryscan_path(PlannerInfo *root, RelOptInfo *rel,
 						 List *pathkeys, Relids required_outer);
 extern Path *create_functionscan_path(PlannerInfo *root, RelOptInfo *rel,
+						 RangeTblEntry *rte,
 						 List *pathkeys, Relids required_outer);
+extern Path *create_tablefunction_path(PlannerInfo *root, RelOptInfo *rel,
+						 RangeTblEntry *rte,
+						 Relids required_outer);
 extern Path *create_valuesscan_path(PlannerInfo *root, RelOptInfo *rel,
+					   RangeTblEntry *rte,
 					   Relids required_outer);
 extern Path *create_ctescan_path(PlannerInfo *root, RelOptInfo *rel,
+					List *pathkeys,
 					Relids required_outer);
 extern Path *create_worktablescan_path(PlannerInfo *root, RelOptInfo *rel,
+						  CdbLocusType ctelocus,
 						  Relids required_outer);
 extern ForeignPath *create_foreignscan_path(PlannerInfo *root, RelOptInfo *rel,
 						double rows, Cost startup_cost, Cost total_cost,
@@ -86,7 +115,8 @@ extern ForeignPath *create_foreignscan_path(PlannerInfo *root, RelOptInfo *rel,
 extern Relids calc_nestloop_required_outer(Path *outer_path, Path *inner_path);
 extern Relids calc_non_nestloop_required_outer(Path *outer_path, Path *inner_path);
 
-extern NestPath *create_nestloop_path(PlannerInfo *root,
+extern bool path_contains_inner_index(Path *path);
+extern Path *create_nestloop_path(PlannerInfo *root,
 					 RelOptInfo *joinrel,
 					 JoinType jointype,
 					 JoinCostWorkspace *workspace,
@@ -95,10 +125,11 @@ extern NestPath *create_nestloop_path(PlannerInfo *root,
 					 Path *outer_path,
 					 Path *inner_path,
 					 List *restrict_clauses,
+					 List *redistribution_clauses,    /*CDB*/
 					 List *pathkeys,
 					 Relids required_outer);
 
-extern MergePath *create_mergejoin_path(PlannerInfo *root,
+extern Path *create_mergejoin_path(PlannerInfo *root,
 					  RelOptInfo *joinrel,
 					  JoinType jointype,
 					  JoinCostWorkspace *workspace,
@@ -109,10 +140,11 @@ extern MergePath *create_mergejoin_path(PlannerInfo *root,
 					  List *pathkeys,
 					  Relids required_outer,
 					  List *mergeclauses,
+                      List *redistribution_clauses,    /*CDB*/
 					  List *outersortkeys,
 					  List *innersortkeys);
 
-extern HashPath *create_hashjoin_path(PlannerInfo *root,
+extern Path *create_hashjoin_path(PlannerInfo *root,
 					 RelOptInfo *joinrel,
 					 JoinType jointype,
 					 JoinCostWorkspace *workspace,
@@ -122,11 +154,17 @@ extern HashPath *create_hashjoin_path(PlannerInfo *root,
 					 Path *inner_path,
 					 List *restrict_clauses,
 					 Relids required_outer,
+                     List *redistribution_clauses,    /*CDB*/
 					 List *hashclauses);
 
 extern Path *reparameterize_path(PlannerInfo *root, Path *path,
 					Relids required_outer,
 					double loop_count);
+
+extern ProjectionPath *create_projection_path_with_quals(PlannerInfo *root,
+								  RelOptInfo *rel,
+								  Path *subpath,
+								  List *restrict_clauses);
 
 /*
  * prototypes for relnode.c
@@ -147,6 +185,18 @@ extern Relids min_join_parameterization(PlannerInfo *root,
 						  RelOptInfo *outer_rel,
 						  RelOptInfo *inner_rel);
 extern RelOptInfo *build_empty_join_rel(PlannerInfo *root);
+extern void build_joinrel_tlist(PlannerInfo *root, RelOptInfo *joinrel, List *input_tlist);
+
+extern Var *cdb_define_pseudo_column(PlannerInfo   *root,
+                         RelOptInfo    *rel,
+                         const char    *colname,
+                         Expr          *defexpr,
+                         int32          width);
+
+extern CdbRelColumnInfo *cdb_find_pseudo_column(PlannerInfo *root, Var *var);
+
+extern CdbRelColumnInfo *cdb_rte_find_pseudo_column(RangeTblEntry *rte, AttrNumber attno);
+
 extern AppendRelInfo *find_childrel_appendrelinfo(PlannerInfo *root,
 							RelOptInfo *rel);
 extern RelOptInfo *find_childrel_top_parent(PlannerInfo *root, RelOptInfo *rel);

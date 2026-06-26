@@ -23,6 +23,8 @@
 #include "storage/lmgr.h"
 #include "utils/acl.h"
 #include "utils/lsyscache.h"
+#include "cdb/cdbvars.h"
+#include "cdb/cdbdisp_query.h"
 #include "utils/syscache.h"
 
 static void LockTableRecurse(Oid reloid, LOCKMODE lockmode, bool nowait);
@@ -63,8 +65,29 @@ LockTableCommand(LockStmt *lockstmt)
 										  RangeVarCallbackForLockTable,
 										  (void *) &lockstmt->mode);
 
+		/*
+		 * CDB: LOCK TABLE will not release the lock until end of transaction,
+		 * set the holdTillEndXact flag for GDD to know about this.
+		 */
+		if (lockstmt->mode != NoLock)
+		{
+			LOCKTAG		tag;
+
+			SET_LOCKTAG_RELATION(tag, MyDatabaseId, reloid);
+			LockSetHoldTillEndXact(&tag);
+		}
+
 		if (recurse)
 			LockTableRecurse(reloid, lockstmt->mode, lockstmt->nowait);
+	}
+
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		CdbDispatchUtilityStatement((Node *) lockstmt,
+									DF_CANCEL_ON_ERROR|
+									DF_NEED_TWO_PHASE,
+									NIL,
+									NULL);
 	}
 }
 
@@ -133,7 +156,22 @@ LockTableRecurse(Oid reloid, LOCKMODE lockmode, bool nowait)
 
 		/* We have enough rights to lock the relation; do so. */
 		if (!nowait)
+		{
 			LockRelationOid(childreloid, lockmode);
+
+			/*
+			 * CDB: LOCK TABLE will not release the lock until end of
+			 * transaction, set the holdTillEndXact flag for GDD to know about
+			 * this.
+			 */
+			if (lockmode != NoLock)
+			{
+				LOCKTAG		tag;
+
+				SET_LOCKTAG_RELATION(tag, MyDatabaseId, childreloid);
+				LockSetHoldTillEndXact(&tag);
+			}
+		}
 		else if (!ConditionalLockRelationOid(childreloid, lockmode))
 		{
 			/* try to throw error by name; relation could be deleted... */

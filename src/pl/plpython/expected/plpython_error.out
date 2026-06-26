@@ -108,7 +108,6 @@ return None
 	LANGUAGE plpythonu;
 SELECT invalid_type_caught('rick');
 NOTICE:  type "test" does not exist
-CONTEXT:  PL/Python function "invalid_type_caught"
  invalid_type_caught 
 ---------------------
  
