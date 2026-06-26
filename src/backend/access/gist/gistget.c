@@ -16,7 +16,9 @@
 
 #include "access/gist_private.h"
 #include "access/relscan.h"
-#include "miscadmin.h"
+#include "executor/execdebug.h"
+#include "miscadmin.h"    /* work_mem */
+#include "nodes/tidbitmap.h"
 #include "pgstat.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
@@ -64,13 +66,15 @@ gistindex_keytest(IndexScanDesc scan,
 	 * If it's a leftover invalid tuple from pre-9.1, treat it as a match with
 	 * minimum possible distances.  This means we'll always follow it to the
 	 * referenced page.
+	 *
+	 * GPDB: the virtual TIDs created for AO tables use the full range of
+	 * offset numbers from 0 to 65535. So a tuple on leaf page that looks like
+	 * an invalid tuple, is actually ok.
 	 */
-	if (GistTupleIsInvalid(tuple))
+	if (!GistPageIsLeaf(page) && GistTupleIsInvalid(tuple))
 	{
 		int			i;
 
-		if (GistPageIsLeaf(page))		/* shouldn't happen */
-			elog(ERROR, "invalid GiST tuple found on leaf page");
 		for (i = 0; i < scan->numberOfOrderBys; i++)
 		{
 			so->distances[i].value = -get_float8_infinity();
@@ -554,13 +558,21 @@ Datum
 gistgetbitmap(PG_FUNCTION_ARGS)
 {
 	IndexScanDesc scan = (IndexScanDesc) PG_GETARG_POINTER(0);
-	TIDBitmap  *tbm = (TIDBitmap *) PG_GETARG_POINTER(1);
+	Node	   *n = (Node *) PG_GETARG_POINTER(1);
+	TIDBitmap  *tbm;
 	GISTScanOpaque so = (GISTScanOpaque) scan->opaque;
 	int64		ntids = 0;
 	GISTSearchItem fakeItem;
 
+	if (n == NULL)
+		tbm = tbm_create(work_mem * 1024L);
+	else if (!IsA(n, TIDBitmap))
+		elog(ERROR, "non hash bitmap");
+	else
+		tbm = (TIDBitmap *) n;
+
 	if (!so->qual_ok)
-		PG_RETURN_INT64(0);
+		PG_RETURN_POINTER(tbm);
 
 	pgstat_count_index_scan(scan->indexRelation);
 
@@ -590,5 +602,5 @@ gistgetbitmap(PG_FUNCTION_ARGS)
 		pfree(item);
 	}
 
-	PG_RETURN_INT64(ntids);
+	PG_RETURN_POINTER(tbm);
 }

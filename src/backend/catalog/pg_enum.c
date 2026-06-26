@@ -22,6 +22,7 @@
 #include "catalog/indexing.h"
 #include "catalog/pg_enum.h"
 #include "catalog/pg_type.h"
+#include "cdb/cdbvars.h"
 #include "storage/lmgr.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
@@ -30,9 +31,6 @@
 #include "utils/syscache.h"
 #include "utils/tqual.h"
 
-
-/* Potentially set by contrib/pg_upgrade_support functions */
-Oid			binary_upgrade_next_pg_enum_oid = InvalidOid;
 
 static void RenumberEnumType(Relation pg_enum, HeapTuple *existing, int nelems);
 static int	oid_cmp(const void *p1, const void *p2);
@@ -87,10 +85,19 @@ EnumValuesCreate(Oid enumTypeOid, List *vals)
 		 */
 		Oid			new_oid;
 
-		do
+		/*
+		 * In QE node, however, use the OIDs assigned by the master (they are delivered
+		 * out-of-band, see oid_dispatch.c.
+		 */
+		if (Gp_role == GP_ROLE_EXECUTE)
+			new_oid = InvalidOid;
+		else
 		{
-			new_oid = GetNewOid(pg_enum);
-		} while (new_oid & 1);
+			do
+			{
+				new_oid = GetNewOid(pg_enum);
+			} while (new_oid & 1);
+		}
 		oids[elemno] = new_oid;
 	}
 
@@ -340,21 +347,14 @@ restart:
 		}
 	}
 
-	/* Get a new OID for the new label */
-	if (IsBinaryUpgrade && OidIsValid(binary_upgrade_next_pg_enum_oid))
+	if (Gp_role == GP_ROLE_EXECUTE || IsBinaryUpgrade)
 	{
 		/*
-		 * Use binary-upgrade override for pg_enum.oid, if supplied. During
-		 * binary upgrade, all pg_enum.oid's are set this way so they are
-		 * guaranteed to be consistent.
+		 * In QE, the dispatcher has alrady allocated the OID for us. Like in
+		 * EnumValuesCreate(), it is delivered out-of-band, and set on the tuple by
+		 * heap_insert().
 		 */
-		if (neighbor != NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("ALTER TYPE ADD BEFORE/AFTER is incompatible with binary upgrade")));
-
-		newOid = binary_upgrade_next_pg_enum_oid;
-		binary_upgrade_next_pg_enum_oid = InvalidOid;
+		newOid = InvalidOid;
 	}
 	else
 	{

@@ -16,6 +16,7 @@
 
 #include "access/xlog.h"
 #include "nodes/parsenodes.h"
+#include "storage/dbdirnode.h"
 
 /* XLOG stuff */
 #define XLOG_TBLSPC_CREATE		0x00
@@ -30,6 +31,7 @@ typedef struct xl_tblspc_create_rec
 typedef struct xl_tblspc_drop_rec
 {
 	Oid			ts_id;
+	char		ts_path[1];		/* VARIABLE LENGTH STRING */
 } xl_tblspc_drop_rec;
 
 typedef struct TableSpaceOpts
@@ -45,6 +47,7 @@ extern Oid	RenameTableSpace(const char *oldname, const char *newname);
 extern Oid	AlterTableSpaceOptions(AlterTableSpaceOptionsStmt *stmt);
 
 extern void TablespaceCreateDbspace(Oid spcNode, Oid dbNode, bool isRedo);
+extern void UnlinkTablespaceDirectory(Oid tablepace_oid_to_unlink, bool isRedo);
 
 extern Oid	GetDefaultTablespace(char relpersistence);
 
@@ -55,7 +58,8 @@ extern char *get_tablespace_name(Oid spc_oid);
 
 extern bool directory_is_empty(const char *path);
 
-extern void tblspc_redo(XLogRecPtr lsn, XLogRecord *rptr);
-extern void tblspc_desc(StringInfo buf, uint8 xl_info, char *rec);
+extern void tblspc_redo(XLogRecPtr beginLoc, XLogRecPtr lsn, XLogRecord *rptr);
+extern void tblspc_desc(StringInfo buf, XLogRecord *record);
+extern void set_short_version(const char *path);
 
 #endif   /* TABLESPACE_H */

@@ -3,6 +3,8 @@
  * rewriteHandler.c
  *		Primary module of query rewriter.
  *
+ * Portions Copyright (c) 2006-2008, Greenplum inc
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -29,6 +31,8 @@
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+
+#include "catalog/pg_exttable.h"
 
 
 /* We use a list of these to detect recursion in RewriteQuery */
@@ -136,6 +140,7 @@ AcquireRewriteLocks(Query *parsetree,
 		RangeTblEntry *rte = (RangeTblEntry *) lfirst(l);
 		Relation	rel;
 		LOCKMODE	lockmode;
+		bool        needLockUpgrade;
 		List	   *newaliasvars;
 		Index		curinputvarno;
 		RangeTblEntry *curinputrte;
@@ -153,7 +158,12 @@ AcquireRewriteLocks(Query *parsetree,
 				 *
 				 * Assuming forExecute is true, this logic must match what the
 				 * executor will do, else we risk lock-upgrade deadlocks.
+				 *
+				 * CDB: The proper lock mode depends on whether the relation is
+				 * local or distributed, which is discovered by heap_open().
+				 * To handle this we make use of CdbOpenRelation().
 				 */
+				needLockUpgrade = false;
 				if (!forExecute)
 					lockmode = AccessShareLock;
 				else if (rt_index == parsetree->resultRelation)
@@ -164,7 +174,29 @@ AcquireRewriteLocks(Query *parsetree,
 				else
 					lockmode = AccessShareLock;
 
-				rel = heap_open(rte->relid, lockmode);
+				/* Target of INSERT/UPDATE/DELETE? */
+				if (rt_index == parsetree->resultRelation)
+				{
+					lockmode = RowExclusiveLock;
+					if (parsetree->commandType != CMD_INSERT)
+						needLockUpgrade = true;
+				}
+
+				/* FOR UPDATE/SHARE? */
+				else if (get_parse_rowmark(parsetree, rt_index) != NULL)
+				{
+					needLockUpgrade = true;
+				}
+
+				/* Take a lock either using CDB lock promotion or not */
+				if (needLockUpgrade)
+				{
+					rel = CdbOpenRelation(rte->relid, lockmode, NULL);
+				}
+				else
+				{
+					rel = heap_open(rte->relid, lockmode);
+				}
 
 				/*
 				 * While we have the relation open, update the RTE's relkind,
@@ -172,6 +204,7 @@ AcquireRewriteLocks(Query *parsetree,
 				 */
 				rte->relkind = rel->rd_rel->relkind;
 
+				/* Close the relcache entry without releasing the lock. */
 				heap_close(rel, NoLock);
 				break;
 
@@ -413,6 +446,10 @@ rewriteRuleAction(Query *parsetree,
 
 			switch (rte->rtekind)
 			{
+				case RTE_TABLEFUNCTION:
+					sub_action->hasSubLinks =
+						checkExprHasSubLink((Node *) rte->functions);
+					break;
 				case RTE_FUNCTION:
 					sub_action->hasSubLinks =
 						checkExprHasSubLink((Node *) rte->functions);
@@ -1339,6 +1376,7 @@ rewriteTargetListUD(Query *parsetree, RangeTblEntry *target_rte,
 	Var		   *var = NULL;
 	const char *attrname;
 	TargetEntry *tle;
+	Var 		*varSegid = NULL;
 
 	if (target_relation->rd_rel->relkind == RELKIND_RELATION ||
 		target_relation->rd_rel->relkind == RELKIND_MATVIEW)
@@ -1354,6 +1392,24 @@ rewriteTargetListUD(Query *parsetree, RangeTblEntry *target_rte,
 					  0);
 
 		attrname = "ctid";
+
+		/*
+		 * GPDB also needs gp_segment_id. ctid is only unique in the same
+		 * segment.
+		 */
+		Oid			reloid;
+		Oid			vartypeid;
+		int32		type_mod;
+		Oid			type_coll;
+
+		reloid = RelationGetRelid(target_relation);
+		get_atttypetypmodcoll(reloid, GpSegmentIdAttributeNumber, &vartypeid, &type_mod, &type_coll);
+		varSegid = makeVar(parsetree->resultRelation,
+						   GpSegmentIdAttributeNumber,
+						   vartypeid,
+						   type_mod,
+						   type_coll,
+						   0);
 	}
 	else if (target_relation->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
 	{
@@ -1409,6 +1465,16 @@ rewriteTargetListUD(Query *parsetree, RangeTblEntry *target_rte,
 							  list_length(parsetree->targetList) + 1,
 							  pstrdup(attrname),
 							  true);
+
+		parsetree->targetList = lappend(parsetree->targetList, tle);
+	}
+
+	if (varSegid)
+	{
+		tle = makeTargetEntry((Expr *) varSegid,
+							  list_length(parsetree->targetList) + 1,	/* resno */
+							  pstrdup("gp_segment_id"),	/* resname */
+							  true);					/* resjunk */
 
 		parsetree->targetList = lappend(parsetree->targetList, tle);
 	}
@@ -1751,7 +1817,7 @@ fireRIRrules(Query *parsetree, List *activeRIRs, bool forUpdatePushedDown)
 		 * do to this level of the query, but we must recurse into the
 		 * subquery to expand any rule references in it.
 		 */
-		if (rte->rtekind == RTE_SUBQUERY)
+		if (rte->rtekind == RTE_SUBQUERY || rte->rtekind == RTE_TABLEFUNCTION)
 		{
 			rte->subquery = fireRIRrules(rte->subquery, activeRIRs,
 										 (forUpdatePushedDown ||
@@ -2411,7 +2477,7 @@ relation_is_updatable(Oid reloid,
 	/* Since this function recurses, it could be driven to stack overflow */
 	check_stack_depth();
 
-	rel = try_relation_open(reloid, AccessShareLock);
+	rel = try_relation_open(reloid, AccessShareLock, false);
 
 	/*
 	 * If the relation doesn't exist, return zero rather than throwing an
@@ -2429,7 +2495,24 @@ relation_is_updatable(Oid reloid,
 		return 0;
 	}
 
+	/* If this is an external table, check if it's writeable */
+	if (rel->rd_rel->relkind == RELKIND_RELATION &&
+		rel->rd_rel->relstorage == RELSTORAGE_EXTERNAL)
+	{
+		ExtTableEntry	   *extentry;
+
+		extentry = GetExtTableEntry(reloid);
+
+		if (extentry->iswritable)
+			events |= (1 << CMD_INSERT);
+
+		pfree(extentry);
+		relation_close(rel, AccessShareLock);
+		return events;
+	}
+
 	/* If the relation is a table, it is always updatable */
+	/* GPDB: except if it's an external table, which we checked above */
 	if (rel->rd_rel->relkind == RELKIND_RELATION)
 	{
 		relation_close(rel, AccessShareLock);

@@ -1420,7 +1420,7 @@ initGISTstate(Relation index)
 }
 
 void
-freeGISTstate(GISTSTATE *giststate)
+freeGISTstate(GISTSTATE *giststate __attribute__((unused)))
 {
 	/* It's sufficient to delete the scanCxt */
 	MemoryContextDelete(giststate->scanCxt);

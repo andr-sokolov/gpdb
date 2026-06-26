@@ -1,6 +1,24 @@
 # config/programs.m4
 
 
+# PGAC_PATH_PROGS
+# ---------------
+# This wrapper for AC_PATH_PROGS behaves like that macro except when
+# VARIABLE is already set; in that case we just accept the value verbatim.
+# (AC_PATH_PROGS would accept it only if it looks like an absolute path.)
+# A desirable future improvement would be to convert a non-absolute-path
+# input into absolute form.
+AC_DEFUN([PGAC_PATH_PROGS],
+[if test -z "$$1"; then
+  AC_PATH_PROGS($@)
+else
+  # Report the value of $1 in configure's output in all cases.
+  AC_MSG_CHECKING([for $1])
+  AC_MSG_RESULT([$$1])
+fi
+])
+
+
 # PGAC_PATH_BISON
 # ---------------
 # Look for Bison, set the output variable BISON to its path if found.
@@ -77,14 +95,14 @@ else
         echo '%%'  > conftest.l
         if $pgac_candidate -t conftest.l 2>/dev/null | grep FLEX_SCANNER >/dev/null 2>&1; then
           pgac_flex_version=`$pgac_candidate --version 2>/dev/null`
-          if echo "$pgac_flex_version" | sed ['s/[.a-z]/ /g'] | $AWK '{ if ([$]1 == 2 && ([$]2 > 5 || ([$]2 == 5 && [$]3 >= 31))) exit 0; else exit 1;}'
+          if echo "$pgac_flex_version" | sed ['s/[^0-9]/ /g'] | $AWK '{ if ([$]1 == 2 && ([$]2 > 5 || ([$]2 == 5 && [$]3 >= 4))) exit 0; else exit 1;}'
           then
             pgac_cv_path_flex=$pgac_candidate
             break 2
           else
             AC_MSG_WARN([
-*** The installed version of Flex, $pgac_candidate, is too old to use with PostgreSQL.
-*** Flex version 2.5.31 or later is required, but this is $pgac_flex_version.])
+*** The installed version of Flex, $pgac_candidate, is too old to use with Greenplum DB.
+*** Flex version 2.5.4 or later is required, but this is $pgac_flex_version.])
           fi
         fi
       fi
@@ -248,3 +266,62 @@ AC_DEFUN([PGAC_CHECK_STRIP],
   AC_SUBST(STRIP_STATIC_LIB)
   AC_SUBST(STRIP_SHARED_LIB)
 ])# PGAC_CHECK_STRIP
+
+
+# GPAC_PATH_APR_1_CONFIG
+# ----------------------
+# Check for apr-1-config, used by gpfdist
+AC_DEFUN([GPAC_PATH_APR_1_CONFIG],
+[
+if test x"$with_apr_config" != x; then
+  APR_1_CONFIG=$with_apr_config
+fi
+if test -z "$APR_1_CONFIG"; then
+  AC_PATH_PROGS(APR_1_CONFIG, apr-1-config)
+fi
+
+if test -n "$APR_1_CONFIG"; then
+  gpac_apr_1_config_version=`$APR_1_CONFIG --version 2>/dev/null | sed q`
+  if test -z "$gpac_apr_1_config_version"; then
+    AC_MSG_ERROR([apr-1-config is required for gpfdist, unable to identify version])
+  fi
+  AC_MSG_NOTICE([using apr-1-config $gpac_apr_1_config_version])
+  apr_includes=`"$APR_1_CONFIG" --includes`
+  apr_link_ld_libs=`"$APR_1_CONFIG" --link-ld --libs`
+  apr_cflags=`"$APR_1_CONFIG" --cflags`
+  apr_cppflags=`"$APR_1_CONFIG" --cppflags`
+  AC_SUBST(apr_includes)
+  AC_SUBST(apr_link_ld_libs)
+  AC_SUBST(apr_cflags)
+  AC_SUBST(apr_cppflags)
+else
+  AC_MSG_ERROR([apr-1-config is required for gpfdist, unable to find binary])
+fi
+]) # GPAC_PATH_APR_1_CONFIG
+
+# GPAC_PATH_APU_1_CONFIG
+# ----------------------
+# Check for apu-1-config, used by gpperfmon
+AC_DEFUN([GPAC_PATH_APU_1_CONFIG],
+[
+if test x"$with_apu_config" != x; then
+  APU_1_CONFIG=$with_apu_config
+fi
+if test -z "$APU_1_CONFIG"; then
+  AC_PATH_PROGS(APU_1_CONFIG, apu-1-config)
+fi
+
+if test -n "$APU_1_CONFIG"; then
+  gpac_apu_1_config_version=`$APU_1_CONFIG --version 2>/dev/null | sed q`
+  if test -z "$gpac_apu_1_config_version"; then
+    AC_MSG_ERROR([apu-1-config is required for gpperfmon, unable to identify version])
+  fi
+  AC_MSG_NOTICE([using apu-1-config $gpac_apu_1_config_version])
+  apu_includes=`"$APU_1_CONFIG" --includes`
+  apu_link_ld_libs=`"$APU_1_CONFIG" --link-ld --libs`
+  AC_SUBST(apu_includes)
+  AC_SUBST(apu_link_ld_libs)
+else
+  AC_MSG_ERROR([apu-1-config is required for gpperfmon, unable to find binary])
+fi
+]) # GPAC_PATH_APU_1_CONFIG

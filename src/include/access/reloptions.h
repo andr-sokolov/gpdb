@@ -22,6 +22,25 @@
 #include "access/htup.h"
 #include "access/tupdesc.h"
 #include "nodes/pg_list.h"
+#include "utils/rel.h"
+
+#define AO_DEFAULT_APPENDONLY     false
+#define AO_DEFAULT_BLOCKSIZE      DEFAULT_APPENDONLY_BLOCK_SIZE
+/* Compression is turned off by default. */
+#define AO_DEFAULT_COMPRESSLEVEL  0
+#define AO_MIN_COMPRESSLEVEL  0
+#define AO_MAX_COMPRESSLEVEL  19
+/*
+ * If compression is turned on without specifying compresstype, this
+ * is the default.
+ */
+#ifdef HAVE_LIBZ
+#define AO_DEFAULT_COMPRESSTYPE   "zlib"
+#else
+#define AO_DEFAULT_COMPRESSTYPE   "none"
+#endif
+#define AO_DEFAULT_CHECKSUM       true
+#define AO_DEFAULT_COLUMNSTORE    false
 
 /* types supported by reloptions */
 typedef enum relopt_type
@@ -45,8 +64,9 @@ typedef enum relopt_kind
 	RELOPT_KIND_TABLESPACE = (1 << 7),
 	RELOPT_KIND_SPGIST = (1 << 8),
 	RELOPT_KIND_VIEW = (1 << 9),
+	RELOPT_KIND_BITMAP = (1 << 10),
 	/* if you add a new kind, make sure you update "last_default" too */
-	RELOPT_KIND_LAST_DEFAULT = RELOPT_KIND_VIEW,
+	RELOPT_KIND_LAST_DEFAULT = RELOPT_KIND_BITMAP,
 	/* some compilers treat enums as signed ints, so we can't use 1 << 31 */
 	RELOPT_KIND_MAX = (1 << 30)
 } relopt_kind;
@@ -273,5 +293,28 @@ extern bytea *index_reloptions(RegProcedure amoptions, Datum reloptions,
 				 bool validate);
 extern bytea *attribute_reloptions(Datum reloptions, bool validate);
 extern bytea *tablespace_reloptions(Datum reloptions, bool validate);
+
+extern void validateAppendOnlyRelOptions(bool ao, int blocksize, int writesize,
+										 int complevel, char* comptype, 
+										 bool checksum, char relkind, bool co);
+
+extern Datum transformAOStdRdOptions(StdRdOptions *opts, Datum withOpts);
+
+extern void resetDefaultAOStorageOpts(void);
+extern void resetAOStorageOpts(StdRdOptions *ao_opts);
+extern bool isDefaultAOCS(void);
+extern bool isDefaultAO(void);
+extern void setDefaultAOStorageOpts(StdRdOptions *copy);
+extern const StdRdOptions *currentAOStorageOptions(void);
+extern Datum parseAOStorageOpts(const char *opts_str, bool *aovalue);
+extern void parse_validate_reloptions(StdRdOptions *result, Datum reloptions,
+									  bool validate, relopt_kind relkind);
+
+/* in reloptions_gp.c */
+extern void initialize_reloptions_gp(void);
+extern void validate_and_refill_options(StdRdOptions *result, relopt_value *options,
+							int numoptions, relopt_kind kind, bool validate);
+extern void validate_and_adjust_options(StdRdOptions *result, relopt_value *options,
+										int num_options, relopt_kind kind, bool validate);
 
 #endif   /* RELOPTIONS_H */

@@ -165,6 +165,19 @@ make_restrictinfo_internal(Expr *clause,
 	restrictinfo->outer_relids = outer_relids;
 	restrictinfo->nullable_relids = nullable_relids;
 
+	/**
+	 * If this is a IS NOT FALSE boolean test, we can peek underneath.
+	 */
+	if (IsA(clause, BooleanTest))
+	{
+		BooleanTest *bt = (BooleanTest *) clause;
+
+		if (bt->booltesttype == IS_NOT_FALSE)
+		{
+			clause = bt->arg;
+		}
+	}
+
 	/*
 	 * If it's a binary opclause, set up left/right relids info. In any case
 	 * set up the total clause relids info.

@@ -108,7 +108,7 @@ static int	outbuf_maxlen = 0;
 Datum
 gtsvectorout(PG_FUNCTION_ARGS)
 {
-	SignTSVector *key = (SignTSVector *) DatumGetPointer(PG_DETOAST_DATUM(PG_GETARG_POINTER(0)));
+	SignTSVector *key = (SignTSVector *) PG_DETOAST_DATUM(PG_GETARG_DATUM(0));
 	char	   *outbuf;
 
 	if (outbuf_maxlen == 0)
@@ -201,9 +201,9 @@ gtsvector_compress(PG_FUNCTION_ARGS)
 		{
 			pg_crc32	c;
 
-			INIT_CRC32(c);
-			COMP_CRC32(c, words + ptr->pos, ptr->len);
-			FIN_CRC32(c);
+			INIT_LEGACY_CRC32(c);
+			COMP_LEGACY_CRC32(c, words + ptr->pos, ptr->len);
+			FIN_LEGACY_CRC32(c);
 
 			*arr = *(int32 *) &c;
 			arr++;
@@ -271,7 +271,7 @@ Datum
 gtsvector_decompress(PG_FUNCTION_ARGS)
 {
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
-	SignTSVector *key = (SignTSVector *) DatumGetPointer(PG_DETOAST_DATUM(entry->key));
+	SignTSVector *key = (SignTSVector *) PG_DETOAST_DATUM(entry->key);
 
 	if (key != (SignTSVector *) DatumGetPointer(entry->key))
 	{
