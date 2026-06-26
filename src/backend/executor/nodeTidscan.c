@@ -26,6 +26,7 @@
 
 #include "access/sysattr.h"
 #include "catalog/pg_type.h"
+#include "cdb/cdbvars.h"
 #include "executor/execdebug.h"
 #include "executor/nodeTidscan.h"
 #include "optimizer/clauses.h"
@@ -172,6 +173,7 @@ TidListCreate(TidScanState *tidstate)
 						   RelationGetRelid(tidstate->ss.ss_currentRelation),
 							  &cursor_tid))
 			{
+				Assert(ItemPointerIsValid(&cursor_tid));
 				if (numTids >= numAllocTids)
 				{
 					numAllocTids *= 2;
@@ -329,7 +331,7 @@ TidNext(TidScanState *node)
 			 * pointers onto disk pages and were not created with palloc() and
 			 * so should not be pfree()'d.
 			 */
-			ExecStoreTuple(tuple,		/* tuple to store */
+			ExecStoreHeapTuple(tuple,		/* tuple to store */
 						   slot,	/* slot to store in */
 						   buffer,		/* buffer associated with tuple  */
 						   false);		/* don't pfree */
@@ -438,6 +440,7 @@ ExecEndTidScan(TidScanState *node)
 	 * close the heap relation.
 	 */
 	ExecCloseScanRelation(node->ss.ss_currentRelation);
+
 }
 
 /* ----------------------------------------------------------------
@@ -499,7 +502,7 @@ ExecInitTidScan(TidScan *node, EState *estate, int eflags)
 	 */
 	ExecAssignExprContext(estate, &tidstate->ss.ps);
 
-	tidstate->ss.ps.ps_TupFromTlist = false;
+	/*tidstate->ss.ps.ps_TupFromTlist = false;*/
 
 	/*
 	 * initialize child expressions
@@ -534,7 +537,6 @@ ExecInitTidScan(TidScan *node, EState *estate, int eflags)
 	currentRelation = ExecOpenScanRelation(estate, node->scan.scanrelid, eflags);
 
 	tidstate->ss.ss_currentRelation = currentRelation;
-	tidstate->ss.ss_currentScanDesc = NULL;		/* no heap scan here */
 
 	/*
 	 * get the scan type from the relation descriptor.

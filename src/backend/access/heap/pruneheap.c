@@ -358,7 +358,9 @@ heap_prune_chain(Relation relation, Buffer buffer, OffsetNumber rootoffnum,
 				i;
 	HeapTupleData tup;
 
+#if 0
 	tup.t_tableOid = RelationGetRelid(relation);
+#endif
 
 	rootlp = PageGetItemId(dp, rootoffnum);
 
@@ -371,7 +373,9 @@ heap_prune_chain(Relation relation, Buffer buffer, OffsetNumber rootoffnum,
 
 		tup.t_data = htup;
 		tup.t_len = ItemIdGetLength(rootlp);
+#if 0
 		tup.t_tableOid = RelationGetRelid(relation);
+#endif
 		ItemPointerSet(&(tup.t_self), BufferGetBlockNumber(buffer), rootoffnum);
 
 		if (HeapTupleHeaderIsHeapOnly(htup))
@@ -394,7 +398,7 @@ heap_prune_chain(Relation relation, Buffer buffer, OffsetNumber rootoffnum,
 			 * either here or while following a chain below.  Whichever path
 			 * gets there first will mark the tuple unused.
 			 */
-			if (HeapTupleSatisfiesVacuum(&tup, OldestXmin, buffer)
+			if (HeapTupleSatisfiesVacuum(relation, &tup, OldestXmin, buffer)
 				== HEAPTUPLE_DEAD && !HeapTupleHeaderIsHotUpdated(htup))
 			{
 				heap_prune_record_unused(prstate, rootoffnum);
@@ -478,7 +482,7 @@ heap_prune_chain(Relation relation, Buffer buffer, OffsetNumber rootoffnum,
 		 */
 		tupdead = recent_dead = false;
 
-		switch (HeapTupleSatisfiesVacuum(&tup, OldestXmin, buffer))
+		switch (HeapTupleSatisfiesVacuum(relation, &tup, OldestXmin, buffer))
 		{
 			case HEAPTUPLE_DEAD:
 				tupdead = true;
@@ -543,6 +547,9 @@ heap_prune_chain(Relation relation, Buffer buffer, OffsetNumber rootoffnum,
 		 */
 		if (!HeapTupleHeaderIsHotUpdated(htup))
 			break;
+
+		/* HOT implies it can't have moved to different segment */
+		Assert(!HeapTupleHeaderIndicatesMovedPartitions(htup));
 
 		/*
 		 * Advance to next chain member.
@@ -814,6 +821,9 @@ heap_get_root_tuples(Page page, OffsetNumber *root_offsets)
 			/* Advance to next chain member, if any */
 			if (!HeapTupleHeaderIsHotUpdated(htup))
 				break;
+
+			/* HOT implies it can't have moved to different segment */
+			Assert(!HeapTupleHeaderIndicatesMovedPartitions(htup));
 
 			nextoffnum = ItemPointerGetOffsetNumber(&htup->t_ctid);
 			priorXmax = HeapTupleHeaderGetUpdateXid(htup);

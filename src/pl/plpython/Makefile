@@ -31,12 +31,16 @@ python_includespec := $(subst \,/,$(python_includespec))
 override python_libspec =
 endif
 
+override python_libspec := -L${python_configdir}/../.. ${python_libspec}
+
 # If we don't have a shared library, we have to skip it.
 ifeq ($(shared_libpython),yes)
 
-override CPPFLAGS := -I. -I$(srcdir) $(python_includespec) $(CPPFLAGS)
+# do not fail build due to warnings in this code
+#override CPPFLAGS := -Wno-error -I. -I$(srcdir) $(python_includespec) $(CPPFLAGS) -DPLPYTHON_SHOW_DEBUG_INFO
+override CPPFLAGS := -Wno-error -I. -I$(srcdir) $(python_includespec) $(CPPFLAGS)
 
-rpathdir = $(python_libdir)
+rpathdir = $(python_libdir):$(INSTLOC)/ext/python/lib
 
 NAME = plpython$(python_majorversion)
 
@@ -108,6 +112,8 @@ REGRESS = \
 	plpython_quote \
 	plpython_composite \
 	plpython_subtransaction \
+	plpython_returns \
+	plpython_gpdb \
 	plpython_drop
 
 REGRESS_PLPYTHON3_MANGLE := $(REGRESS)

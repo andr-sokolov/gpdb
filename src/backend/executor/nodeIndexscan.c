@@ -25,6 +25,7 @@
 #include "postgres.h"
 
 #include "access/nbtree.h"
+#include "cdb/cdbvars.h"
 #include "access/relscan.h"
 #include "executor/execdebug.h"
 #include "executor/nodeIndexscan.h"
@@ -82,7 +83,7 @@ IndexNext(IndexScanState *node)
 		 * Note: we pass 'false' because tuples returned by amgetnext are
 		 * pointers onto disk pages and must not be pfree()'d.
 		 */
-		ExecStoreTuple(tuple,	/* tuple to store */
+		ExecStoreHeapTuple(tuple,	/* tuple to store */
 					   slot,	/* slot to store in */
 					   scandesc->xs_cbuf,		/* buffer containing tuple */
 					   false);	/* don't pfree */
@@ -401,11 +402,17 @@ ExecEndIndexScan(IndexScanState *node)
 
 	/*
 	 * Free the exprcontext(s) ... now dead code, see ExecFreeExprContext
+	 *
+	 * GPDB: This is not dead code in GPDB, because we don't want to leak
+	 * exprcontexts in a dynamic index scan.
 	 */
-#ifdef NOT_USED
+#if 1
 	ExecFreeExprContext(&node->ss.ps);
 	if (node->iss_RuntimeContext)
+	{
 		FreeExprContext(node->iss_RuntimeContext, true);
+		node->iss_RuntimeContext = NULL;
+	}
 #endif
 
 	/*
@@ -418,7 +425,7 @@ ExecEndIndexScan(IndexScanState *node)
 	 * close the index relation (no-op if we didn't open it)
 	 */
 	if (indexScanDesc)
-		index_endscan(indexScanDesc);
+		index_endscan(node->iss_ScanDesc);
 	if (indexRelationDesc)
 		index_close(indexRelationDesc, NoLock);
 
@@ -426,6 +433,7 @@ ExecEndIndexScan(IndexScanState *node)
 	 * close the heap relation.
 	 */
 	ExecCloseScanRelation(relation);
+
 }
 
 /* ----------------------------------------------------------------
@@ -462,8 +470,22 @@ ExecIndexRestrPos(IndexScanState *node)
 IndexScanState *
 ExecInitIndexScan(IndexScan *node, EState *estate, int eflags)
 {
-	IndexScanState *indexstate;
 	Relation	currentRelation;
+
+	/*
+	 * open the base relation and acquire appropriate lock on it.
+	 */
+	currentRelation = ExecOpenScanRelation(estate, node->scan.scanrelid, eflags);
+
+	return ExecInitIndexScanForPartition(node, estate, eflags,
+										 currentRelation, node->indexid);
+}
+
+IndexScanState *
+ExecInitIndexScanForPartition(IndexScan *node, EState *estate, int eflags,
+							  Relation currentRelation, Oid indexid)
+{
+	IndexScanState *indexstate;
 	bool		relistarget;
 
 	/*
@@ -480,7 +502,7 @@ ExecInitIndexScan(IndexScan *node, EState *estate, int eflags)
 	 */
 	ExecAssignExprContext(estate, &indexstate->ss.ps);
 
-	indexstate->ss.ps.ps_TupFromTlist = false;
+	/*indexstate->ss.ps.ps_TupFromTlist = false;*/
 
 	/*
 	 * initialize child expressions
@@ -508,13 +530,7 @@ ExecInitIndexScan(IndexScan *node, EState *estate, int eflags)
 	ExecInitResultTupleSlot(estate, &indexstate->ss.ps);
 	ExecInitScanTupleSlot(estate, &indexstate->ss);
 
-	/*
-	 * open the base relation and acquire appropriate lock on it.
-	 */
-	currentRelation = ExecOpenScanRelation(estate, node->scan.scanrelid, eflags);
-
 	indexstate->ss.ss_currentRelation = currentRelation;
-	indexstate->ss.ss_currentScanDesc = NULL;	/* no heap scan here */
 
 	/*
 	 * get the scan type from the relation descriptor.
@@ -543,7 +559,7 @@ ExecInitIndexScan(IndexScan *node, EState *estate, int eflags)
 	 * taking another lock here.  Otherwise we need a normal reader's lock.
 	 */
 	relistarget = ExecRelationIsTargetRelation(estate, node->scan.scanrelid);
-	indexstate->iss_RelationDesc = index_open(node->indexid,
+	indexstate->iss_RelationDesc = index_open(indexid,
 									 relistarget ? NoLock : AccessShareLock);
 
 	/*

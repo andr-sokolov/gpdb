@@ -86,7 +86,6 @@
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
 
-
 /*
  * Defines for MultiXactOffset page sizes.  A page is the same BLCKSZ as is
  * used everywhere else in Postgres.
@@ -2129,6 +2128,7 @@ ShutdownMultiXact(void)
 	TRACE_POSTGRESQL_MULTIXACT_CHECKPOINT_START(false);
 	SimpleLruFlush(MultiXactOffsetCtl, false);
 	SimpleLruFlush(MultiXactMemberCtl, false);
+
 	TRACE_POSTGRESQL_MULTIXACT_CHECKPOINT_DONE(false);
 }
 
@@ -2136,7 +2136,7 @@ ShutdownMultiXact(void)
  * Get the MultiXact data to save in a checkpoint record
  */
 void
-MultiXactGetCheckptMulti(bool is_shutdown,
+MultiXactGetCheckptMulti(bool is_shutdown __attribute__((unused)) ,
 						 MultiXactId *nextMulti,
 						 MultiXactOffset *nextMultiOffset,
 						 MultiXactId *oldestMulti,
@@ -3196,7 +3196,7 @@ WriteMZeroPageXlogRec(int pageno, uint8 info)
  * MULTIXACT resource manager's routines
  */
 void
-multixact_redo(XLogRecPtr lsn, XLogRecord *record)
+multixact_redo(XLogRecPtr beginLoc __attribute__((unused)), XLogRecPtr lsn __attribute__((unused)), XLogRecord *record)
 {
 	uint8		info = record->xl_info & ~XLR_INFO_MASK;
 

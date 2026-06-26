@@ -69,6 +69,7 @@ Node *replication_parse_result;
 %token K_PROGRESS
 %token K_FAST
 %token K_NOWAIT
+%token K_EXCLUDE
 %token K_MAX_RATE
 %token K_WAL
 %token K_TIMELINE
@@ -167,6 +168,11 @@ base_backup_opt:
 				{
 				  $$ = makeDefElem("max_rate",
 								   (Node *)makeInteger($2));
+				}
+			| K_EXCLUDE SCONST
+				{
+				  $$ = makeDefElem("exclude",
+						  (Node *) makeString($2));
 				}
 			;
 

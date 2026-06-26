@@ -62,6 +62,10 @@
 #include "utils/syscache.h"
 #include "utils/tqual.h"
 
+#include "cdb/cdbtm.h"
+#include "cdb/cdbvars.h"
+#include "utils/guc.h"
+
 
 /*
  * CurrentSnapshot points to the only snapshot taken in transaction-snapshot
@@ -204,7 +208,7 @@ GetTransactionSnapshot(void)
 			if (IsolationIsSerializable())
 				CurrentSnapshot = GetSerializableTransactionSnapshot(&CurrentSnapshotData);
 			else
-				CurrentSnapshot = GetSnapshotData(&CurrentSnapshotData);
+				CurrentSnapshot = GetSnapshotData(&CurrentSnapshotData, DistributedTransactionContext);
 			/* Make a saved copy */
 			CurrentSnapshot = CopySnapshot(CurrentSnapshot);
 			FirstXactSnapshot = CurrentSnapshot;
@@ -213,19 +217,39 @@ GetTransactionSnapshot(void)
 			RegisteredSnapshots++;
 		}
 		else
-			CurrentSnapshot = GetSnapshotData(&CurrentSnapshotData);
+			CurrentSnapshot = GetSnapshotData(&CurrentSnapshotData, DistributedTransactionContext);
 
 		FirstSnapshotSet = true;
 		return CurrentSnapshot;
 	}
 
 	if (IsolationUsesXactSnapshot())
+	{
+		elogif(Debug_print_snapshot_dtm, LOG,
+			   "[Distributed Snapshot #%u] *Serializable* (gxid = %u, '%s')",
+			   CurrentSnapshot->distribSnapshotWithLocalMapping.ds.distribSnapshotId,
+			   getDistributedTransactionId(),
+			   DtxContextToString(DistributedTransactionContext));
+
+		// GPDB_91_MERGE_FIXME: the name of UpdateSerializableCommandId is a bit
+		// wrong, now that SERIALIZABLE and REPEATABLE READ are not the same.
+		// From comparison, the if-check above was changed from checking
+		// IsXactIsoLevelSerializable to IsolationUsesXactSnapshot()
+		UpdateSerializableCommandId(CurrentSnapshot->curcid);
+
 		return CurrentSnapshot;
+	}
 
 	/* Don't allow catalog snapshot to be older than xact snapshot. */
 	InvalidateCatalogSnapshot();
 
-	CurrentSnapshot = GetSnapshotData(&CurrentSnapshotData);
+	CurrentSnapshot = GetSnapshotData(&CurrentSnapshotData, DistributedTransactionContext);
+
+	elogif(Debug_print_snapshot_dtm, LOG,
+		   "[Distributed Snapshot #%u] (gxid = %u, '%s')",
+		   CurrentSnapshot->distribSnapshotWithLocalMapping.ds.distribSnapshotId,
+		   getDistributedTransactionId(),
+		   DtxContextToString(DistributedTransactionContext));
 
 	return CurrentSnapshot;
 }
@@ -238,6 +262,7 @@ GetTransactionSnapshot(void)
 Snapshot
 GetLatestSnapshot(void)
 {
+	DtxContext               dtxctx;
 	/*
 	 * So far there are no cases requiring support for GetLatestSnapshot()
 	 * during logical decoding, but it wouldn't be hard to add if required.
@@ -248,7 +273,27 @@ GetLatestSnapshot(void)
 	if (!FirstSnapshotSet)
 		return GetTransactionSnapshot();
 
-	SecondarySnapshot = GetSnapshotData(&SecondarySnapshotData);
+	/*
+	 * Greenplum specific behavior
+	 * On QEs, we cannot create a latest global snapshot. However, this function
+	 * is called mainly in executor, for example some alter table statements that
+	 * need to rewrite a new heap will invoke this and scan the old heap via the
+	 * latest snapshot. But distributed snapshot can only be created in QD, and
+	 * QEs can only set the distributed snapshot from QD through Dispatch. So
+	 * we always return the latest local snapshot in this function when in QD.
+	 * Sometimes in QD we have to get latest snapshot with distributed snapshot
+	 * and then dispatch it to QEs, a typical example is ATExecExpandTableCTAS.
+	 * ATExecExpandTableCTAS and ATExecSetDistributedBy functions are implemented
+	 * as:nn
+	 *   1. build a query CTAS that scan the old table into a new table in QD
+	 *   2. ExecutorStart, ExecutorRun, ExecutorEnd the above query
+	 * So they have to use the latest snapshot to scan the old table no matter
+	 * what is the isolation level of the transaction.
+	 *
+	 * See github issue: https://github.com/greenplum-db/gpdb/issues/10216
+	 */
+	dtxctx = Gp_role == GP_ROLE_DISPATCH ? DistributedTransactionContext : DTX_CONTEXT_LOCAL_ONLY;
+	SecondarySnapshot = GetSnapshotData(&SecondarySnapshotData, dtxctx);
 
 	return SecondarySnapshot;
 }
@@ -271,7 +316,7 @@ GetCatalogSnapshot(Oid relid)
 	if (HistoricSnapshotActive())
 		return HistoricSnapshot;
 
-	return GetNonHistoricCatalogSnapshot(relid);
+	return GetNonHistoricCatalogSnapshot(relid, DTX_CONTEXT_LOCAL_ONLY);
 }
 
 /*
@@ -281,7 +326,7 @@ GetCatalogSnapshot(Oid relid)
  *		up.
  */
 Snapshot
-GetNonHistoricCatalogSnapshot(Oid relid)
+GetNonHistoricCatalogSnapshot(Oid relid, DtxContext distributedTransactionContext)
 {
 	/*
 	 * If the caller is trying to scan a relation that has no syscache, no
@@ -298,7 +343,9 @@ GetNonHistoricCatalogSnapshot(Oid relid)
 	if (CatalogSnapshot == NULL)
 	{
 		/* Get new snapshot. */
-		CatalogSnapshot = GetSnapshotData(&CatalogSnapshotData);
+		CatalogSnapshot = GetSnapshotData(
+			&CatalogSnapshotData,
+			distributedTransactionContext);
 
 		/*
 		 * Make sure the catalog snapshot will be accounted for in decisions
@@ -402,7 +449,7 @@ SetTransactionSnapshot(Snapshot sourcesnap, TransactionId sourcexid)
 	 * two variables in exported snapshot files, but it seems better to have
 	 * snapshot importers compute reasonably up-to-date values for them.)
 	 */
-	CurrentSnapshot = GetSnapshotData(&CurrentSnapshotData);
+	CurrentSnapshot = GetSnapshotData(&CurrentSnapshotData, DistributedTransactionContext);
 
 	/*
 	 * Now copy appropriate fields from the source snapshot.
@@ -471,15 +518,29 @@ CopySnapshot(Snapshot snapshot)
 {
 	Snapshot	newsnap;
 	Size		subxipoff;
+	Size		dsoff = 0;
 	Size		size;
 
 	Assert(snapshot != InvalidSnapshot);
+
+	if (!IsMVCCSnapshot(snapshot))
+		return snapshot;
 
 	/* We allocate any XID arrays needed in the same palloc block. */
 	size = subxipoff = sizeof(SnapshotData) +
 		snapshot->xcnt * sizeof(TransactionId);
 	if (snapshot->subxcnt > 0)
 		size += snapshot->subxcnt * sizeof(TransactionId);
+
+	if (snapshot->haveDistribSnapshot &&
+		snapshot->distribSnapshotWithLocalMapping.ds.count > 0)
+	{
+		dsoff = size;
+		size += snapshot->distribSnapshotWithLocalMapping.ds.count *
+			sizeof(DistributedTransactionId);
+		size += snapshot->distribSnapshotWithLocalMapping.currentLocalXidsCount *
+			sizeof(TransactionId);
+	}
 
 	newsnap = (Snapshot) MemoryContextAlloc(TopTransactionContext, size);
 	memcpy(newsnap, snapshot, sizeof(SnapshotData));
@@ -514,6 +575,53 @@ CopySnapshot(Snapshot snapshot)
 	else
 		newsnap->subxip = NULL;
 
+	if (snapshot->haveDistribSnapshot &&
+		snapshot->distribSnapshotWithLocalMapping.ds.count > 0)
+	{
+		newsnap->distribSnapshotWithLocalMapping.ds.inProgressXidArray =
+			(DistributedTransactionId*) ((char *) newsnap + dsoff);
+		memcpy(newsnap->distribSnapshotWithLocalMapping.ds.inProgressXidArray,
+			   snapshot->distribSnapshotWithLocalMapping.ds.inProgressXidArray,
+			   snapshot->distribSnapshotWithLocalMapping.ds.count *
+			   sizeof(DistributedTransactionId));
+
+		Assert(snapshot->distribSnapshotWithLocalMapping.ds.count ==
+			   newsnap->distribSnapshotWithLocalMapping.ds.count);
+
+		/* Store -1 as the maxCount, to indicate that the array was not malloc'd */
+		newsnap->distribSnapshotWithLocalMapping.ds.maxCount = -1;
+
+		/*
+		 * Increment offset to point to next chunk of memory allocated for
+		 * cache.
+		 */
+		dsoff +=snapshot->distribSnapshotWithLocalMapping.ds.count *
+			sizeof(DistributedTransactionId);
+
+		/* Copy the local xid cache */
+		if (IS_QUERY_DISPATCHER())
+		{
+			newsnap->distribSnapshotWithLocalMapping.inProgressMappedLocalXids = NULL;
+			newsnap->distribSnapshotWithLocalMapping.maxLocalXidsCount = 0;
+			newsnap->distribSnapshotWithLocalMapping.currentLocalXidsCount = 0;
+		}
+		else
+		{
+			newsnap->distribSnapshotWithLocalMapping.inProgressMappedLocalXids =
+				(TransactionId*) ((char *) newsnap + dsoff);
+			memcpy(newsnap->distribSnapshotWithLocalMapping.inProgressMappedLocalXids,
+				   snapshot->distribSnapshotWithLocalMapping.inProgressMappedLocalXids,
+				   snapshot->distribSnapshotWithLocalMapping.currentLocalXidsCount *
+				   sizeof(TransactionId));
+			newsnap->distribSnapshotWithLocalMapping.maxLocalXidsCount =
+				snapshot->distribSnapshotWithLocalMapping.currentLocalXidsCount;
+		}
+	}
+	else
+	{
+		newsnap->distribSnapshotWithLocalMapping.ds.inProgressXidArray = NULL;
+	}
+
 	return newsnap;
 }
 
@@ -524,6 +632,9 @@ CopySnapshot(Snapshot snapshot)
 static void
 FreeSnapshot(Snapshot snapshot)
 {
+	if (!IsMVCCSnapshot(snapshot))
+		return;
+
 	Assert(snapshot->regd_count == 0);
 	Assert(snapshot->active_count == 0);
 	Assert(snapshot->copied);
@@ -1400,4 +1511,18 @@ HistoricSnapshotGetTupleCids(void)
 {
 	Assert(HistoricSnapshotActive());
 	return tuplecid_data;
+}
+
+
+DistributedSnapshotWithLocalMapping *
+GetCurrentDistributedSnapshotWithLocalMapping()
+{
+	if (!FirstSnapshotSet)
+		return NULL;
+
+	Assert(CurrentSnapshot);
+	if (CurrentSnapshot->haveDistribSnapshot)
+		return &CurrentSnapshot->distribSnapshotWithLocalMapping;
+
+	return NULL;
 }

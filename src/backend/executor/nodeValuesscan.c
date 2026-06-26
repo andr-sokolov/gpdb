@@ -4,6 +4,8 @@
  *	  Support routines for scanning Values lists
  *	  ("VALUES (...), (...), ..." in rangetable).
  *
+ * Portions Copyright (c) 2006-2008, Greenplum inc
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -23,9 +25,12 @@
  */
 #include "postgres.h"
 
+#include "cdb/cdbvars.h"
 #include "executor/executor.h"
 #include "executor/nodeValuesscan.h"
 #include "optimizer/clauses.h"
+#include "optimizer/var.h"              /* CDB: contain_var_reference() */
+#include "parser/parsetree.h"
 
 
 static TupleTableSlot *ValuesNext(ValuesScanState *node);
@@ -130,8 +135,9 @@ ValuesNext(ValuesScanState *node)
 		 * Compute the expressions and build a virtual result tuple. We
 		 * already did ExecClearTuple(slot).
 		 */
-		values = slot->tts_values;
-		isnull = slot->tts_isnull;
+		ExecClearTuple(slot); 
+		values = slot_get_values(slot); 
+		isnull = slot_get_isnull(slot);
 
 		resind = 0;
 		foreach(lc, exprstatelist)
@@ -151,6 +157,21 @@ ValuesNext(ValuesScanState *node)
 		 * And return the virtual tuple.
 		 */
 		ExecStoreVirtualTuple(slot);
+
+		/*
+		 * CDB: Label each row with a synthetic ctid for subquery dedup.
+		 *
+		 * Values Scan supports backward scans too, so we can't use
+		 * slot_set_ctid_from_fake() like most scan types do.
+		 */
+		if (node->cdb_want_ctid)
+        {
+			HeapTuple	tuple = ExecFetchSlotHeapTuple(slot);
+
+			ItemPointerSet(&tuple->t_self,
+						   (BlockNumber) (node->curr_idx / 1024),
+						   (OffsetNumber) ((node->curr_idx % 1024) + 1));
+        }
 	}
 
 	return slot;
@@ -239,6 +260,9 @@ ExecInitValuesScan(ValuesScan *node, EState *estate, int eflags)
 		ExecInitExpr((Expr *) node->scan.plan.qual,
 					 (PlanState *) scanstate);
 
+	/* Check if targetlist or qual contains a var node referencing the ctid column */
+	scanstate->cdb_want_ctid = contain_ctid_var_reference(&node->scan);
+
 	/*
 	 * get info about values list
 	 */
@@ -287,8 +311,6 @@ ExecInitValuesScan(ValuesScan *node, EState *estate, int eflags)
 		i++;
 	}
 
-	scanstate->ss.ps.ps_TupFromTlist = false;
-
 	/*
 	 * Initialize result tuple type and projection info.
 	 */
@@ -319,6 +341,7 @@ ExecEndValuesScan(ValuesScanState *node)
 	 */
 	ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
 	ExecClearTuple(node->ss.ss_ScanTupleSlot);
+
 }
 
 /* ----------------------------------------------------------------
