@@ -16,20 +16,28 @@
 
 #include "access/htup_details.h"
 #include "catalog/pg_aggregate.h"
+#include "catalog/pg_attrdef.h"
+#include "catalog/pg_constraint.h"
+#include "catalog/pg_partition_rule.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_proc_callback.h"
 #include "catalog/pg_type.h"
 #include "funcapi.h"
+#include "miscadmin.h"
 #include "lib/stringinfo.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "parser/parse_agg.h"
 #include "parser/parse_clause.h"
 #include "parser/parse_coerce.h"
+#include "parser/parse_expr.h"
 #include "parser/parse_func.h"
 #include "parser/parse_relation.h"
 #include "parser/parse_target.h"
 #include "parser/parse_type.h"
+#include "parser/parsetree.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 
@@ -41,7 +49,15 @@ static Oid	FuncNameAsType(List *funcname);
 static Node *ParseComplexProjection(ParseState *pstate, char *funcname,
 					   Node *first_arg, int location);
 
+typedef struct
+{
+	Node *parent;
+} check_table_func_context;
 
+static bool 
+checkTableFunctions_walker(Node *node, check_table_func_context *context);
+
+static void check_srf_call_placement(ParseState *pstate, int location);
 /*
  *	Parse a function call
  *
@@ -260,15 +276,21 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 		if (agg_star)
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-			   errmsg("%s(*) specified, but %s is not an aggregate function",
-					  NameListToString(funcname),
-					  NameListToString(funcname)),
+					 errmsg("%s(*) specified, but %s is not an aggregate function",
+							NameListToString(funcname),
+							NameListToString(funcname)),
 					 parser_errposition(pstate, location)));
 		if (agg_distinct)
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-			errmsg("DISTINCT specified, but %s is not an aggregate function",
-				   NameListToString(funcname)),
+					 errmsg("DISTINCT specified, but %s is not an aggregate function",
+							NameListToString(funcname)),
+					 parser_errposition(pstate, location)));
+		if (agg_within_group)
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("WITHIN GROUP specified, but %s is not an aggregate function",
+							NameListToString(funcname)),
 					 parser_errposition(pstate, location)));
 		if (agg_within_group)
 			ereport(ERROR,
@@ -511,8 +533,8 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 					 errmsg("function %s does not exist",
 							func_signature_string(funcname, nargs, argnames,
 												  actual_arg_types)),
-			errhint("No function matches the given name and argument types. "
-					"You might need to add explicit type casts."),
+					 errhint("No function matches the given name and argument types. "
+							 "You might need to add explicit type casts."),
 					 parser_errposition(pstate, location)));
 	}
 
@@ -618,6 +640,9 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 									  exprLocation((Node *) llast(fargs)))));
 	}
 
+	if (retset)
+		check_srf_call_placement(pstate, location);
+
 	/* build the appropriate output structure */
 	if (fdresult == FUNCDETAIL_NORMAL)
 	{
@@ -654,13 +679,17 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 		/*
 		 * Reject attempt to call a parameterless aggregate without (*)
 		 * syntax.  This is mere pedantry but some folks insisted ...
+		 *
+		 * GPDB: We allow this in GPDB.
 		 */
+#if 0
 		if (fargs == NIL && !agg_star && !agg_within_group)
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 					 errmsg("%s(*) must be used to call a parameterless aggregate function",
 							NameListToString(funcname)),
 					 parser_errposition(pstate, location)));
+#endif
 
 		if (retset)
 			ereport(ERROR,
@@ -706,25 +735,41 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 		wfunc->aggfilter = agg_filter;
 		wfunc->location = location;
 
+		wfunc->windistinct = agg_distinct;
+
 		/*
 		 * agg_star is allowed for aggregate functions but distinct isn't
+		 *
+		 * GPDB: We have implemented this in GPDB, with some limitations.
 		 */
 		if (agg_distinct)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				  errmsg("DISTINCT is not implemented for window functions"),
-					 parser_errposition(pstate, location)));
+		{
+			if (fdresult == FUNCDETAIL_WINDOWFUNC)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("DISTINCT is not implemented for window functions"),
+						 parser_errposition(pstate, location)));
+
+			if (list_length(fargs) != 1)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("DISTINCT is supported only for single-argument window aggregates")));
+		}
 
 		/*
 		 * Reject attempt to call a parameterless aggregate without (*)
 		 * syntax.  This is mere pedantry but some folks insisted ...
+		 *
+		 * GPDB: We allow this in GPDB.
 		 */
+#if 0
 		if (wfunc->winagg && fargs == NIL && !agg_star)
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 					 errmsg("%s(*) must be used to call a parameterless aggregate function",
 							NameListToString(funcname)),
 					 parser_errposition(pstate, location)));
+#endif
 
 		/*
 		 * ordered aggs not allowed in windows yet
@@ -755,6 +800,32 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 
 		retval = (Node *) wfunc;
 	}
+
+	/*
+	 * Mark the context if this is a dynamic typed function, if so we mustn't
+	 * allow views to be created from this statement because we cannot 
+	 * guarantee that the future return type will be the same as the current
+	 * return type.
+	 */
+	if (TypeSupportsDescribe(rettype))
+	{
+		Oid DescribeFuncOid = lookupProcCallback(funcid, PROMETHOD_DESCRIBE);
+		if (OidIsValid(DescribeFuncOid))
+		{
+			ParseState *state = pstate;
+
+			for (state = pstate; state; state = state->parentParseState)
+				state->p_hasDynamicFunction = true;
+		}
+	}
+
+	/*
+	 * If this function has restrictions on where it can be executed
+	 * (EXECUTE ON MASTER or EXECUTE ON ALL SEGMENTS), make note of that,
+	 * so that the planner knows to be prepared for it.
+	 */
+	if (func_exec_location(funcid) != PROEXECLOCATION_ANY)
+		pstate->p_hasFuncsWithExecRestrictions = true;
 
 	return retval;
 }
@@ -2028,4 +2099,210 @@ LookupAggNameTypeNames(List *aggname, List *argtypes, bool noError)
 	ReleaseSysCache(ftup);
 
 	return oid;
+}
+
+/*
+ * check_srf_call_placement
+ *		Verify that a set-returning function is called in a valid place,
+ *		and throw a nice error if not.
+ *
+ * This is a partial cherry-pick of upstream commit a4c35ea1c from
+ * REL_12_STABLE.  It was found that queries with set returning functions on
+ * the left of ANY/ALL operator lead to wrong results.  Such queries and more
+ * are prohibited by the upstream commit.
+ */
+static void
+check_srf_call_placement(ParseState *pstate, int location)
+{
+	const char *err;
+	bool		errkind;
+
+	/*
+	 * Check to see if the set-returning function is in an invalid place
+	 * within the query.  Basically, we don't allow SRFs anywhere except in
+	 * the targetlist (which includes GROUP BY/ORDER BY expressions), VALUES,
+	 * and functions in FROM.
+	 *
+	 * For brevity we support two schemes for reporting an error here: set
+	 * "err" to a custom message, or set "errkind" true if the error context
+	 * is sufficiently identified by what ParseExprKindName will return, *and*
+	 * what it will return is just a SQL keyword.  (Otherwise, use a custom
+	 * message to avoid creating translation problems.)
+	 */
+	err = NULL;
+	errkind = false;
+	switch (pstate->p_expr_kind)
+	{
+		case EXPR_KIND_NONE:
+			Assert(false);		/* can't happen */
+			break;
+		case EXPR_KIND_OTHER:
+			/* Accept SRF here; caller must throw error if wanted */
+			break;
+		case EXPR_KIND_JOIN_ON:
+		case EXPR_KIND_JOIN_USING:
+			err = _("set-returning functions are not allowed in JOIN conditions");
+			break;
+		case EXPR_KIND_FROM_SUBSELECT:
+			/* can't get here, but just in case, throw an error */
+			errkind = true;
+			break;
+		case EXPR_KIND_FROM_FUNCTION:
+			break;
+		case EXPR_KIND_WHERE:
+			errkind = true;
+			break;
+		case EXPR_KIND_HAVING:
+			errkind = true;
+			break;
+		case EXPR_KIND_FILTER:
+			errkind = true;
+			break;
+		case EXPR_KIND_WINDOW_PARTITION:
+		case EXPR_KIND_WINDOW_ORDER:
+			break;
+		case EXPR_KIND_WINDOW_FRAME_RANGE:
+		case EXPR_KIND_WINDOW_FRAME_ROWS:
+			err = _("set-returning functions are not allowed in window definitions");
+			break;
+		case EXPR_KIND_SELECT_TARGET:
+		case EXPR_KIND_INSERT_TARGET:
+			break;
+		case EXPR_KIND_UPDATE_SOURCE:
+		case EXPR_KIND_UPDATE_TARGET:
+			/* disallowed because it would be ambiguous what to do */
+			errkind = true;
+			break;
+		case EXPR_KIND_GROUP_BY:
+		case EXPR_KIND_ORDER_BY:
+		case EXPR_KIND_DISTINCT_ON:
+			break;
+		case EXPR_KIND_LIMIT:
+		case EXPR_KIND_OFFSET:
+			errkind = true;
+			break;
+		case EXPR_KIND_RETURNING:
+			errkind = true;
+			break;
+		case EXPR_KIND_VALUES:
+			break;
+		case EXPR_KIND_CHECK_CONSTRAINT:
+		case EXPR_KIND_DOMAIN_CHECK:
+			err = _("set-returning functions are not allowed in check constraints");
+			break;
+		case EXPR_KIND_COLUMN_DEFAULT:
+		case EXPR_KIND_FUNCTION_DEFAULT:
+			err = _("set-returning functions are not allowed in DEFAULT expressions");
+			break;
+		case EXPR_KIND_INDEX_EXPRESSION:
+			err = _("set-returning functions are not allowed in index expressions");
+			break;
+		case EXPR_KIND_INDEX_PREDICATE:
+			err = _("set-returning functions are not allowed in index predicates");
+			break;
+		case EXPR_KIND_ALTER_COL_TRANSFORM:
+			err = _("set-returning functions are not allowed in transform expressions");
+			break;
+		case EXPR_KIND_EXECUTE_PARAMETER:
+			err = _("set-returning functions are not allowed in EXECUTE parameters");
+			break;
+		case EXPR_KIND_TRIGGER_WHEN:
+			err = _("set-returning functions are not allowed in trigger WHEN conditions");
+			break;
+		case EXPR_KIND_PARTITION_EXPRESSION:
+			err = _("set-returning functions are not allowed in partition key expressions");
+			break;
+
+		case EXPR_KIND_SCATTER_BY:
+			err = _("set-returning functions are not allowed in scatter by expressions");
+			break;
+
+			/*
+			 * There is intentionally no default: case here, so that the
+			 * compiler will warn if we add a new ParseExprKind without
+			 * extending this switch.  If we do see an unrecognized value at
+			 * runtime, the behavior will be the same as for EXPR_KIND_OTHER,
+			 * which is sane anyway.
+			 */
+	}
+	if (err)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg_internal("%s", err),
+				 parser_errposition(pstate, location)));
+	if (errkind)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+		/* translator: %s is name of a SQL construct, eg GROUP BY */
+				 errmsg("set-returning functions are not allowed in %s",
+						ParseExprKindName(pstate->p_expr_kind)),
+				 parser_errposition(pstate, location)));
+}
+
+
+/*
+ * parseCheckTableFunctions
+ *
+ *	Check for TableValueExpr where they shouldn't be.  Currently the only
+ *  valid location for a TableValueExpr is within a call to a table function.
+ *  In the full SQL Standard they can exist anywhere a multiset is supported.
+ */
+void 
+parseCheckTableFunctions(ParseState *pstate, Query *qry)
+{
+	check_table_func_context context;
+	context.parent = NULL;
+	query_tree_walker(qry, 
+					  checkTableFunctions_walker,
+					  (void *) &context, 0);
+}
+
+static bool 
+checkTableFunctions_walker(Node *node, check_table_func_context *context)
+{
+	if (node == NULL)
+		return false;
+
+	/* 
+	 * TABLE() value expressions are currently only permited as parameters
+	 * to table functions called in the FROM clause.
+	 */
+	if (IsA(node, TableValueExpr))
+	{
+		if (context->parent && IsA(context->parent, FuncExpr))
+		{ 
+			FuncExpr *parent = (FuncExpr *) context->parent;
+
+			/*
+			 * This flag is set in addRangeTableEntryForFunction for functions
+			 * called as range table entries having TABLE value expressions
+			 * as arguments.
+			 */
+			if (parent->is_tablefunc)
+				return false;
+
+			/* Error message could be improved */
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("table functions must be invoked in FROM clause")));
+		}
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("invalid use of TABLE value expression")));
+		return true;  /* not possible, but keeps compiler happy */
+	}
+
+	context->parent = node;
+	if (IsA(node, Query))
+	{
+		return query_tree_walker((Query *) node, 
+								 checkTableFunctions_walker,
+								 (void *) context, 0);
+	}
+	else
+	{
+		return expression_tree_walker(node, 
+									  checkTableFunctions_walker, 
+									  (void *) context);
+	}
 }

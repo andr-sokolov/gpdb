@@ -1902,8 +1902,8 @@ CREATE VIEW tables AS
            CAST(nt.nspname AS sql_identifier) AS user_defined_type_schema,
            CAST(t.typname AS sql_identifier) AS user_defined_type_name,
 
-           CAST(CASE WHEN c.relkind = 'r' OR
-                          (c.relkind IN ('v', 'f') AND
+           CAST(CASE WHEN (c.relkind = 'r' AND c.relstorage <> 'x') OR
+                          (c.relkind IN ('v', 'f', 'r') AND
                            -- 1 << CMD_INSERT
                            pg_relation_is_updatable(c.oid, false) & 8 = 8)
                 THEN 'YES' ELSE 'NO' END AS yes_or_no) AS is_insertable_into,
@@ -1913,6 +1913,7 @@ CREATE VIEW tables AS
 
     FROM pg_namespace nc JOIN pg_class c ON (nc.oid = c.relnamespace)
            LEFT JOIN (pg_type t JOIN pg_namespace nt ON (t.typnamespace = nt.oid)) ON (c.reloftype = t.oid)
+           LEFT JOIN pg_exttable x ON c.oid = x.reloid
 
     WHERE c.relkind IN ('r', 'v', 'f')
           AND (NOT pg_is_other_temp_schema(nc.oid))

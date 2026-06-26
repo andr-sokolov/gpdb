@@ -369,11 +369,15 @@ typedef struct xl_heap_rewrite_mapping
 extern void HeapTupleHeaderAdvanceLatestRemovedXid(HeapTupleHeader tuple,
 									   TransactionId *latestRemovedXid);
 
-extern void heap_redo(XLogRecPtr lsn, XLogRecord *rptr);
-extern void heap_desc(StringInfo buf, uint8 xl_info, char *rec);
-extern void heap2_redo(XLogRecPtr lsn, XLogRecord *rptr);
-extern void heap2_desc(StringInfo buf, uint8 xl_info, char *rec);
+extern void heap_redo(XLogRecPtr beginLoc, XLogRecPtr lsn, XLogRecord *rptr);
+extern void heap_desc(StringInfo buf, XLogRecord *record);
+extern bool heap_getrelfilenode(
+	XLogRecord 		*record,
+	RelFileNode		*relFileNode);
+extern void heap2_redo(XLogRecPtr beginLoc, XLogRecPtr lsn, XLogRecord *rptr);
+extern void heap2_desc(StringInfo buf, XLogRecord *record);
 extern void heap_xlog_logical_rewrite(XLogRecPtr lsn, XLogRecord *r);
+extern void heap_mask(char *pagedata, BlockNumber blkno);
 
 extern XLogRecPtr log_heap_cleanup_info(RelFileNode rnode,
 					  TransactionId latestRemovedXid);

@@ -26,6 +26,7 @@
 #include "access/htup_details.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
+#include "catalog/oid_dispatch.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
@@ -39,6 +40,8 @@
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 
+#include "cdb/cdbvars.h"
+#include "cdb/cdbdisp_query.h"
 
 /*
  *	DefineAggregate
@@ -61,6 +64,9 @@ DefineAggregate(List *name, List *args, bool oldstyle, List *parameters,
 	char		aggKind = AGGKIND_NORMAL;
 	List	   *transfuncName = NIL;
 	List	   *finalfuncName = NIL;
+	List	   *combinefuncName = NIL;
+	List	   *serialfuncName = NIL;
+	List	   *deserialfuncName = NIL;
 	List	   *mtransfuncName = NIL;
 	List	   *minvtransfuncName = NIL;
 	List	   *mfinalfuncName = NIL;
@@ -83,10 +89,11 @@ DefineAggregate(List *name, List *args, bool oldstyle, List *parameters,
 	List	   *parameterDefaults;
 	Oid			variadicArgType;
 	Oid			transTypeId;
-	Oid			mtransTypeId = InvalidOid;
 	char		transTypeType;
+	Oid			mtransTypeId = InvalidOid;
 	char		mtransTypeType = 0;
 	ListCell   *pl;
+	List	   *orig_args = args;
 
 	/* Convert list of names to a name and namespace */
 	aggNamespace = QualifiedNameGetCreationNamespace(name, &aggName);
@@ -124,6 +131,16 @@ DefineAggregate(List *name, List *args, bool oldstyle, List *parameters,
 			transfuncName = defGetQualifiedName(defel);
 		else if (pg_strcasecmp(defel->defname, "finalfunc") == 0)
 			finalfuncName = defGetQualifiedName(defel);
+		else if (pg_strcasecmp(defel->defname, "combinefunc") == 0)
+			combinefuncName = defGetQualifiedName(defel);
+		/* Alias for COMBINEFUNC, for backwards-compatibility with
+		 * GPDB 5 and below */
+		else if (pg_strcasecmp(defel->defname, "prefunc") == 0)
+			combinefuncName = defGetQualifiedName(defel);
+		else if (pg_strcasecmp(defel->defname, "serialfunc") == 0)
+			serialfuncName = defGetQualifiedName(defel);
+		else if (pg_strcasecmp(defel->defname, "deserialfunc") == 0)
+			deserialfuncName = defGetQualifiedName(defel);
 		else if (pg_strcasecmp(defel->defname, "msfunc") == 0)
 			mtransfuncName = defGetQualifiedName(defel);
 		else if (pg_strcasecmp(defel->defname, "minvfunc") == 0)
@@ -183,6 +200,14 @@ DefineAggregate(List *name, List *args, bool oldstyle, List *parameters,
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
 				 errmsg("aggregate sfunc must be specified")));
+
+	/*
+	 * MPP: Ordered aggregates do not support combine functions.
+	 */
+	if (aggKind == AGGKIND_ORDERED_SET && combinefuncName != NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+				 errmsg("ordered aggregate combine function is not supported")));
 
 	/*
 	 * if mtransType is given, mtransfuncName and minvtransfuncName must be as
@@ -316,6 +341,27 @@ DefineAggregate(List *name, List *args, bool oldstyle, List *parameters,
 							format_type_be(transTypeId))));
 	}
 
+	if (serialfuncName && deserialfuncName)
+	{
+		/*
+		 * Serialization is only needed/allowed for transtype INTERNAL.
+		 */
+		if (transTypeId != INTERNALOID)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+					 errmsg("serialization functions may be specified only when the aggregate transition data type is %s",
+							format_type_be(INTERNALOID))));
+	}
+	else if (serialfuncName || deserialfuncName)
+	{
+		/*
+		 * Cannot specify one function without the other.
+		 */
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+				 errmsg("must specify both or neither of serialization and deserialization functions")));
+	}
+
 	/*
 	 * If a moving-aggregate transtype is specified, look that up.  Same
 	 * restrictions as for transtype.
@@ -370,7 +416,8 @@ DefineAggregate(List *name, List *args, bool oldstyle, List *parameters,
 	/*
 	 * Most of the argument-checking is done inside of AggregateCreate
 	 */
-	return AggregateCreate(aggName,		/* aggregate name */
+	Oid			aOid;
+	aOid = AggregateCreate(aggName,				/* aggregate name */
 						   aggNamespace,		/* namespace */
 						   aggKind,
 						   numArgs,
@@ -383,6 +430,9 @@ DefineAggregate(List *name, List *args, bool oldstyle, List *parameters,
 						   variadicArgType,
 						   transfuncName,		/* step function name */
 						   finalfuncName,		/* final function name */
+						   combinefuncName,		/* combine function name */
+						   serialfuncName,		/* serial function name */
+						   deserialfuncName,	/* deserial function name */
 						   mtransfuncName,		/* fwd trans function name */
 						   minvtransfuncName,	/* inv trans function name */
 						   mfinalfuncName,		/* final function name */
@@ -395,4 +445,22 @@ DefineAggregate(List *name, List *args, bool oldstyle, List *parameters,
 						   mtransSpace, /* transition space */
 						   initval,		/* initial condition */
 						   minitval);	/* initial condition */
+
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		DefineStmt * stmt = makeNode(DefineStmt);
+		stmt->kind = OBJECT_AGGREGATE;
+		stmt->oldstyle = oldstyle;
+		stmt->defnames = name;
+		stmt->args = orig_args;
+		stmt->definition = parameters;
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									GetAssignedOidsForDispatch(),
+									NULL);
+	}
+
+	return aOid;
 }

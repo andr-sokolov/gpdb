@@ -25,6 +25,8 @@
 #include "catalog/catalog.h"
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
+#include "common/relpath.h"
+#include "commands/dbcommands.h"
 #include "storage/freespace.h"
 #include "storage/smgr.h"
 #include "utils/memutils.h"
@@ -52,8 +54,7 @@
 
 typedef struct PendingRelDelete
 {
-	RelFileNode relnode;		/* relation that may need to be deleted */
-	BackendId	backend;		/* InvalidBackendId if not a temp rel */
+	RelFileNodePendingDelete relnode;		/* relation that may need to be deleted */
 	bool		atCommit;		/* T=delete at commit; F=delete at abort */
 	int			nestLevel;		/* xact nesting level of request */
 	struct PendingRelDelete *next;		/* linked-list link */
@@ -73,7 +74,7 @@ static PendingRelDelete *pendingDeletes = NULL; /* head of linked list */
  * transaction aborts later on, the storage will be destroyed.
  */
 void
-RelationCreateStorage(RelFileNode rnode, char relpersistence)
+RelationCreateStorage(RelFileNode rnode, char relpersistence, char relstorage)
 {
 	PendingRelDelete *pending;
 	SMgrRelation srel;
@@ -83,7 +84,7 @@ RelationCreateStorage(RelFileNode rnode, char relpersistence)
 	switch (relpersistence)
 	{
 		case RELPERSISTENCE_TEMP:
-			backend = MyBackendId;
+			backend = TempRelBackendId;
 			needs_wal = false;
 			break;
 		case RELPERSISTENCE_UNLOGGED:
@@ -108,8 +109,9 @@ RelationCreateStorage(RelFileNode rnode, char relpersistence)
 	/* Add the relation to the list of stuff to delete at abort */
 	pending = (PendingRelDelete *)
 		MemoryContextAlloc(TopMemoryContext, sizeof(PendingRelDelete));
-	pending->relnode = rnode;
-	pending->backend = backend;
+	pending->relnode.node = rnode;
+	pending->relnode.relstorage = relstorage;
+	pending->relnode.isTempRelation = backend == TempRelBackendId;
 	pending->atCommit = false;	/* delete if abort */
 	pending->nestLevel = GetCurrentTransactionNestLevel();
 	pending->next = pendingDeletes;
@@ -151,8 +153,9 @@ RelationDropStorage(Relation rel)
 	/* Add the relation to the list of stuff to delete at commit */
 	pending = (PendingRelDelete *)
 		MemoryContextAlloc(TopMemoryContext, sizeof(PendingRelDelete));
-	pending->relnode = rel->rd_node;
-	pending->backend = rel->rd_backend;
+	pending->relnode.node = rel->rd_node;
+	pending->relnode.relstorage = rel->rd_rel->relstorage;
+	pending->relnode.isTempRelation = rel->rd_backend == TempRelBackendId;
 	pending->atCommit = true;	/* delete if commit */
 	pending->nestLevel = GetCurrentTransactionNestLevel();
 	pending->next = pendingDeletes;
@@ -199,7 +202,7 @@ RelationPreserveStorage(RelFileNode rnode, bool atCommit)
 	for (pending = pendingDeletes; pending != NULL; pending = next)
 	{
 		next = pending->next;
-		if (RelFileNodeEquals(rnode, pending->relnode)
+		if (RelFileNodeEquals(rnode, pending->relnode.node)
 			&& pending->atCommit == atCommit)
 		{
 			/* unlink and delete list entry */
@@ -316,6 +319,7 @@ smgrDoPendingDeletes(bool isCommit)
 				i = 0,
 				maxrels = 0;
 	SMgrRelation *srels = NULL;
+	char	   *relstorages = NULL;
 
 	prev = NULL;
 	for (pending = pendingDeletes; pending != NULL; pending = next)
@@ -337,21 +341,28 @@ smgrDoPendingDeletes(bool isCommit)
 			if (pending->atCommit == isCommit)
 			{
 				SMgrRelation srel;
-
-				srel = smgropen(pending->relnode, pending->backend);
+				/* GPDB: backend can only be TempRelBackendId or
+				 * InvalidBackendId for a given relfile since we don't tie temp
+				 * relations to their backends. */
+				srel = smgropen(pending->relnode.node,
+					pending->relnode.isTempRelation ?
+					TempRelBackendId : InvalidBackendId);
 
 				/* allocate the initial array, or extend it, if needed */
 				if (maxrels == 0)
 				{
 					maxrels = 8;
 					srels = palloc(sizeof(SMgrRelation) * maxrels);
+					relstorages = palloc(maxrels * sizeof(char));
 				}
 				else if (maxrels <= nrels)
 				{
 					maxrels *= 2;
 					srels = repalloc(srels, sizeof(SMgrRelation) * maxrels);
+					relstorages = repalloc(relstorages, sizeof(char) * maxrels);
 				}
 
+				relstorages[nrels] = pending->relnode.relstorage;
 				srels[nrels++] = srel;
 			}
 			/* must explicitly free the list entry */
@@ -362,12 +373,13 @@ smgrDoPendingDeletes(bool isCommit)
 
 	if (nrels > 0)
 	{
-		smgrdounlinkall(srels, nrels, false);
+		smgrdounlinkall(srels, nrels, false, relstorages);
 
 		for (i = 0; i < nrels; i++)
 			smgrclose(srels[i]);
 
 		pfree(srels);
+		pfree(relstorages);
 	}
 }
 
@@ -387,20 +399,32 @@ smgrDoPendingDeletes(bool isCommit)
  *
  * Note that the list does not include anything scheduled for termination
  * by upper-level transactions.
+ *
+ * Greenplum-specific notes: We *do* include temporary relations in the returned
+ * list. Because unlike in Upstream Postgres, Greenplum two-phase commits can
+ * involve temporary tables, which necessitates including the temporary
+ * relations in the two-phase state files (PREPARE xlog record). Otherwise the
+ * relation files won't get unlink(2)'d, or the shared buffers won't be
+ * dropped at the end of COMMIT phase.
  */
 int
-smgrGetPendingDeletes(bool forCommit, RelFileNode **ptr)
+smgrGetPendingDeletes(bool forCommit, RelFileNodePendingDelete **ptr)
 {
 	int			nestLevel = GetCurrentTransactionNestLevel();
 	int			nrels;
-	RelFileNode *rptr;
+	RelFileNodePendingDelete *rptr;
 	PendingRelDelete *pending;
 
 	nrels = 0;
 	for (pending = pendingDeletes; pending != NULL; pending = pending->next)
 	{
 		if (pending->nestLevel >= nestLevel && pending->atCommit == forCommit
-			&& pending->backend == InvalidBackendId)
+			/*
+			 * Greenplum allows transactions that access temporary tables to be
+			 * prepared.
+			 */
+			/* && pending->relnode.backend == InvalidBackendId) */
+				)
 			nrels++;
 	}
 	if (nrels == 0)
@@ -408,12 +432,16 @@ smgrGetPendingDeletes(bool forCommit, RelFileNode **ptr)
 		*ptr = NULL;
 		return 0;
 	}
-	rptr = (RelFileNode *) palloc(nrels * sizeof(RelFileNode));
+	rptr = (RelFileNodePendingDelete *) palloc(nrels * sizeof(RelFileNodePendingDelete));
 	*ptr = rptr;
 	for (pending = pendingDeletes; pending != NULL; pending = pending->next)
 	{
 		if (pending->nestLevel >= nestLevel && pending->atCommit == forCommit
-			&& pending->backend == InvalidBackendId)
+			/*
+			 * Keep this loop condition identical to above
+			 */
+			/* && pending->relnode.backend == InvalidBackendId) */
+				)
 		{
 			*rptr = pending->relnode;
 			rptr++;
@@ -421,7 +449,6 @@ smgrGetPendingDeletes(bool forCommit, RelFileNode **ptr)
 	}
 	return nrels;
 }
-
 /*
  *	PostPrepare_smgr -- Clean up after a successful PREPARE
  *
@@ -443,7 +470,6 @@ PostPrepare_smgr(void)
 		pfree(pending);
 	}
 }
-
 
 /*
  * AtSubCommit_smgr() --- Take care of subtransaction commit.
@@ -477,7 +503,7 @@ AtSubAbort_smgr(void)
 }
 
 void
-smgr_redo(XLogRecPtr lsn, XLogRecord *record)
+smgr_redo(XLogRecPtr beginLoc, XLogRecPtr lsn, XLogRecord *record)
 {
 	uint8		info = record->xl_info & ~XLR_INFO_MASK;
 

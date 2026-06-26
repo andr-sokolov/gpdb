@@ -3,6 +3,8 @@
  * proc.c
  *	  routines to manage per-process shared memory data structure
  *
+ * Portions Copyright (c) 2006-2008, Greenplum inc
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -38,20 +40,37 @@
 #include "access/transam.h"
 #include "access/twophase.h"
 #include "access/xact.h"
+#include "catalog/namespace.h" /* TempNamespaceOidIsValid */
+#include "commands/async.h"
 #include "miscadmin.h"
 #include "postmaster/autovacuum.h"
 #include "replication/slot.h"
 #include "replication/syncrep.h"
+#include "replication/walsender.h"
 #include "storage/ipc.h"
+#include "storage/spin.h"
+#include "storage/sinval.h"
 #include "storage/lmgr.h"
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "storage/procsignal.h"
 #include "storage/spin.h"
+#include "utils/faultinjector.h"
 #include "utils/timeout.h"
 #include "utils/timestamp.h"
 
+#include "utils/sharedsnapshot.h"  /*SharedLocalSnapshotSlot*/
+
+#include "cdb/cdblocaldistribxact.h"
+#include "cdb/cdbtm.h"
+#include "cdb/cdbvars.h"  /*Gp_is_writer*/
+#include "port/atomics.h"
+#include "postmaster/fts.h"
+#include "tcop/idle_resource_cleaner.h"
+#include "utils/resource_manager.h"
+#include "utils/resscheduler.h"
+#include "utils/session_state.h"
 
 /* GUC variables */
 int			DeadlockTimeout = 1000;
@@ -62,6 +81,11 @@ bool		log_lock_waits = false;
 /* Pointer to this process's PGPROC and PGXACT structs, if any */
 PGPROC	   *MyProc = NULL;
 PGXACT	   *MyPgXact = NULL;
+TMGXACT	   *MyTmGxact = NULL;
+TMGXACTLOCAL	*MyTmGxactLocal = NULL;
+
+/* Special for MPP reader gangs */
+PGPROC	   *lockHolderProcPtr;
 
 /*
  * This spinlock protects the freelist of recycled PGPROC structures.
@@ -82,7 +106,6 @@ static LOCALLOCK *lockAwaited = NULL;
 
 /* Mark this volatile because it can be changed by signal handler */
 static volatile DeadLockState deadlock_state = DS_NOT_YET_CHECKED;
-
 
 static void RemoveProcFromArray(int code, Datum arg);
 static void ProcKill(int code, Datum arg);
@@ -157,6 +180,7 @@ InitProcGlobal(void)
 {
 	PGPROC	   *procs;
 	PGXACT	   *pgxacts;
+	TMGXACT	   *tmgxacts;
 	int			i,
 				j;
 	bool		found;
@@ -179,6 +203,8 @@ InitProcGlobal(void)
 	ProcGlobal->startupBufferPinWaitBufId = -1;
 	ProcGlobal->walwriterLatch = NULL;
 	ProcGlobal->checkpointerLatch = NULL;
+
+	ProcGlobal->mppLocalProcessCounter = 0;
 
 	/*
 	 * Create and initialize all the PGPROC structures we'll need.  There are
@@ -209,6 +235,14 @@ InitProcGlobal(void)
 	pgxacts = (PGXACT *) ShmemAlloc(TotalProcs * sizeof(PGXACT));
 	MemSet(pgxacts, 0, TotalProcs * sizeof(PGXACT));
 	ProcGlobal->allPgXact = pgxacts;
+
+	/*
+	 * Also allocate a separate array of TMGXACT structures out of the same
+	 * consideration as above.
+	 */
+	tmgxacts = (TMGXACT *) ShmemAlloc(TotalProcs * sizeof(TMGXACT));
+	MemSet(tmgxacts, 0, TotalProcs * sizeof(TMGXACT));
+	ProcGlobal->allTmGxact = tmgxacts;
 
 	for (i = 0; i < TotalProcs; i++)
 	{
@@ -281,6 +315,15 @@ InitProcess(void)
 	volatile PROC_HDR *procglobal = ProcGlobal;
 
 	/*
+	 * Autovacuum, WAL sender, FTS handler and FTS daemon processes are marked
+	 * as GP_ROLE_UTILITY to prevent unwanted GP_ROLE_DISPATCH MyProc settings
+	 * such as mppSessionId being valid and mppIsWriter set to true.
+	 */
+	if (IsAutoVacuumWorkerProcess() || am_walsender || am_ftshandler ||
+		IsFaultHandler)
+		Gp_role = GP_ROLE_UTILITY;
+
+	/*
 	 * ProcGlobal should be set up already (if we are a backend, we inherit
 	 * this by fork() or EXEC_BACKEND mechanism from the postmaster).
 	 */
@@ -339,14 +382,36 @@ InitProcess(void)
 				 errmsg("sorry, too many clients already")));
 	}
 	MyPgXact = &ProcGlobal->allPgXact[MyProc->pgprocno];
+	MyTmGxact = &ProcGlobal->allTmGxact[MyProc->pgprocno];
+	MyTmGxactLocal = (TMGXACTLOCAL*)MemoryContextAllocZero(TopMemoryContext, sizeof(TMGXACTLOCAL));
+	if (MyTmGxactLocal == NULL)
+		elog(FATAL, "allocating TMGXACTLOCAL failed");
+
+	if (gp_debug_pgproc)
+	{
+		elog(LOG, "allocating PGPROC entry for pid %d, freeProcs (prev ptr, new ptr): (%p, %p)",
+			 MyProcPid, MyProc, MyProc->links.next);
+	}
+
+	int mppLocalProcessSerial = pg_atomic_add_fetch_u32((pg_atomic_uint32 *)&procglobal->mppLocalProcessCounter, 1);
+
+	lockHolderProcPtr = MyProc;
+
+	/* Set the next pointer to NULL */
+	MyProc->links.next = NULL;
 
 	/*
 	 * Now that we have a PGPROC, mark ourselves as an active postmaster
 	 * child; this is so that the postmaster can detect it if we exit without
 	 * cleaning up.  (XXX autovac launcher currently doesn't participate in
 	 * this; it probably should.)
+	 *
+	 * Ideally, we should create functions similar to IsAutoVacuumLauncherProcess()
+	 * for ftsProber, etc who call InitProcess().
+	 * But MyPMChildSlot helps to get away with it.
 	 */
-	if (IsUnderPostmaster && !IsAutoVacuumLauncherProcess())
+	if (IsUnderPostmaster && !IsAutoVacuumLauncherProcess()
+		&& MyPMChildSlot > 0)
 		MarkPostmasterChildActive();
 
 	/*
@@ -360,6 +425,8 @@ InitProcess(void)
 	MyProc->fpLocalTransactionId = InvalidLocalTransactionId;
 	MyPgXact->xid = InvalidTransactionId;
 	MyPgXact->xmin = InvalidTransactionId;
+	MyProc->localDistribXactData.state = LOCALDISTRIBXACT_STATE_NONE;
+	MyProc->serializableIsoLevel = false;
 	MyProc->pid = MyProcPid;
 	/* backendId, databaseId and roleId will be filled in later */
 	MyProc->backendId = InvalidBackendId;
@@ -375,6 +442,55 @@ InitProcess(void)
 	MyProc->lwWaitLink = NULL;
 	MyProc->waitLock = NULL;
 	MyProc->waitProcLock = NULL;
+	MyProc->resSlot = NULL;
+	MyProc->movetoResSlot = NULL;
+	MyProc->movetoGroupId = InvalidOid;
+
+    /* 
+     * mppLocalProcessSerial uniquely identifies this backend process among
+     * all those that our parent postmaster process creates over its lifetime. 
+     *
+  	 * Since we use the process serial number to decide if we should
+	 * deliver a response from a server under this spin, we need to 
+	 * assign it under the spin lock.
+	 */
+    MyProc->mppLocalProcessSerial = mppLocalProcessSerial;
+
+    /* 
+     * A nonzero gp_session_id uniquely identifies an MPP client session 
+     * over the lifetime of the entry postmaster process. A qDisp passes
+     * its gp_session_id down to all of its qExecs. If this is a qExec,
+     * we have already received the gp_session_id from the qDisp.
+	 *
+	 * Utility mode connections on segments should not be assigned a valid
+	 * session ID.  Otherwise, locks acquired by them may result in incorrect
+	 * determination of conflicts.  See LockCheckConflicts().
+	 *
+	 * It is ok to assign a valid session ID to a utility mode connection on
+	 * master, because session IDs are generated only on master by atomically
+	 * incrementing a counter.  Therefore, it is not possible for a utility
+	 * mode connection to be assigned the same session ID as a normal mode
+	 * connection on master.
+     */
+	if (IS_QUERY_DISPATCHER() &&
+		Gp_role == GP_ROLE_DISPATCH &&
+		gp_session_id == InvalidGpSessionId)
+        gp_session_id = mppLocalProcessSerial;
+
+	AssertImply(Gp_role == GP_ROLE_UTILITY && !IS_QUERY_DISPATCHER(),
+				gp_session_id == InvalidGpSessionId);
+
+    MyProc->mppSessionId = gp_session_id;
+    elog(DEBUG1,"InitProcess(): gp_session_id %d, Gp_role %d",gp_session_id, Gp_role);
+    
+    MyProc->mppIsWriter = Gp_is_writer;
+
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		MyProc->mppIsWriter = true;
+	}
+    
+	/* Initialise for sync rep */
 #ifdef USE_ASSERT_CHECKING
 	if (assert_enabled)
 	{
@@ -404,6 +520,14 @@ InitProcess(void)
 	 * necessary anymore, but seems like a good idea for cleanliness.)
 	 */
 	PGSemaphoreReset(&MyProc->sem);
+
+	/* Set wait portal (do not check if resource scheduling is enabled) */
+	MyProc->waitPortalId = INVALID_PORTALID;
+
+	MyProc->queryCommandId = -1;
+
+	/* Init gxact */
+	resetGxact();
 
 	/*
 	 * Arrange to clean up at backend exit.
@@ -513,7 +637,12 @@ InitAuxiliaryProcess(void)
 	((volatile PGPROC *) auxproc)->pid = MyProcPid;
 
 	MyProc = auxproc;
+	lockHolderProcPtr = auxproc;
 	MyPgXact = &ProcGlobal->allPgXact[auxproc->pgprocno];
+	MyTmGxact = &ProcGlobal->allTmGxact[auxproc->pgprocno];
+	MyTmGxactLocal = (TMGXACTLOCAL*)MemoryContextAllocZero(TopMemoryContext, sizeof(TMGXACTLOCAL));
+	if (MyTmGxactLocal == NULL)
+		elog(FATAL, "allocating TMGXACTLOCAL failed");
 
 	SpinLockRelease(ProcStructLock);
 
@@ -528,9 +657,14 @@ InitAuxiliaryProcess(void)
 	MyProc->fpLocalTransactionId = InvalidLocalTransactionId;
 	MyPgXact->xid = InvalidTransactionId;
 	MyPgXact->xmin = InvalidTransactionId;
+	MyProc->localDistribXactData.state = LOCALDISTRIBXACT_STATE_NONE;
+	MyProc->serializableIsoLevel = false;
 	MyProc->backendId = InvalidBackendId;
 	MyProc->databaseId = InvalidOid;
 	MyProc->roleId = InvalidOid;
+    MyProc->mppLocalProcessSerial = 0;
+	MyProc->mppSessionId = InvalidGpSessionId;
+    MyProc->mppIsWriter = false;
 	MyPgXact->delayChkpt = false;
 	MyPgXact->vacuumFlags = 0;
 	MyProc->lwWaiting = false;
@@ -561,6 +695,8 @@ InitAuxiliaryProcess(void)
 	 * necessary anymore, but seems like a good idea for cleanliness.)
 	 */
 	PGSemaphoreReset(&MyProc->sem);
+
+	MyProc->queryCommandId = -1;
 
 	/*
 	 * Arrange to clean up at process exit.
@@ -679,6 +815,11 @@ LockErrorCleanup(void)
 		return;
 	}
 
+	/* Don't try to cancel resource locks.*/
+	if (Gp_role == GP_ROLE_DISPATCH && IsResQueueEnabled() &&
+		LOCALLOCK_LOCKMETHOD(*lockAwaited) == RESOURCE_LOCKMETHOD)
+		return;
+
 	/*
 	 * Turn off the deadlock and lock timeout timers, if they are still
 	 * running (see ProcSleep).  Note we must preserve the LOCK_TIMEOUT
@@ -773,6 +914,26 @@ RemoveProcFromArray(int code, Datum arg)
 }
 
 /*
+ * update_spins_per_delay
+ *   Update spins_per_delay value in ProcGlobal.
+ */
+static void
+update_spins_per_delay(void)
+{
+	volatile PROC_HDR *procglobal = ProcGlobal;
+	bool casResult = false;
+
+	while (!casResult)
+	{
+		int old_spins_per_delay = procglobal->spins_per_delay;
+		int new_spins_per_delay = recompute_spins_per_delay(old_spins_per_delay);
+		casResult = pg_atomic_compare_exchange_u32((pg_atomic_uint32 *)&procglobal->spins_per_delay,
+										(uint32 *)&old_spins_per_delay,
+										new_spins_per_delay);
+	}
+}
+
+/*
  * ProcKill() -- Destroy the per-proc data structure for
  *		this process. Release any of its held LW locks.
  */
@@ -786,6 +947,39 @@ ProcKill(int code, Datum arg)
 	Assert(MyProc != NULL);
 
 	/* Make sure we're out of the sync rep lists */
+	SyncRepCleanupAtProcExit();
+
+	/* 
+	 * Cleanup for any resource locks on portals - from holdable cursors or
+	 * unclean process abort (assertion failures).
+	 */
+	if (Gp_role == GP_ROLE_DISPATCH && IsResQueueEnabled())
+		AtExitCleanup_ResPortals();
+
+	/*
+	 * Remove the shared snapshot slot.
+	 */
+	if (SharedLocalSnapshotSlot != NULL)
+	{
+		if (Gp_role == GP_ROLE_DISPATCH)
+		{
+			SharedSnapshotRemove(SharedLocalSnapshotSlot,
+								 "Query Dispatcher");
+		}
+	    else if (IS_QUERY_DISPATCHER() && Gp_role == GP_ROLE_EXECUTE && !Gp_is_writer)
+	    {
+			/* 
+			 * Entry db singleton QE is a user of the shared snapshot -- not a creator.
+			 */	
+	    }
+		else if (Gp_role == GP_ROLE_EXECUTE && Gp_is_writer)
+		{
+			SharedSnapshotRemove(SharedLocalSnapshotSlot,
+								 "Writer qExec");
+		}
+		SharedLocalSnapshotSlot = NULL;
+	}
+
 	SyncRepCleanupAtProcExit();
 
 #ifdef USE_ASSERT_CHECKING
@@ -806,6 +1000,12 @@ ProcKill(int code, Datum arg)
 	 */
 	LWLockReleaseAll();
 
+	MyProc->localDistribXactData.state = LOCALDISTRIBXACT_STATE_NONE;
+    MyProc->mppLocalProcessSerial = 0;
+	MyProc->mppSessionId = InvalidGpSessionId;
+    MyProc->mppIsWriter = false;
+	MyProc->pid = 0;
+
 	/* Make sure active replication slots are released */
 	if (MyReplicationSlot != NULL)
 		ReplicationSlotRelease();
@@ -817,6 +1017,7 @@ ProcKill(int code, Datum arg)
 	 */
 	proc = MyProc;
 	MyProc = NULL;
+	lockHolderProcPtr = NULL;
 	DisownLatch(&proc->procLatch);
 
 	SpinLockAcquire(ProcStructLock);
@@ -839,7 +1040,7 @@ ProcKill(int code, Datum arg)
 	}
 
 	/* Update shared estimate of spins_per_delay */
-	procglobal->spins_per_delay = update_spins_per_delay(procglobal->spins_per_delay);
+	update_spins_per_delay();
 
 	SpinLockRelease(ProcStructLock);
 
@@ -848,7 +1049,8 @@ ProcKill(int code, Datum arg)
 	 * way, so tell the postmaster we've cleaned up acceptably well. (XXX
 	 * autovac launcher should be included here someday)
 	 */
-	if (IsUnderPostmaster && !IsAutoVacuumLauncherProcess())
+	if (IsUnderPostmaster && !IsAutoVacuumLauncherProcess()
+		&& MyPMChildSlot > 0)
 		MarkPostmasterChildInactive();
 
 	/* wake autovac launcher if needed -- see comments in FreeWorkerInfo */
@@ -884,6 +1086,7 @@ AuxiliaryProcKill(int code, Datum arg)
 	 */
 	proc = MyProc;
 	MyProc = NULL;
+	lockHolderProcPtr = NULL;
 	DisownLatch(&proc->procLatch);
 
 	SpinLockAcquire(ProcStructLock);
@@ -892,7 +1095,7 @@ AuxiliaryProcKill(int code, Datum arg)
 	proc->pid = 0;
 
 	/* Update shared estimate of spins_per_delay */
-	ProcGlobal->spins_per_delay = update_spins_per_delay(ProcGlobal->spins_per_delay);
+	update_spins_per_delay();
 
 	SpinLockRelease(ProcStructLock);
 }
@@ -1538,6 +1741,23 @@ CheckDeadLock(void)
 	int			i;
 
 	/*
+	 * This check was added in GPDB a long time ago. Not sure if it's still
+	 * needed, but seems like it can't hurt.
+	 *
+	 * From old pre-open sourcing git repository:
+	 * commit d628fac161d0536b344348927915335bbcd38c1a
+	 * Date:   Wed Aug 19 03:26:36 2015 -0400
+	 *
+	 *    [JIRA: MPP-25646] Add proc_exit_inprogress check in handle_sig_alarm.
+	 *
+	 *    If SIGALRM happens in the middle if handling SIGTERM, there are risks causing
+	 *    SIGSEGV, for instance, double free gang, or accessing MyProc while it was freed
+	 *    already. The solution is to ignore SIGALRM while we are dying.
+	 */
+	if (proc_exit_inprogress)
+		return;
+
+	/*
 	 * Acquire exclusive lock on the entire shared lock data structures. Must
 	 * grab LWLocks in partition-number order to avoid LWLock deadlock.
 	 *
@@ -1578,7 +1798,7 @@ CheckDeadLock(void)
 		/*
 		 * Oops.  We have a deadlock.
 		 *
-		 * Get this process out of wait state. (Note: we could do this more
+		 * Get this process out of wait state.	(Note: we could do this more
 		 * efficiently by relying on lockAwaited, but use this coding to
 		 * preserve the flexibility to kill some other transaction than the
 		 * one detecting the deadlock.)
@@ -1588,7 +1808,23 @@ CheckDeadLock(void)
 		 * handler.
 		 */
 		Assert(MyProc->waitLock != NULL);
-		RemoveFromWaitQueue(MyProc, LockTagHashCode(&(MyProc->waitLock->tag)));
+		if (Gp_role == GP_ROLE_DISPATCH && IsResQueueEnabled() &&
+			LOCK_LOCKMETHOD(*(MyProc->waitLock)) == RESOURCE_LOCKMETHOD)
+		{
+			ResRemoveFromWaitQueue(MyProc, 
+								   LockTagHashCode(&(MyProc->waitLock->tag)));
+			/*
+			 * lockAwaited's lock/proclock pointers are dangling after the call
+			 * to ResRemoveFromWaitQueue(). So clean up the locallock as well,
+			 * to avoid de-referencing them in the eventual ResLockRelease() in
+			 * ResLockPortal/ResLockUtilityPortal.
+			 */
+			RemoveLocalLock(lockAwaited);
+		}
+		else
+		{
+			RemoveFromWaitQueue(MyProc, LockTagHashCode(&(MyProc->waitLock->tag)));
+		}
 
 		/*
 		 * Unlock my semaphore so that the interrupted ProcSleep() call can
@@ -1685,4 +1921,194 @@ ProcSendSignal(int pid)
 
 	if (proc != NULL)
 		PGSemaphoreUnlock(&proc->sem);
+}
+
+/*
+ * ResProcSleep -- put a process to sleep (that is waiting for a resource lock).
+ *
+ * Notes:
+ * 	Locktable's masterLock must be held at entry, and will be held
+ * 	at exit.
+ *
+ *	This is merely a version of ProcSleep modified for resource locks.
+ *	The logic here could have been merged into ProcSleep, however it was
+ *	requested to keep as much as possible of this resource lock code 
+ *	separate from its standard lock relatives - in the interest of not
+ *	introducing new bugs or performance regressions into the lock code.
+ */
+int
+ResProcSleep(LOCKMODE lockmode, LOCALLOCK *locallock, void *incrementSet)
+{
+	LOCK	   *lock = locallock->lock;
+	PROCLOCK   *proclock = locallock->proclock;
+	PROC_QUEUE	*waitQueue = &(lock->waitProcs);
+	PGPROC		*proc;
+	uint32		hashcode = locallock->hashcode;
+	LWLockId	partitionLock = LockHashPartitionLock(hashcode);
+
+	bool		selflock = true;		/* initialize result for error. */
+
+	/*
+	 * Don't check my held locks, as we just add at the end of the queue.
+	 */
+	proc = (PGPROC *) &(waitQueue->links);
+	SHMQueueInsertBefore(&(proc->links), &(MyProc->links));
+	waitQueue->size++;
+
+	lock->waitMask |= LOCKBIT_ON(lockmode);
+
+	/*
+	 * reflect this in PGPROC object, too.
+	 */
+	MyProc->waitLock = lock;
+	MyProc->waitProcLock = (PROCLOCK *) proclock;
+	MyProc->waitLockMode = lockmode;
+
+	MyProc->waitStatus = STATUS_ERROR;	/* initialize result for error */
+
+	/* Now check the status of the self lock footgun. */
+	selflock = ResCheckSelfDeadLock(lock, proclock, incrementSet);
+	if (selflock)
+	{
+		LWLockRelease(partitionLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_DEADLOCK_DETECTED),
+				 errmsg("deadlock detected, locking against self")));
+	}
+
+	/* Mark that we are waiting for a lock */
+	lockAwaited = locallock;
+
+	/* Ok to wait.*/
+	LWLockRelease(partitionLock);
+
+	if (LockTimeout > 0)
+	{
+		EnableTimeoutParams timeouts[2];
+
+		timeouts[0].id = DEADLOCK_TIMEOUT;
+		timeouts[0].type = TMPARAM_AFTER;
+		timeouts[0].delay_ms = DeadlockTimeout;
+		timeouts[1].id = LOCK_TIMEOUT;
+		timeouts[1].type = TMPARAM_AFTER;
+		timeouts[1].delay_ms = LockTimeout;
+		enable_timeouts(timeouts, 2);
+	}
+	else
+		enable_timeout_after(DEADLOCK_TIMEOUT, DeadlockTimeout);
+
+	/*
+	 * Sleep on the semaphore.
+	 */
+	PGSemaphoreLock(&MyProc->sem, true);
+
+	if (LockTimeout > 0)
+	{
+		DisableTimeoutParams timeouts[2];
+
+		timeouts[0].id = DEADLOCK_TIMEOUT;
+		timeouts[0].keep_indicator = false;
+		timeouts[1].id = LOCK_TIMEOUT;
+		timeouts[1].keep_indicator = false;
+		disable_timeouts(timeouts, 2);
+	}
+	else
+		disable_timeout(DEADLOCK_TIMEOUT, false);
+
+	/*
+	 * Have been awakened, so continue.
+	 */
+	LWLockAcquire(partitionLock, LW_EXCLUSIVE);
+
+	/*
+	 * We no longer want (Res)LockWaitCancel to do anything.
+	 */
+	lockAwaited = NULL;
+
+	return MyProc->waitStatus;
+}
+
+
+/*
+ * ResLockWaitCancel -- Cancel any pending wait for a resource lock, when 
+ *	aborting a transaction.
+ */
+void
+ResLockWaitCancel(void)
+{
+	LWLockId	partitionLock;
+
+	if (lockAwaited != NULL)
+	{
+		/* Unlink myself from the wait queue, if on it  */
+		partitionLock = LockHashPartitionLock(lockAwaited->hashcode);
+		LWLockAcquire(partitionLock, LW_EXCLUSIVE);
+
+		if (MyProc->links.next != NULL)
+		{
+			/* We could not have been granted the lock yet */
+			Assert(MyProc->waitStatus == STATUS_ERROR);
+
+			/* We should only be trying to cancel resource locks. */
+			Assert(LOCALLOCK_LOCKMETHOD(*lockAwaited) == RESOURCE_LOCKMETHOD);
+
+			ResRemoveFromWaitQueue(MyProc, lockAwaited->hashcode);
+			/*
+			 * lockAwaited's lock/proclock pointers are dangling after the call
+			 * to ResRemoveFromWaitQueue(). So clean up the locallock as well,
+			 * to avoid de-referencing them in the eventual ResLockRelease() in
+			 * ResLockPortal/ResLockUtilityPortal.
+			 */
+			RemoveLocalLock(lockAwaited);
+		}
+
+		lockAwaited = NULL;
+
+		LWLockRelease(partitionLock);
+	}
+
+	/*
+	 * Reset the proc wait semaphore to zero. This is necessary in the
+	 * scenario where someone else granted us the lock we wanted before we
+	 * were able to remove ourselves from the wait-list.
+	 */
+	PGSemaphoreReset(&MyProc->sem);
+
+	return;
+}
+
+bool ProcCanSetMppSessionId(void)
+{
+	if (ProcGlobal == NULL || MyProc == NULL)
+		return false;
+
+	return true;
+}
+
+
+void ProcNewMppSessionId(int *newSessionId)
+{
+	Assert(newSessionId != NULL);
+
+    *newSessionId = MyProc->mppSessionId =
+		pg_atomic_add_fetch_u32((pg_atomic_uint32 *)&ProcGlobal->mppLocalProcessCounter, 1);
+
+    /*
+     * Make sure that our SessionState entry correctly records our
+     * new session id.
+     */
+    if (NULL != MySessionState)
+    {
+    	/* This should not happen outside of dispatcher on the master */
+    	Assert(IS_QUERY_DISPATCHER() && Gp_role == GP_ROLE_DISPATCH);
+
+    	ereport(gp_sessionstate_loglevel, (errmsg("ProcNewMppSessionId: changing session id (old: %d, new: %d), pinCount: %d, activeProcessCount: %d",
+    			MySessionState->sessionId, *newSessionId, MySessionState->pinCount, MySessionState->activeProcessCount), errprintstack(true)));
+
+#ifdef USE_ASSERT_CHECKING
+    	MySessionState->isModifiedSessionId = true;
+#endif
+
+    	MySessionState->sessionId = *newSessionId;
+    }
 }

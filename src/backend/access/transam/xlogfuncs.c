@@ -43,6 +43,8 @@
  * contains the user-supplied label string (typically this would be used
  * to tell where the backup dump will be stored) and the starting time and
  * starting WAL location for the dump.
+ *
+ * **Note :- Currently this functionality is not supported.**
  */
 Datum
 pg_start_backup(PG_FUNCTION_ARGS)
@@ -51,6 +53,11 @@ pg_start_backup(PG_FUNCTION_ARGS)
 	bool		fast = PG_GETARG_BOOL(1);
 	char	   *backupidstr;
 	XLogRecPtr	startpoint;
+
+	ereport(NOTICE,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("pg_start_backup() is not supported in Greenplum Database"),
+			 errhint("Contact support to get more information and resolve the issue")));
 
 	backupidstr = text_to_cstring(backupid);
 
@@ -76,11 +83,18 @@ pg_start_backup(PG_FUNCTION_ARGS)
  * record for that and the file is for informational and debug purposes only.
  *
  * Note: different from CancelBackup which just cancels online backup mode.
+ *
+ * **Note :- Currently this functionality is not supported.**
  */
 Datum
 pg_stop_backup(PG_FUNCTION_ARGS)
 {
-	XLogRecPtr	stoppoint;
+	XLogRecPtr	stoppoint = InvalidXLogRecPtr;
+
+	ereport(NOTICE,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("pg_stop_backup() is not supported in Greenplum Database"),
+			 errhint("Contact support to get more information and resolve the issue")));
 
 	if (!superuser() && !has_rolreplication(GetUserId()))
 		ereport(ERROR,

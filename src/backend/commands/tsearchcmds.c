@@ -24,6 +24,7 @@
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/objectaccess.h"
+#include "catalog/oid_dispatch.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_ts_config.h"
@@ -46,6 +47,8 @@
 #include "utils/syscache.h"
 #include "utils/tqual.h"
 
+#include "cdb/cdbvars.h"
+#include "cdb/cdbdisp_query.h"
 
 static void MakeConfigurationMapping(AlterTSConfigurationStmt *stmt,
 						 HeapTuple tup, Relation relMap);
@@ -278,6 +281,24 @@ DefineTSParser(List *names, List *parameters)
 
 	heap_close(prsRel, RowExclusiveLock);
 
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		DefineStmt *stmt = makeNode(DefineStmt);
+
+		stmt->kind = OBJECT_TSPARSER;
+		stmt->oldstyle = false;
+		stmt->defnames = names;
+		stmt->args = NIL;
+		stmt->definition = parameters;
+
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR |
+									DF_NEED_TWO_PHASE |
+									DF_WITH_SNAPSHOT,
+									GetAssignedOidsForDispatch(),
+									NULL);
+	}
+
 	return prsOid;
 }
 
@@ -484,6 +505,22 @@ DefineTSDictionary(List *names, List *parameters)
 
 	heap_close(dictRel, RowExclusiveLock);
 
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		DefineStmt *stmt = makeNode(DefineStmt);
+		stmt->kind = OBJECT_TSDICTIONARY;
+		stmt->oldstyle = false;
+		stmt->defnames = names;
+		stmt->args = NIL;
+		stmt->definition = parameters;
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR |
+									DF_NEED_TWO_PHASE |
+									DF_WITH_SNAPSHOT,
+									GetAssignedOidsForDispatch(),
+									NULL);
+	}
+
 	return dictOid;
 }
 
@@ -624,6 +661,14 @@ AlterTSDictionary(AlterTSDictionaryStmt *stmt)
 	ReleaseSysCache(tup);
 
 	heap_close(rel, RowExclusiveLock);
+
+	if (Gp_role == GP_ROLE_DISPATCH)
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR |
+									DF_NEED_TWO_PHASE |
+									DF_WITH_SNAPSHOT,
+									NIL,
+									NULL);
 
 	return dictId;
 }
@@ -801,6 +846,22 @@ DefineTSTemplate(List *names, List *parameters)
 	heap_freetuple(tup);
 
 	heap_close(tmplRel, RowExclusiveLock);
+
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		DefineStmt *stmt = makeNode(DefineStmt);
+		stmt->kind = OBJECT_TSTEMPLATE;
+		stmt->oldstyle = false;
+		stmt->defnames = names;
+		stmt->args = NIL;
+		stmt->definition = parameters;
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR |
+									DF_NEED_TWO_PHASE |
+									DF_WITH_SNAPSHOT,
+									GetAssignedOidsForDispatch(),
+									NULL);
+	}
 
 	return tmplOid;
 }
@@ -1099,6 +1160,22 @@ DefineTSConfiguration(List *names, List *parameters)
 		heap_close(mapRel, RowExclusiveLock);
 	heap_close(cfgRel, RowExclusiveLock);
 
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		DefineStmt *stmt = makeNode(DefineStmt);
+		stmt->kind = OBJECT_TSCONFIGURATION;
+		stmt->oldstyle = false;
+		stmt->defnames = names;
+		stmt->args = NIL;
+		stmt->definition = parameters;
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR |
+									DF_NEED_TWO_PHASE |
+									DF_WITH_SNAPSHOT,
+									GetAssignedOidsForDispatch(),
+									NULL);
+	}
+
 	return cfgOid;
 }
 
@@ -1192,6 +1269,14 @@ AlterTSConfiguration(AlterTSConfigurationStmt *stmt)
 	heap_close(relMap, RowExclusiveLock);
 
 	ReleaseSysCache(tup);
+
+	if (Gp_role == GP_ROLE_DISPATCH)
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR |
+									DF_NEED_TWO_PHASE |
+									DF_WITH_SNAPSHOT,
+									NIL,
+									NULL);
 
 	return cfgId;
 }

@@ -266,9 +266,16 @@ static void
 show_cppflags(bool all)
 {
 #ifdef VAL_CPPFLAGS
+    char includePath[MAXPGPATH];
+    get_include_path(mypath, includePath);
+    cleanup_path(includePath);
+
 	if (all)
 		printf("CPPFLAGS = ");
-	printf("%s\n", VAL_CPPFLAGS);
+
+    if (strlen(VAL_CPPFLAGS) > 0)
+	    printf("%s -I%s\n", VAL_CPPFLAGS, includePath);
+    else printf("-I%s\n", includePath);
 #else
 	if (!all)
 	{
@@ -282,9 +289,13 @@ static void
 show_cflags(bool all)
 {
 #ifdef VAL_CFLAGS
+    char includePath[MAXPGPATH];
+	get_include_path(mypath, includePath);
+	cleanup_path(includePath);
+
 	if (all)
 		printf("CFLAGS = ");
-	printf("%s\n", VAL_CFLAGS);
+	printf("%s -I%s\n", VAL_CFLAGS, includePath);
 #else
 	if (!all)
 	{
@@ -314,9 +325,16 @@ static void
 show_ldflags(bool all)
 {
 #ifdef VAL_LDFLAGS
+	char libraryPath[MAXPGPATH];
+	get_lib_path(mypath, libraryPath);
+	cleanup_path(libraryPath);
+
 	if (all)
 		printf("LDFLAGS = ");
-	printf("%s\n", VAL_LDFLAGS);
+
+    if (strlen(VAL_LDFLAGS) > 0)
+	    printf("%s -L%s\n", VAL_LDFLAGS, libraryPath);
+    else printf("-L%s\n", libraryPath);
 #else
 	if (!all)
 	{
@@ -362,9 +380,13 @@ static void
 show_libs(bool all)
 {
 #ifdef VAL_LIBS
+    char libraryPath[MAXPGPATH];
+	get_lib_path(mypath, libraryPath);
+	cleanup_path(libraryPath);
+
 	if (all)
 		printf("LIBS = ");
-	printf("%s\n", VAL_LIBS);
+	printf("%s -L%s\n", VAL_LIBS, libraryPath);
 #else
 	if (!all)
 	{
@@ -408,7 +430,7 @@ static const InfoItem info_items[] = {
 	{"--sharedir", show_sharedir},
 	{"--sysconfdir", show_sysconfdir},
 	{"--pgxs", show_pgxs},
-	{"--configure", show_configure},
+    {"--configure", show_configure},
 	{"--cc", show_cc},
 	{"--cppflags", show_cppflags},
 	{"--cflags", show_cflags},
@@ -424,7 +446,7 @@ static const InfoItem info_items[] = {
 
 static void
 help(void)
-{
+{ 
 	printf(_("\n%s provides information about the installed version of PostgreSQL.\n\n"), progname);
 	printf(_("Usage:\n"));
 	printf(_("  %s [OPTION]...\n\n"), progname);
@@ -456,7 +478,7 @@ help(void)
 	printf(_("  --version             show the PostgreSQL version\n"));
 	printf(_("  -?, --help            show this help, then exit\n"));
 	printf(_("\nWith no arguments, all known items are shown.\n\n"));
-	printf(_("Report bugs to <pgsql-bugs@postgresql.org>.\n"));
+	printf(_("Report bugs to <bugs@greenplum.org>.\n"));
 }
 
 static void

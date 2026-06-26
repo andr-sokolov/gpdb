@@ -243,6 +243,7 @@ extern struct varlena *pg_detoast_datum_packed(struct varlena * datum);
 /* and this if you can handle 1-byte-header datums: */
 #define PG_GETARG_VARLENA_PP(n) PG_DETOAST_DATUM_PACKED(PG_GETARG_DATUM(n))
 /* DatumGetFoo macros for varlena types will typically look like this: */
+#define PG_GETARG_TID(n)	 (*((ItemPointer) DatumGetPointer(PG_GETARG_DATUM(n))))
 #define DatumGetByteaP(X)			((bytea *) PG_DETOAST_DATUM(X))
 #define DatumGetByteaPP(X)			((bytea *) PG_DETOAST_DATUM_PACKED(X))
 #define DatumGetTextP(X)			((text *) PG_DETOAST_DATUM(X))
@@ -263,6 +264,7 @@ extern struct varlena *pg_detoast_datum_packed(struct varlena * datum);
 #define DatumGetTextPSlice(X,m,n)	((text *) PG_DETOAST_DATUM_SLICE(X,m,n))
 #define DatumGetBpCharPSlice(X,m,n) ((BpChar *) PG_DETOAST_DATUM_SLICE(X,m,n))
 #define DatumGetVarCharPSlice(X,m,n) ((VarChar *) PG_DETOAST_DATUM_SLICE(X,m,n))
+
 /* GETARG macros for varlena types will typically look like this: */
 #define PG_GETARG_BYTEA_P(n)		DatumGetByteaP(PG_GETARG_DATUM(n))
 #define PG_GETARG_BYTEA_PP(n)		DatumGetByteaPP(PG_GETARG_DATUM(n))
@@ -279,6 +281,7 @@ extern struct varlena *pg_detoast_datum_packed(struct varlena * datum);
 #define PG_GETARG_BPCHAR_P_COPY(n)	DatumGetBpCharPCopy(PG_GETARG_DATUM(n))
 #define PG_GETARG_VARCHAR_P_COPY(n) DatumGetVarCharPCopy(PG_GETARG_DATUM(n))
 #define PG_GETARG_HEAPTUPLEHEADER_COPY(n)	DatumGetHeapTupleHeaderCopy(PG_GETARG_DATUM(n))
+
 /* And a b-byte slice from position a -also OK to write */
 #define PG_GETARG_BYTEA_P_SLICE(n,a,b) DatumGetByteaPSlice(PG_GETARG_DATUM(n),a,b)
 #define PG_GETARG_TEXT_P_SLICE(n,a,b)  DatumGetTextPSlice(PG_GETARG_DATUM(n),a,b)
@@ -308,12 +311,14 @@ extern struct varlena *pg_detoast_datum_packed(struct varlena * datum);
 #define PG_RETURN_FLOAT4(x)  return Float4GetDatum(x)
 #define PG_RETURN_FLOAT8(x)  return Float8GetDatum(x)
 #define PG_RETURN_INT64(x)	 return Int64GetDatum(x)
+#define PG_RETURN_UINT64(x)	 return UInt64GetDatum(x)
 /* RETURN macros for other pass-by-ref types will typically look like this: */
 #define PG_RETURN_BYTEA_P(x)   PG_RETURN_POINTER(x)
 #define PG_RETURN_TEXT_P(x)    PG_RETURN_POINTER(x)
 #define PG_RETURN_BPCHAR_P(x)  PG_RETURN_POINTER(x)
 #define PG_RETURN_VARCHAR_P(x) PG_RETURN_POINTER(x)
 #define PG_RETURN_HEAPTUPLEHEADER(x)  return HeapTupleHeaderGetDatum(x)
+#define PG_RETURN_XID(x)	 return TransactionIdGetDatum(x)
 
 
 /*-------------------------------------------------------------------------
@@ -394,26 +399,53 @@ extern int no_such_variable
 typedef struct
 {
 	int			len;			/* sizeof(this struct) */
-	int			version;		/* PostgreSQL major version */
+	int			version;		/* product major version */
 	int			funcmaxargs;	/* FUNC_MAX_ARGS */
 	int			indexmaxkeys;	/* INDEX_MAX_KEYS */
 	int			namedatalen;	/* NAMEDATALEN */
 	int			float4byval;	/* FLOAT4PASSBYVAL */
 	int			float8byval;	/* FLOAT8PASSBYVAL */
+	int         product;        /* magic product code */
+	int         headerversion;/* header version number to force recompilation of libraries */
 } Pg_magic_struct;
+
+/*
+ * List of product codes for products that support some level of compatability
+ * with the postgres contrib module format. 
+ *
+ * GPDB: A patch for this has been supplied to Postgres in the hope of improved
+ * cross product compatibility.  It is currently unknown if they will accept
+ * the patch.
+ */
+typedef enum {
+	PgMagicProductNone		   = 0,
+	PgMagicProductPostgres	   = 1,
+	PgMagicProductGreenplum	   = 2180,     /* 'GPDB' cast to an integer */
+} Pg_magic_product_code;
+
+/* The header version to force recompilation of third party libraries */
+#define GP_HEADER_VERSION_NUM 1
 
 /* The actual data block contents */
 #define PG_MODULE_MAGIC_DATA \
 { \
 	sizeof(Pg_magic_struct), \
-	PG_VERSION_NUM / 100, \
+	GP_VERSION_NUM / 100, \
 	FUNC_MAX_ARGS, \
 	INDEX_MAX_KEYS, \
 	NAMEDATALEN, \
 	FLOAT4PASSBYVAL, \
-	FLOAT8PASSBYVAL \
+	FLOAT8PASSBYVAL, \
+	PgMagicProductGreenplum, \
+	GP_HEADER_VERSION_NUM, \
 }
 
+#ifndef FLOAT4PASSBYVAL
+#define FLOAT4PASSBYVAL 1
+#endif
+#ifndef FLOAT8PASSBYVAL
+#define FLOAT8PASSBYVAL 1
+#endif
 /*
  * Declare the module magic function.  It needs to be a function as the dlsym
  * in the backend is only guaranteed to work on functions, not data
@@ -657,8 +689,8 @@ extern void **find_rendezvous_variable(const char *varName);
  */
 
 /* AggCheckCallContext can return one of the following codes, or 0: */
-#define AGG_CONTEXT_AGGREGATE	1		/* regular aggregate */
-#define AGG_CONTEXT_WINDOW		2		/* window function */
+#define AGG_CONTEXT_AGGREGATE   1       /* regular aggregate */
+#define AGG_CONTEXT_WINDOW      2       /* window function */
 
 extern int AggCheckCallContext(FunctionCallInfo fcinfo,
 					MemoryContext *aggcontext);
@@ -694,20 +726,5 @@ extern PGDLLIMPORT fmgr_hook_type fmgr_hook;
 
 #define FmgrHookIsNeeded(fn_oid)							\
 	(!needs_fmgr_hook ? false : (*needs_fmgr_hook)(fn_oid))
-
-/*
- * !!! OLD INTERFACE !!!
- *
- * fmgr() is the only remaining vestige of the old-style caller support
- * functions.  It's no longer used anywhere in the Postgres distribution,
- * but we should leave it around for a release or two to ease the transition
- * for user-supplied C functions.  OidFunctionCallN() replaces it for new
- * code.
- */
-
-/*
- * DEPRECATED, DO NOT USE IN NEW CODE
- */
-extern char *fmgr(Oid procedureId,...);
 
 #endif   /* FMGR_H */
