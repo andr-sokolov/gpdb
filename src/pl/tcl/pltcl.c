@@ -25,6 +25,7 @@
 
 #include "access/htup_details.h"
 #include "access/xact.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "commands/event_trigger.h"
@@ -36,6 +37,7 @@
 #include "parser/parse_type.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -504,9 +506,11 @@ pltcl_init_load_unknown(Tcl_Interp *interp)
 	 * We allow the table to be found anywhere in the search_path.
 	 * This is for backwards compatibility.  To ensure that the table
 	 * is trustworthy, we require it to be owned by a superuser.
+	 *
+	 * this next bit of code is the same as try_relation_openrv(),
+	 * which only exists in 8.4 and up.
 	 ************************************************************/
-	pmrel = relation_openrv_extended(makeRangeVar(NULL, "pltcl_modules", -1),
-									 AccessShareLock, true);
+	pmrel = relation_openrv_extended(makeRangeVar(NULL, "pltcl_modules", -1), AccessShareLock, true, true);
 	if (pmrel == NULL)
 		return;
 	/* sanity-check the relation kind */

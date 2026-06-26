@@ -48,6 +48,11 @@ CATALOG(pg_conversion,2607)
 	bool		condefault;
 } FormData_pg_conversion;
 
+/* GPDB added foreign key definitions for gpcheckcat. */
+FOREIGN_KEY(connamespace REFERENCES pg_namespace(oid));
+FOREIGN_KEY(conowner REFERENCES pg_authid(oid));
+FOREIGN_KEY(conproc REFERENCES pg_proc(oid));
+
 /* ----------------
  *		Form_pg_conversion corresponds to a pointer to a tuple with
  *		the format of pg_conversion relation.

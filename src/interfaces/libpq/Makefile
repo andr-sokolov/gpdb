@@ -29,6 +29,9 @@ endif
 # platforms require special flags.
 LIBS := $(LIBS:-lpgport=)
 
+# The frontend doesn't need everything that's in LIBS, some are backend only
+LIBS := $(filter-out -lresolv -lbz2, $(LIBS))
+
 # We can't use Makefile variables here because the MSVC build system scrapes
 # OBJS from this file.
 OBJS=	fe-auth.o fe-connect.o fe-exec.o fe-misc.o fe-print.o fe-lobj.o \
@@ -70,7 +73,7 @@ else
 SHLIB_LINK += $(filter -lcrypt -ldes -lcom_err -lcrypto -lk5crypto -lkrb5 -lgssapi32 -lssl -lsocket -lnsl -lresolv -lintl $(PTHREAD_LIBS), $(LIBS)) $(LDAP_LIBS_FE)
 endif
 ifeq ($(PORTNAME), win32)
-SHLIB_LINK += -lshell32 -lwsock32 -lws2_32 -lsecur32 $(filter -leay32 -lssleay32 -lcomerr32 -lkrb5_32, $(LIBS))
+SHLIB_LINK += -L../../../../gpAux/ext/win32/kfw-3-2-2/lib -L../../../src/bin/gpfdist/ext/lib -lgssapi32 -lshell32 -lwsock32 -lws2_32 -lsecur32 $(filter -leay32 -lssleay32 -lcomerr32 -lkrb5_32, $(LIBS))
 endif
 
 SHLIB_EXPORTS = exports.txt

@@ -25,6 +25,14 @@ extern char *locale_messages;
 extern char *locale_monetary;
 extern char *locale_numeric;
 extern char *locale_time;
+extern char *locale_collate;
+
+/* lc_time localization cache */
+extern char *localized_abbrev_days[];
+extern char *localized_full_days[];
+extern char *localized_abbrev_months[];
+extern char *localized_full_months[];
+
 
 /* lc_time localization cache */
 extern char *localized_abbrev_days[];
@@ -47,6 +55,7 @@ extern char *pg_perm_setlocale(int category, const char *locale);
 
 extern bool lc_collate_is_c(Oid collation);
 extern bool lc_ctype_is_c(Oid collation);
+extern void lc_guess_strxfrm_scaling_factor(int *scaleFactorOut, int *constantFactorOut);
 
 /*
  * Return the POSIX lconv struct (contains number/money formatting

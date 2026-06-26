@@ -24,6 +24,11 @@
 #include <sys/select.h>
 #endif
 
+#include "access/genam.h"
+#include "catalog/indexing.h"
+#include "catalog/pg_authid.h"
+#include "catalog/pg_auth_time_constraint.h"
+#include "cdb/cdbvars.h"
 #include "libpq/auth.h"
 #include "libpq/crypt.h"
 #include "libpq/ip.h"
@@ -31,9 +36,24 @@
 #include "libpq/pqformat.h"
 #include "libpq/md5.h"
 #include "miscadmin.h"
+#include "pgtime.h"
+#include "postmaster/postmaster.h"
+#include "utils/builtins.h"
+#include "utils/datetime.h"
+#include "utils/fmgroids.h"
+#include "utils/guc.h"
+#include "utils/relcache.h"
+#include "utils/syscache.h"
+#include "utils/timestamp.h"
+#include "utils/tqual.h"
 #include "replication/walsender.h"
 #include "storage/ipc.h"
 
+extern bool gp_reject_internal_tcp_conn;
+
+#if defined(_AIX)
+int     getpeereid(int, uid_t *__restrict__, gid_t *__restrict__);
+#endif
 
 /*----------------------------------------------------------------
  * Global authentication functions
@@ -147,6 +167,7 @@ bool		pg_krb_caseins_users;
 #endif
 
 static int	pg_GSS_recvauth(Port *port);
+static int	check_valid_until_for_gssapi(Port *port);
 #endif   /* ENABLE_GSS */
 
 
@@ -232,8 +253,16 @@ auth_failed(Port *port, int status, char *logdetail)
 	if (status == STATUS_EOF)
 		proc_exit(0);
 
-	switch (port->hba->auth_method)
+	/* internal communication failure */
+	if (!port->hba)
 	{
+		errstr = gettext_noop("authentication failed for user \"%s\": "
+							  "invalid authentication method");
+	}
+	else
+	{
+	  switch (port->hba->auth_method)
+	  {
 		case uaReject:
 		case uaImplicitReject:
 			errstr = gettext_noop("authentication failed for user \"%s\": host rejected");
@@ -274,6 +303,7 @@ auth_failed(Port *port, int status, char *logdetail)
 		default:
 			errstr = gettext_noop("authentication failed for user \"%s\": invalid authentication method");
 			break;
+	  }
 	}
 
 	cdetail = psprintf(_("Connection matched pg_hba.conf line %d: \"%s\""),
@@ -291,6 +321,107 @@ auth_failed(Port *port, int status, char *logdetail)
 	/* doesn't return */
 }
 
+/*
+ * Special client authentication for QD to QE connections. This is run at the
+ * QE. This is non-trivial because a QE some times runs at the master (i.e., an
+ * entry-DB for things like master only tables).
+ */
+static int
+internal_client_authentication(Port *port)
+{
+	if (IS_QUERY_DISPATCHER())
+	{
+		/* 
+		 * The entry-DB (or QE at the master) case.
+		 *
+		 * The goal here is to block network connection from out of
+		 * master to master db with magic bit packet.
+		 * So, only when it comes from the same host, the connection
+		 * is authenticated, if this connection is TCP/UDP. We
+		 * don't assume the connection is via unix domain socket,
+		 * but if it comes, just authenticate it. We'll need to
+		 * verify user on UDS case, but for now we don't do too much
+		 * for the goal described above.
+		 */
+		if(port->raddr.addr.ss_family == AF_INET
+#ifdef HAVE_IPV6
+				|| port->raddr.addr.ss_family == AF_INET6
+#endif   /* HAVE_IPV6 */
+			   )
+		{
+			if (check_same_host_or_net(&port->raddr, ipCmpSameHost) &&
+				!gp_reject_internal_tcp_conn)
+			{
+				elog(DEBUG1, "received same host internal TCP connection");
+				FakeClientAuthentication(port);
+			}
+			else
+			{
+				/* Security violation? */
+				elog(LOG, "rejecting TCP connection to master using internal"
+					 "connection protocol");
+				return false;
+			}
+			return true;
+		}
+#ifdef HAVE_UNIX_SOCKETS
+		else if (port->raddr.addr.ss_family == AF_UNIX)
+		{
+			/* 
+			 * Internal connection via a domain socket -- use ident
+			 */
+			char *local_name;
+			struct passwd *pw;
+
+			pw = getpwuid(geteuid());
+			if (pw == NULL)
+			{
+				elog(LOG, "invalid effective UID %d ", geteuid());
+				return false;
+			}
+
+			local_name = pw->pw_name;
+
+			if (!auth_peer(port))
+				return false;
+			else
+			{
+				FakeClientAuthentication(port);
+				return true;
+			}
+		}
+#endif   /* HAVE_UNIX_SOCKETS */
+		else
+		{
+			/* Security violation? */
+			elog(LOG, "rejecting TCP connection to master using internal"
+				 "connection protocol");
+			return false;
+		}
+	}
+	else
+	{
+		/* We're on an actual segment host */	
+		FakeClientAuthentication(port);
+	}
+
+	return true;
+}
+
+static bool
+is_internal_gpdb_conn(Port *port)
+{
+	/* 
+	 * This is an internal connection if major version is three and we've set
+	 * the upper bits to 7.
+	 */
+	if (PG_PROTOCOL_MAJOR(port->proto) == 3 &&
+			IS_GPDB_INTERNAL_PROTOCOL(port->proto))
+		return true;
+	else
+		return false;
+}
+
 
 /*
  * Client authentication starts here.  If there is an error, this
@@ -301,6 +432,18 @@ ClientAuthentication(Port *port)
 {
 	int			status = STATUS_ERROR;
 	char	   *logdetail = NULL;
+
+	/*
+	 * If this is a QD to QE connection, we might be able to short circuit
+	 * client authentication.
+	 */
+	if (is_internal_gpdb_conn(port))
+	{
+		if (internal_client_authentication(port))
+			return;
+
+		/* Else, try the normal authentication */
+	}
 
 	/*
 	 * Get the authentication method to use for this frontend/database
@@ -490,6 +633,14 @@ ClientAuthentication(Port *port)
 
 		case uaGSS:
 #ifdef ENABLE_GSS
+			if (check_valid_until_for_gssapi(port) == STATUS_ERROR)
+			{
+				ereport(FATAL,
+					(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+					 errmsg("authentication failed for user \"%s\": valid until timestamp expired",
+							port->user_name)));
+			}
+
 			sendAuthRequest(port, AUTH_REQ_GSS);
 			status = pg_GSS_recvauth(port);
 #else
@@ -567,6 +718,15 @@ ClientAuthentication(Port *port)
 		(*ClientAuthentication_hook) (port, status);
 
 	if (status == STATUS_OK)
+	{
+		if (CheckAuthTimeConstraints(port->user_name) != STATUS_OK)
+			ereport(FATAL,
+					 (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+					  errmsg("authentication failed for user \"%s\": login not permitted at this time",
+							 port->user_name)));
+	}
+
+	if (status == STATUS_OK)
 		sendAuthRequest(port, AUTH_REQ_OK);
 	else
 		auth_failed(port, status, logdetail);
@@ -575,6 +735,11 @@ ClientAuthentication(Port *port)
 	ImmediateInterruptOK = false;
 }
 
+void
+FakeClientAuthentication(Port *port)
+{
+	sendAuthRequest(port, AUTH_REQ_OK);
+}
 
 /*
  * Send an authentication request packet to the frontend.
@@ -705,7 +870,7 @@ recv_password_packet(Port *port)
 
 
 /*----------------------------------------------------------------
- * MD5 authentication
+ * hashed password (MD5, SHA-256) authentication
  *----------------------------------------------------------------
  */
 
@@ -725,7 +890,7 @@ recv_and_check_password_packet(Port *port, char **logdetail)
 	if (passwd == NULL)
 		return STATUS_EOF;		/* client wouldn't send password */
 
-	result = md5_crypt_verify(port, port->user_name, passwd, logdetail);
+	result = hashed_passwd_verify(port, port->user_name, passwd, logdetail);
 
 	pfree(passwd);
 
@@ -799,6 +964,59 @@ pg_GSS_error(int severity, char *errmsg, OM_uint32 maj_stat, OM_uint32 min_stat)
 	ereport(severity,
 			(errmsg_internal("%s", errmsg),
 			 errdetail_internal("%s: %s", msg_major, msg_minor)));
+}
+
+/*
+ * Check to see if the password of a user is valid (using the validuntil
+ * attribute associated with the pg_role) for GSSAPI based authentication.
+ *
+ * This logic is copied from hashed_passwd_verify(), so we need to ensure
+ * these functions don't fall out of sync.
+ */
+static int
+check_valid_until_for_gssapi(Port *port)
+{
+	int			retval = STATUS_ERROR;
+	TimestampTz vuntil = 0;
+	HeapTuple	roleTup;
+	Datum		datum;
+	bool		isnull;
+
+	/*
+	 * Disable immediate interrupts while doing database access.  (Note
+	 * we don't bother to turn this back on if we hit one of the failure
+	 * conditions, since we can expect we'll just exit right away anyway.)
+	 */
+	ImmediateInterruptOK = false;
+
+	/* Get role info from pg_authid */
+	roleTup = SearchSysCache1(AUTHNAME, PointerGetDatum(port->user_name));
+	if (!HeapTupleIsValid(roleTup))
+		return STATUS_ERROR;					/* no such user */
+
+	datum = SysCacheGetAttr(AUTHNAME, roleTup,
+							Anum_pg_authid_rolvaliduntil, &isnull);
+	if (!isnull)
+		vuntil = DatumGetTimestampTz(datum);
+
+	ReleaseSysCache(roleTup);
+
+	/* Re-enable immediate response to SIGTERM/SIGINT/timeout interrupts */
+	ImmediateInterruptOK = true;
+	/* And don't forget to detect one that already arrived */
+	CHECK_FOR_INTERRUPTS();
+
+	/*
+	 * Now check to be sure we are not past rolvaliduntil
+	 */
+	if (isnull)
+		retval = STATUS_OK;
+	else if (vuntil < GetCurrentTimestamp())
+		retval = STATUS_ERROR;
+	else
+		retval = STATUS_OK;
+
+	return retval;
 }
 
 static int
@@ -1636,10 +1854,15 @@ auth_peer(hbaPort *port)
 
 	strlcpy(ident_user, pw->pw_name, IDENT_USERNAME_MAX + 1);
 
-	return check_usermap(port->hba->usermap, port->user_name, ident_user, false);
+	/*
+	 * GPDB: check for port->hba == NULL here, because auth_peer is used
+	 * without an HBA entry in the short-circuited QD->QE authentication,
+	 * from internal_client_authentication().
+	 */
+	return check_usermap(port->hba ? port->hba->usermap : NULL,
+						 port->user_name, ident_user, false);
 }
 #endif   /* HAVE_UNIX_SOCKETS */
-
 
 /*----------------------------------------------------------------
  * PAM authentication system
@@ -1651,9 +1874,16 @@ auth_peer(hbaPort *port)
  * PAM conversation function
  */
 
+
+#if defined(_AIX)
+static int
+pam_passwd_conv_proc(int num_msg, struct pam_message **msg,
+					struct pam_response **resp, void *appdata_ptr)
+#else
 static int
 pam_passwd_conv_proc(int num_msg, const struct pam_message ** msg,
 					 struct pam_response ** resp, void *appdata_ptr)
+#endif
 {
 	char	   *passwd;
 	struct pam_response *reply;
@@ -1875,7 +2105,23 @@ InitializeLDAPConnection(Port *port, LDAP **ldap)
 	int			ldapversion = LDAP_VERSION3;
 	int			r;
 
-	*ldap = ldap_init(port->hba->ldapserver, port->hba->ldapport);
+	if (strncmp(port->hba->ldapserver, "ldaps://", 8) == 0 ||
+		strncmp(port->hba->ldapserver, "ldap://",  7) == 0)
+	{
+		if ((r = ldap_initialize(ldap, port->hba->ldapserver)) != LDAP_SUCCESS)
+		{
+			ereport(LOG,
+					(errmsg("could not initialize LDAP: code: %d, msg: %s",
+							r, ldap_err2string(r))));
+			*ldap = NULL;
+			return STATUS_ERROR;
+		}
+	}
+	else
+	{
+		*ldap = ldap_init(port->hba->ldapserver, port->hba->ldapport);
+	}
+
 	if (!*ldap)
 	{
 #ifndef WIN32
@@ -1946,7 +2192,8 @@ InitializeLDAPConnection(Port *port, LDAP **ldap)
 		{
 			ldap_unbind(*ldap);
 			ereport(LOG,
-					(errmsg("could not start LDAP TLS session: %s", ldap_err2string(r))));
+			 (errmsg("could not start LDAP TLS session: %s, server: %s, port: %d",
+					 ldap_err2string(r), port->hba->ldapserver, port->hba->ldapport)));
 			return STATUS_ERROR;
 		}
 	}
@@ -2599,4 +2846,206 @@ CheckRADIUSAuth(Port *port)
 			continue;
 		}
 	}							/* while (true) */
+}
+
+/*----------------------------------------------------------------
+ * Time-based authentication
+ *----------------------------------------------------------------
+ */
+/*
+ * interval_overlap -- Return true iff intersection of a, b is nonempty
+ */
+bool
+interval_overlap(const authInterval *a, const authInterval *b)
+{
+	return point_cmp(&a->start, &b->end) <= 0 &&
+		   point_cmp(&a->end, &b->start) >= 0;
+}
+
+/*
+ * interval_contains -- Return true iff interval contains point
+ */
+bool
+interval_contains(const authInterval *interval, const authPoint *point)
+{
+	return point_cmp(point, &interval->start) >= 0 &&
+		   point_cmp(point, &interval->end) <= 0;
+}
+
+/* Comparator for authPoint struct */
+int
+point_cmp(const authPoint *a, const authPoint *b)
+{
+	if (a->day > b->day)
+		return 1;
+	else if (a->day == b->day)
+		if (a->time > b->time)
+			return 1;
+		else if (a->time == b->time)
+			return 0;
+		else
+			return -1;
+	else
+		return -1;
+}
+
+/* convert timestamptz to authPoint through use of timestamp2tm and timestamptz_time */
+void
+timestamptz_to_point(TimestampTz in, authPoint *out)
+{
+	/* from timestamptz_to_char */
+	struct	pg_tm 	tm;
+	fsec_t  fsec;   
+	const char	*tzn;
+	int 	tzp, thisdate;
+	if (timestamp2tm(in, &tzp, &tm, &fsec, &tzn, NULL) != 0)
+		ereport(FATAL,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("current timestamp out of range")));
+
+	thisdate = date2j(tm.tm_year, tm.tm_mon, tm.tm_mday);
+	out->day = (thisdate + 1) % 7;
+	out->time = DatumGetTimeADT(DirectFunctionCall1(timestamptz_time,
+													TimestampTzGetDatum(in)));
+}
+
+/*
+ * CheckAuthTimeConstraints - check pg_auth_time_constraint for login restrictions
+ *
+ * Invokes check_auth_time_constraints_internal against the current timestamp
+ */
+int
+CheckAuthTimeConstraints(char *rolname) 
+{
+	if (gp_auth_time_override_str != NULL && gp_auth_time_override_str[0] != '\0')
+	{
+		TimestampTz timestamptz = DatumGetTimestampTz(DirectFunctionCall3(timestamptz_in,
+																		  CStringGetDatum(gp_auth_time_override_str),
+																		  InvalidOid,
+																		  Int32GetDatum(0)));
+		return check_auth_time_constraints_internal(rolname, timestamptz);
+	}
+	return check_auth_time_constraints_internal(rolname, GetCurrentTimestamp());
+}
+
+/*
+ * check_auth_time_constraints_internal - helper to CheckAuthTimeConstraints
+ *
+ * Called out as separate function to facilitate unit testing, where the provided
+ * timestamp is likely to be hardcoded for deterministic test runs
+ *
+ * Returns STATUS_ERROR iff it finds an interval that contains timestamp from
+ * among the entries of pg_auth_time_constraint that pertain to rolname
+ */
+int
+check_auth_time_constraints_internal(char *rolname, TimestampTz timestamp)
+{
+	Oid				roleId;
+	Relation		reltimeconstr;
+	ScanKeyData 	entry[1];
+	SysScanDesc 	scan;
+	HeapTuple		roleTup;
+	HeapTuple		tuple;
+	authPoint 		now;
+	int				status;
+	bool			isRoleSuperuser;
+	bool			found = false;
+
+	timestamptz_to_point(timestamp, &now);
+
+	/*
+	 * Disable immediate interrupts while doing database access.  (Note
+	 * we don't bother to turn this back on if we hit one of the failure
+	 * conditions, since we can expect we'll just exit right away anyway.)
+	 */
+	ImmediateInterruptOK = false;
+
+	/* Look up this user in pg_authid. */
+	roleTup = SearchSysCache(AUTHNAME, CStringGetDatum(rolname), 0, 0, 0);
+	if (!HeapTupleIsValid(roleTup))
+	{
+		/*
+		 * No such user. We don't error out here; it's up to other
+		 * authentication steps to deny access to nonexistent roles.
+		 */
+		return STATUS_OK;
+	}
+
+	isRoleSuperuser = ((Form_pg_authid) GETSTRUCT(roleTup))->rolsuper;
+	roleId = HeapTupleGetOid(roleTup);
+
+	ReleaseSysCache(roleTup);
+	/* Walk pg_auth_time_constraint for entries belonging to this user. */
+	reltimeconstr = heap_open(AuthTimeConstraintRelationId, AccessShareLock);
+
+	ScanKeyInit(&entry[0],
+				Anum_pg_auth_time_constraint_authid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(roleId));
+
+	/*
+	 * Since this is called during authentication, we have to make sure we don't
+	 * use the index unless it's already been built. See GetDatabaseTuple for
+	 * another example of this sort of logic.
+	 */
+	scan = systable_beginscan(reltimeconstr, AuthTimeConstraintAuthIdIndexId,
+							  criticalSharedRelcachesBuilt, NULL, 1,
+							  entry);
+
+	/*
+	 * Check each denied interval to see if the current timestamp is part of it.
+	 */
+	status = STATUS_OK;
+
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		Form_pg_auth_time_constraint constraint_tuple;
+		Datum 			datum;
+		bool			isnull;
+		authInterval	given;
+
+		/* Record that we found constraints regardless if they apply now */
+		found = true;
+
+		constraint_tuple = (Form_pg_auth_time_constraint) GETSTRUCT(tuple);
+		Assert(constraint_tuple->authid == roleId);
+
+		/* Retrieve the start of the interval. */
+		datum = heap_getattr(tuple, Anum_pg_auth_time_constraint_start_time,
+							 RelationGetDescr(reltimeconstr), &isnull);
+		Assert(!isnull);
+
+		given.start.day = constraint_tuple->start_day;
+		given.start.time = DatumGetTimeADT(datum);
+
+		/* Repeat for the end. */
+		datum = heap_getattr(tuple, Anum_pg_auth_time_constraint_end_time,
+							 RelationGetDescr(reltimeconstr), &isnull);
+		Assert(!isnull);
+
+		given.end.day = constraint_tuple->end_day;
+		given.end.time = DatumGetTimeADT(datum);
+
+		if (interval_contains(&given, &now))
+		{
+			status = STATUS_ERROR;
+			break;
+		}
+	}
+
+	/* Clean up. */
+	systable_endscan(scan);
+	heap_close(reltimeconstr, AccessShareLock);
+
+	/* Time constraints shouldn't be added to superuser roles */
+	if (found && isRoleSuperuser)
+		ereport(WARNING,
+				(errmsg("time constraints added on superuser role")));
+
+	/* Re-enable immediate response to SIGTERM/SIGINT/timeout interrupts */
+	ImmediateInterruptOK = true;
+	/* And don't forget to detect one that already arrived */
+	CHECK_FOR_INTERRUPTS();
+	
+	return status;
 }

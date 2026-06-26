@@ -15,15 +15,25 @@
 #define NODESUBPLAN_H
 
 #include "nodes/execnodes.h"
+#include "executor/execdesc.h"
 
 extern SubPlanState *ExecInitSubPlan(SubPlan *subplan, PlanState *parent);
 
 extern AlternativeSubPlanState *ExecInitAlternativeSubPlan(AlternativeSubPlan *asplan, PlanState *parent);
 
+extern Datum ExecAlternativeSubPlan(AlternativeSubPlanState *node,
+							 		ExprContext *econtext,
+							 		bool *isNull,
+							 		ExprDoneCond *isDone);
+
 extern void ExecReScanSetParamPlan(SubPlanState *node, PlanState *parent);
 
-extern void ExecSetParamPlan(SubPlanState *node, ExprContext *econtext);
+/*
+ * MPP Change: Added a parameter (ParamListInfo p) to this function.  See comments in nodeSubplan.cpp
+ */
+extern void ExecSetParamPlan(SubPlanState *node, ExprContext *econtext, QueryDesc *gbl_queryDesc);
 
-extern void ExecSetParamPlanMulti(const Bitmapset *params, ExprContext *econtext);
+/* Gpmon: It seems does not make any sense to gpmon this node. */
+extern void ExecSetParamPlanMulti(const Bitmapset *params, ExprContext *econtext, QueryDesc *gbl_queryDesc);
 
 #endif   /* NODESUBPLAN_H */

@@ -11,8 +11,11 @@
 subdir = src/backend/commands
 top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
+override CPPFLAGS := -I$(libpq_srcdir) $(CPPFLAGS)
 
-OBJS = aggregatecmds.o alter.o analyze.o async.o cluster.o comment.o  \
+explain.o: explain_gp.c
+
+OBJS = aggregatecmds.o alter.o analyze.o analyzeutils.o async.o cluster.o comment.o  \
 	collationcmds.o constraint.o conversioncmds.o copy.o createas.o \
 	dbcommands.o define.o discard.o dropcmds.o \
 	event_trigger.o explain.o extension.o foreigncmds.o functioncmds.o \
@@ -21,5 +24,8 @@ OBJS = aggregatecmds.o alter.o analyze.o async.o cluster.o comment.o  \
 	schemacmds.o seclabel.o sequence.o tablecmds.o tablespace.o trigger.o \
 	tsearchcmds.o typecmds.o user.o vacuum.o vacuumlazy.o \
 	variable.o view.o
+
+OBJS += analyzefuncs.o queue.o
+OBJS += resgroupcmds.o
 
 include $(top_srcdir)/src/backend/common.mk

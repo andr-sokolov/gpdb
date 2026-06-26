@@ -2122,7 +2122,6 @@ populate_record_worker(FunctionCallInfo fcinfo, const char *funcname,
 		/* Build a temporary HeapTuple control structure */
 		tuple.t_len = HeapTupleHeaderGetDatumLength(rec);
 		ItemPointerSetInvalid(&(tuple.t_self));
-		tuple.t_tableOid = InvalidOid;
 		tuple.t_data = rec;
 	}
 
@@ -2469,7 +2468,9 @@ make_row_from_rec_and_jsonb(Jsonb *element, PopulateRecordsetState *state)
 		/* Build a temporary HeapTuple control structure */
 		tuple.t_len = HeapTupleHeaderGetDatumLength(state->rec);
 		ItemPointerSetInvalid(&(tuple.t_self));
+#if 0
 		tuple.t_tableOid = InvalidOid;
+#endif
 		tuple.t_data = state->rec;
 
 		/* Break down the tuple into fields */
@@ -2813,7 +2814,6 @@ populate_recordset_object_end(void *state)
 		/* Build a temporary HeapTuple control structure */
 		tuple.t_len = HeapTupleHeaderGetDatumLength(_state->rec);
 		ItemPointerSetInvalid(&(tuple.t_self));
-		tuple.t_tableOid = InvalidOid;
 		tuple.t_data = _state->rec;
 
 		/* Break down the tuple into fields */
