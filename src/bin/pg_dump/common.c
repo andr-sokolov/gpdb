@@ -50,6 +50,7 @@ static DumpableObject **oprinfoindex;
 static DumpableObject **collinfoindex;
 static DumpableObject **nspinfoindex;
 static DumpableObject **extinfoindex;
+static DumpableObject **binaryupgradeinfoindex;
 static int	numTables;
 static int	numTypes;
 static int	numFuncs;
@@ -57,6 +58,7 @@ static int	numOperators;
 static int	numCollations;
 static int	numNamespaces;
 static int	numExtensions;
+static int  numTypeStorageOptions;
 
 /* This is an array of object identities, not actual DumpableObjects */
 static ExtensionMemberId *extmembers;
@@ -79,7 +81,7 @@ static int	strInArray(const char *pattern, char **arr, int arr_size);
  *	  Collect information about all potentially dumpable objects
  */
 TableInfo *
-getSchemaData(Archive *fout, int *numTablesPtr)
+getSchemaData(Archive *fout, int *numTablesPtr, int binary_upgrade)
 {
 	TableInfo  *tblinfo;
 	TypeInfo   *typinfo;
@@ -105,6 +107,19 @@ getSchemaData(Archive *fout, int *numTablesPtr)
 	int			numForeignServers;
 	int			numDefaultACLs;
 	int			numEventTriggers;
+
+	/* GPDB specific variables */
+
+	if (binary_upgrade)
+	{
+		BinaryUpgradeInfo *binfo;
+
+		if (g_verbose)
+			write_msg(NULL, "identifying required binary upgrade calls\n");
+
+		binfo = getBinaryUpgradeObjects();
+		binaryupgradeinfoindex = buildIndexArray(binfo, 1, sizeof(BinaryUpgradeInfo));
+	}
 
 	/*
 	 * We must read extensions and extension membership info first, because
@@ -149,6 +164,11 @@ getSchemaData(Archive *fout, int *numTablesPtr)
 		write_msg(NULL, "reading user-defined types\n");
 	typinfo = getTypes(fout, &numTypes);
 	typinfoindex = buildIndexArray(typinfo, numTypes, sizeof(TypeInfo));
+
+	/* this must be after getFuncs */
+	if (g_verbose)
+		write_msg(NULL, "reading type storage options\n");
+	getTypeStorageOptions(fout, &numTypeStorageOptions);
 
 	/* this must be after getFuncs, too */
 	if (g_verbose)
@@ -283,7 +303,8 @@ flagInhTables(TableInfo *tblinfo, int numTables,
 		/* Some kinds never have parents */
 		if (tblinfo[i].relkind == RELKIND_SEQUENCE ||
 			tblinfo[i].relkind == RELKIND_VIEW ||
-			tblinfo[i].relkind == RELKIND_MATVIEW)
+			tblinfo[i].relkind == RELKIND_MATVIEW ||
+			tblinfo[i].relstorage == RELSTORAGE_FOREIGN)
 			continue;
 
 		/* Don't bother computing anything for non-target tables, either */
@@ -329,7 +350,8 @@ flagInhAttrs(TableInfo *tblinfo, int numTables)
 		/* Some kinds never have parents */
 		if (tbinfo->relkind == RELKIND_SEQUENCE ||
 			tbinfo->relkind == RELKIND_VIEW ||
-			tbinfo->relkind == RELKIND_MATVIEW)
+			tbinfo->relkind == RELKIND_MATVIEW ||
+			tbinfo->relstorage == RELSTORAGE_FOREIGN)
 			continue;
 
 		/* Don't bother computing anything for non-target tables, either */
@@ -377,18 +399,18 @@ flagInhAttrs(TableInfo *tblinfo, int numTables)
 			{
 				AttrDefInfo *attrDef;
 
-				attrDef = (AttrDefInfo *) pg_malloc(sizeof(AttrDefInfo));
+				attrDef = (AttrDefInfo *) malloc(sizeof(AttrDefInfo));
 				attrDef->dobj.objType = DO_ATTRDEF;
 				attrDef->dobj.catId.tableoid = 0;
 				attrDef->dobj.catId.oid = 0;
 				AssignDumpId(&attrDef->dobj);
-				attrDef->dobj.name = pg_strdup(tbinfo->dobj.name);
+				attrDef->dobj.name = strdup(tbinfo->dobj.name);
 				attrDef->dobj.namespace = tbinfo->dobj.namespace;
 				attrDef->dobj.dump = tbinfo->dobj.dump;
 
 				attrDef->adtable = tbinfo;
 				attrDef->adnum = j + 1;
-				attrDef->adef_expr = pg_strdup("NULL");
+				attrDef->adef_expr = strdup("NULL");
 
 				/* Will column be dumped explicitly? */
 				if (shouldPrintColumn(tbinfo, j))
@@ -552,7 +574,7 @@ findObjectByCatalogId(CatalogId catalogId)
  *
  * Returns NULL for unknown OID
  */
-static DumpableObject *
+DumpableObject *
 findObjectByOid(Oid oid, DumpableObject **indexArray, int numObjs)
 {
 	DumpableObject **low;
@@ -1008,4 +1030,70 @@ simple_oid_list_member(SimpleOidList *list, Oid val)
 			return true;
 	}
 	return false;
+}
+
+/*
+ * MPP-1890
+ *
+ * If the user explicitly DROP'ed a CHECK constraint on a child but it
+ * still exists on the parent when they dump and restore that constraint
+ * will exist on the child since it will again inherit it from the
+ * parent. Therefore we look here for constraints that exist on the
+ * parent but not on the child and mark them to be dropped from the
+ * child after the child table is defined.
+ *
+ * Loop through each parent and for each parent constraint see if it
+ * exists on the child as well. If it doesn't it means that the child
+ * dropped it. Mark it.
+ */
+void
+DetectChildConstraintDropped(TableInfo *tbinfo, PQExpBuffer q)
+{
+	TableInfo  *parent;
+	TableInfo **parents = tbinfo->parents;
+	int			j,
+				k,
+				l;
+	int			numParents = tbinfo->numParents;
+
+	for (k = 0; k < numParents; k++)
+	{
+		parent = parents[k];
+
+		/* for each CHECK constraint of this parent */
+		for (l = 0; l < parent->ncheck; l++)
+		{
+			ConstraintInfo *pconstr = &(parent->checkexprs[l]);
+			ConstraintInfo *cconstr;
+			bool		constr_on_child = false;
+
+			/* for each child CHECK constraint */
+			for (j = 0; j < tbinfo->ncheck; j++)
+			{
+				cconstr = &(tbinfo->checkexprs[j]);
+
+				if (strcmp(pconstr->dobj.name, cconstr->dobj.name) == 0)
+				{
+					/* parent constr exists on child. hence wasn't dropped */
+					constr_on_child = true;
+					break;
+				}
+
+			}
+
+			/* this parent constr is not on child, issue a DROP for it */
+			if (!constr_on_child)
+			{
+				appendPQExpBuffer(q, "ALTER TABLE %s.",
+								  fmtId(tbinfo->dobj.namespace->dobj.name));
+				appendPQExpBuffer(q, "%s ",
+								  fmtId(tbinfo->dobj.name));
+				appendPQExpBuffer(q, "DROP CONSTRAINT %s;\n",
+								  fmtId(pconstr->dobj.name));
+
+				constr_on_child = false;
+			}
+		}
+	}
+
 }

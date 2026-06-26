@@ -69,6 +69,21 @@ CATALOG(pg_am,2601)
 	regproc		amoptions;		/* parse AM-specific parameters */
 } FormData_pg_am;
 
+/* GPDB added foreign key definitions for gpcheckcat. */
+FOREIGN_KEY(aminsert REFERENCES pg_proc(oid));
+FOREIGN_KEY(ambeginscan REFERENCES pg_proc(oid));
+FOREIGN_KEY(amgettuple REFERENCES pg_proc(oid));
+FOREIGN_KEY(amgetbitmap REFERENCES pg_proc(oid));
+FOREIGN_KEY(amrescan REFERENCES pg_proc(oid));
+FOREIGN_KEY(amendscan REFERENCES pg_proc(oid));
+FOREIGN_KEY(ammarkpos REFERENCES pg_proc(oid));
+FOREIGN_KEY(amrestrpos REFERENCES pg_proc(oid));
+FOREIGN_KEY(ambuild REFERENCES pg_proc(oid));
+FOREIGN_KEY(ambulkdelete REFERENCES pg_proc(oid));
+FOREIGN_KEY(amvacuumcleanup REFERENCES pg_proc(oid));
+FOREIGN_KEY(amcostestimate REFERENCES pg_proc(oid));
+FOREIGN_KEY(amoptions REFERENCES pg_proc(oid));
+
 /* ----------------
  *		Form_pg_am corresponds to a pointer to a tuple with
  *		the format of pg_am relation.
@@ -132,5 +147,9 @@ DESCR("GIN index access method");
 DATA(insert OID = 4000 (  spgist	0 5 f f f f f t f t f f f 0 spginsert spgbeginscan spggettuple spggetbitmap spgrescan spgendscan spgmarkpos spgrestrpos spgbuild spgbuildempty spgbulkdelete spgvacuumcleanup spgcanreturn spgcostestimate spgoptions ));
 DESCR("SP-GiST index access method");
 #define SPGIST_AM_OID 4000
+
+DATA(insert OID = 7013 (  bitmap	5 1 f f f t t t f f f f f 0 bminsert bmbeginscan bmgettuple bmgetbitmap bmrescan bmendscan bmmarkpos bmrestrpos bmbuild bmbuildempty bmbulkdelete bmvacuumcleanup - bmcostestimate bmoptions ));
+DESCR("bitmap index access method");
+#define BITMAP_AM_OID 7013
 
 #endif   /* PG_AM_H */

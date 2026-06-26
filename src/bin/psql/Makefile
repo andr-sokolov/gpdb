@@ -18,13 +18,25 @@ include $(top_builddir)/src/Makefile.global
 
 REFDOCDIR= $(top_srcdir)/doc/src/sgml/ref
 
-override CPPFLAGS := -I. -I$(srcdir) -I$(libpq_srcdir) -I$(top_srcdir)/src/bin/pg_dump $(CPPFLAGS)
+override CPPFLAGS := -DFRONTEND -I. -I$(srcdir) -I$(libpq_srcdir) -I$(top_srcdir)/src/bin/pg_dump $(CPPFLAGS)
+
+# necessary to get flex to play nice with large files on 32bit solaris sparc
+ifeq ($(PORTNAME), solaris)
+#ifeq ($(host_cpu), sparc)
+ifneq ($(enable_largefile), no)
+override CFLAGS := -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE=1
+endif
+#endif
+endif
 
 OBJS=	command.o common.o help.o input.o stringutils.o mainloop.o copy.o \
 	startup.o prompt.o variables.o large_obj.o print.o describe.o \
 	tab-complete.o mbprint.o dumputils.o keywords.o kwlookup.o \
 	sql_help.o \
 	$(WIN32RES)
+
+# The frontend doesn't need everything that's in LIBS, some are backend only
+LIBS := $(filter-out -lresolv -lbz2, $(LIBS))
 
 
 all: psql
@@ -67,7 +79,7 @@ uninstall:
 
 # psqlscan.c is in the distribution tarball, so is not cleaned here
 clean distclean:
-	rm -f psql$(X) $(OBJS) dumputils.c keywords.c kwlookup.c lex.backup
+	rm -f psql$(X) $(OBJS) dumputils.c keywords.c kwlookup.c psqlscan.o
 
 maintainer-clean: distclean
 	rm -f sql_help.h sql_help.c psqlscan.c

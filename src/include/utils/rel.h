@@ -4,6 +4,8 @@
  *	  POSTGRES relation descriptor (a/k/a relcache entry) definitions.
  *
  *
+ * Portions Copyright (c) 2005-2009, Greenplum inc.
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -105,6 +107,8 @@ typedef struct RelationData
 	RuleLock   *rd_rules;		/* rewrite rules */
 	MemoryContext rd_rulescxt;	/* private memory cxt for rd_rules, if any */
 	TriggerDesc *trigdesc;		/* Trigger info, or NULL if rel has none */
+    struct GpPolicy *rd_cdbpolicy; /* Partitioning info if distributed rel */
+    bool        rd_cdbDefaultStatsWarningIssued;
 
 	/* data managed by RelationGetIndexList: */
 	List	   *rd_indexlist;	/* list of OIDs of indexes on relation */
@@ -216,6 +220,9 @@ typedef struct StdRdOptions
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
 	int			fillfactor;		/* page fill factor in percent (0..100) */
 	AutoVacOpts autovacuum;		/* autovacuum-related options */
+
+	bool		security_barrier;		/* for views */
+	int			check_option_offset;	/* for views */
 	bool		user_catalog_table;		/* use as an additional catalog
 										 * relation */
 } StdRdOptions;
@@ -316,6 +323,27 @@ typedef struct ViewOptions
 #define RelationIsValid(relation) PointerIsValid(relation)
 
 #define InvalidRelation ((Relation) NULL)
+
+/*
+ * RelationIsHeap
+ * 		True iff relation has heap storage
+ */
+#define RelationIsHeap(relation) \
+	((bool)((relation)->rd_rel->relstorage == RELSTORAGE_HEAP))
+
+/*
+ * RelationIsForeign
+ * 		True iff relation has foreign storage
+ */
+#define RelationIsForeign(relation) \
+	((bool)((relation)->rd_rel->relstorage == RELSTORAGE_FOREIGN))
+
+/*
+ * RelationIsBitmapIndex
+ *      True iff relation is a bitmap index
+ */
+#define RelationIsBitmapIndex(relation) \
+	((bool)((relation)->rd_rel->relam == BITMAP_AM_OID))
 
 /*
  * RelationHasReferenceCountZero
@@ -435,8 +463,18 @@ typedef struct ViewOptions
 /*
  * RelationUsesLocalBuffers
  *		True if relation's pages are stored in local buffers.
+ *
+ * In GPDB, we do not use local buffers for temp tables because segmates need
+ * to share temp table contents.  Currently, there is no other reason to use
+ * local buffers.
  */
-#define RelationUsesLocalBuffers(relation) \
+#define RelationUsesLocalBuffers(relation) false
+
+/*
+ * RelationUsesTempNamespace
+ *		True if relation's catalog entries live in a private namespace.
+ */
+#define RelationUsesTempNamespace(relation) \
 	((relation)->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
 
 /*

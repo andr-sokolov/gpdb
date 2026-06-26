@@ -53,6 +53,22 @@ initStringInfo(StringInfo str)
 }
 
 /*
+ * initStringInfoOfSize
+ *
+ * Initialize a StringInfoData struct with data buffer of 'size' bytes 
+ */
+void
+initStringInfoOfSize(StringInfo str, int size)
+{
+
+	str->data = (char *) palloc(size);
+	str->maxlen = size;
+	str->len = 0;
+	str->data[0] = '\0';
+	str->cursor = 0;
+}
+
+/*
  * resetStringInfo
  *
  * Reset the StringInfo: the data buffer remains valid, but its
@@ -205,7 +221,7 @@ appendStringInfoSpaces(StringInfo str, int count)
  * if necessary.
  */
 void
-appendBinaryStringInfo(StringInfo str, const char *data, int datalen)
+appendBinaryStringInfo(StringInfo str, const void *data, int datalen)
 {
 	Assert(str != NULL);
 
@@ -287,3 +303,24 @@ enlargeStringInfo(StringInfo str, int needed)
 
 	str->maxlen = newlen;
 }
+
+/*
+ * Replace all occurrences of a string in a StringInfo with a different string.
+ */
+void
+replaceStringInfoString(StringInfo str, char *replace, char *replacement)
+{
+	char	   *ptr;
+
+	while ((ptr = strstr(str->data, replace)) != NULL)
+	{
+		char	   *dup = pstrdup(str->data);
+
+		resetStringInfo(str);
+		appendBinaryStringInfo(str, dup, ptr - str->data);
+		appendStringInfoString(str, replacement);
+		appendStringInfoString(str, dup + (ptr - str->data) + strlen(replace));		
+		pfree(dup);
+	}
+}
+

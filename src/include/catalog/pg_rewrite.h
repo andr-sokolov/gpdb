@@ -45,6 +45,9 @@ CATALOG(pg_rewrite,2618)
 #endif
 } FormData_pg_rewrite;
 
+/* GPDB added foreign key definitions for gpcheckcat. */
+FOREIGN_KEY(ev_class REFERENCES pg_attribute(attrelid));
+
 /* ----------------
  *		Form_pg_rewrite corresponds to a pointer to a tuple with
  *		the format of pg_rewrite relation.

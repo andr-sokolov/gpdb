@@ -15,6 +15,7 @@
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "storage/spin.h"
+#include "replication/walsender_private.h"
 
 /*
  * Behaviour of replication slots, upon release or crash.
@@ -111,6 +112,9 @@ typedef struct ReplicationSlot
 	/* is somebody performing io on this slot? */
 	LWLock	   *io_in_progress_lock;
 
+	/* GPDB: the walsnd of this replication slot */
+	WalSnd	   *walsnd;
+
 	/* all the remaining data is only used for logical slots */
 
 	/* ----
@@ -124,6 +128,11 @@ typedef struct ReplicationSlot
 	XLogRecPtr	candidate_restart_valid;
 	XLogRecPtr	candidate_restart_lsn;
 } ReplicationSlot;
+
+#define SlotIsPhysical(slot) (slot->data.database == InvalidOid)
+#define SlotIsLogical(slot) (slot->data.database != InvalidOid)
+
+#define INTERNAL_WAL_REPLICATION_SLOT_NAME	"internal_wal_replication_slot"
 
 /*
  * Shared memory control area for all of replication slots.
@@ -159,10 +168,12 @@ extern void ReplicationSlotMarkDirty(void);
 
 /* misc stuff */
 extern bool ReplicationSlotValidateName(const char *name, int elevel);
+extern void ReplicationSlotReserveWal(void);
 extern void ReplicationSlotsComputeRequiredXmin(bool already_locked);
 extern void ReplicationSlotsComputeRequiredLSN(void);
 extern XLogRecPtr ReplicationSlotsComputeLogicalRestartLSN(void);
 extern bool ReplicationSlotsCountDBSlots(Oid dboid, int *nslots, int *nactive);
+extern void InvalidateObsoleteReplicationSlots(XLogSegNo oldestSegno);
 
 extern void StartupReplicationSlots(void);
 extern void CheckPointReplicationSlots(void);
@@ -174,5 +185,7 @@ extern Datum pg_create_physical_replication_slot(PG_FUNCTION_ARGS);
 extern Datum pg_create_logical_replication_slot(PG_FUNCTION_ARGS);
 extern Datum pg_drop_replication_slot(PG_FUNCTION_ARGS);
 extern Datum pg_get_replication_slots(PG_FUNCTION_ARGS);
+
+extern void ReplicationSlotDropIfExists(const char *name);
 
 #endif   /* SLOT_H */

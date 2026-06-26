@@ -5,6 +5,8 @@
  *	  along with the relation's initial contents.
  *
  *
+ * Portions Copyright (c) 2006-2010, Greenplum inc
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -158,6 +160,10 @@ CATALOG(pg_attribute,1249) BKI_BOOTSTRAP BKI_WITHOUT_OIDS BKI_ROWTYPE_OID(75) BK
 	text		attfdwoptions[1];
 #endif
 } FormData_pg_attribute;
+
+/* GPDB added foreign key definitions for gpcheckcat. */
+FOREIGN_KEY(attrelid REFERENCES pg_class(oid));
+FOREIGN_KEY(atttypid REFERENCES pg_type(oid));
 
 /*
  * ATTRIBUTE_FIXED_PART_SIZE is the size of the fixed-layout,

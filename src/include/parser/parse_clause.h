@@ -37,10 +37,19 @@ extern List *transformWindowDefinitions(ParseState *pstate,
 						   List *windowdefs,
 						   List **targetlist);
 
+extern List *transformDistinctToGroupBy(ParseState *pstate, List **targetlist,
+						   List **sortClause, List **groupClause);
 extern List *transformDistinctClause(ParseState *pstate,
 						List **targetlist, List *sortClause, bool is_agg);
 extern List *transformDistinctOnClause(ParseState *pstate, List *distinctlist,
 						  List **targetlist, List *sortClause);
+extern List *transformScatterClause(ParseState *pstate, List *scatterlist,
+									List **targetlist);
+extern void processExtendedGrouping(ParseState *pstate, Node *havingQual,
+									List *windowClause, List *targetlist);
+extern List *addTargetToSortList(ParseState *pstate, TargetEntry *tle,
+					List *sortlist, List *targetlist, SortBy *sortby,
+					bool resolveUnknown);
 
 extern List *addTargetToSortList(ParseState *pstate, TargetEntry *tle,
 					List *sortlist, List *targetlist, SortBy *sortby,
