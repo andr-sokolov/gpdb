@@ -18,6 +18,7 @@
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_foreign_table.h"
 #include "catalog/pg_user_mapping.h"
+#include "commands/defrem.h"
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
 #include "lib/stringinfo.h"
@@ -31,6 +32,45 @@
 extern Datum pg_options_to_table(PG_FUNCTION_ARGS);
 extern Datum postgresql_fdw_validator(PG_FUNCTION_ARGS);
 
+/* Get and separate out the mpp_execute option. */
+char
+SeparateOutMppExecute(List **options)
+{
+	ListCell *lc = NULL;
+	ListCell *prev = NULL;
+	char *mpp_execute = NULL;
+	char exec_location = FTEXECLOCATION_NOT_DEFINED;
+
+	foreach(lc, *options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, "mpp_execute") == 0)
+		{
+			mpp_execute = defGetString(def);
+
+			if (pg_strcasecmp(mpp_execute, "any") == 0)
+				exec_location = FTEXECLOCATION_ANY;
+			else if (pg_strcasecmp(mpp_execute, "master") == 0)
+				exec_location = FTEXECLOCATION_MASTER;
+			else if (pg_strcasecmp(mpp_execute, "all segments") == 0)
+				exec_location = FTEXECLOCATION_ALL_SEGMENTS;
+			else
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("\"%s\" is not a valid mpp_execute value",
+								mpp_execute)));
+			}
+
+			*options = list_delete_cell(*options, lc, prev);
+			break;
+		}
+		prev = lc;
+	}
+
+	return exec_location;
+}
 
 /*
  * GetForeignDataWrapper -	look up the foreign-data wrapper by OID.
@@ -67,6 +107,10 @@ GetForeignDataWrapper(Oid fdwid)
 		fdw->options = NIL;
 	else
 		fdw->options = untransformRelOptions(datum);
+
+	fdw->exec_location = SeparateOutMppExecute(&fdw->options);
+	if (fdw->exec_location == FTEXECLOCATION_NOT_DEFINED)
+		fdw->exec_location = FTEXECLOCATION_MASTER;
 
 	ReleaseSysCache(tp);
 
@@ -138,6 +182,13 @@ GetForeignServer(Oid serverid)
 		server->options = NIL;
 	else
 		server->options = untransformRelOptions(datum);
+
+	server->exec_location = SeparateOutMppExecute(&server->options);
+	if (server->exec_location == FTEXECLOCATION_NOT_DEFINED)
+	{
+		ForeignDataWrapper *fdw = GetForeignDataWrapper(server->fdwid);
+		server->exec_location = fdw->exec_location;
+	}
 
 	ReleaseSysCache(tp);
 
@@ -242,6 +293,13 @@ GetForeignTable(Oid relid)
 		ft->options = NIL;
 	else
 		ft->options = untransformRelOptions(datum);
+
+	ft->exec_location = SeparateOutMppExecute(&ft->options);
+	if (ft->exec_location == FTEXECLOCATION_NOT_DEFINED)
+	{
+		ForeignServer *server = GetForeignServer(ft->serverid);
+		ft->exec_location = server->exec_location;
+	}
 
 	ReleaseSysCache(tp);
 

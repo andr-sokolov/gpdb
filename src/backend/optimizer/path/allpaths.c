@@ -3,6 +3,8 @@
  * allpaths.c
  *	  Routines to find possible search paths for processing a query
  *
+ * Portions Copyright (c) 2005-2008, Greenplum inc
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -17,6 +19,7 @@
 
 #include <math.h>
 
+#include "catalog/catalog.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_operator.h"
 #include "foreign/fdwapi.h"
@@ -26,19 +29,29 @@
 #endif
 #include "optimizer/clauses.h"
 #include "optimizer/cost.h"
-#include "optimizer/geqo.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/plancat.h"
+#include "optimizer/planmain.h"
 #include "optimizer/planner.h"
 #include "optimizer/prep.h"
 #include "optimizer/restrictinfo.h"
 #include "optimizer/var.h"
+#include "optimizer/planshare.h"
 #include "parser/parse_clause.h"
 #include "parser/parsetree.h"
 #include "rewrite/rewriteManip.h"
+#include "utils/guc.h"
 #include "utils/lsyscache.h"
+#include "utils/syscache.h"
 
+#include "cdb/cdbmutate.h"		/* cdbmutate_warn_ctid_without_segid */
+#include "cdb/cdbpath.h"		/* cdbpath_rows() */
+#include "cdb/cdbsetop.h"
+
+// TODO: these planner gucs need to be refactored into PlannerConfig.
+bool		gp_enable_sort_limit = FALSE;
+bool		gp_enable_sort_distinct = FALSE;
 
 /* results of subquery_is_pushdown_safe */
 typedef struct pushdown_safety_info
@@ -47,10 +60,6 @@ typedef struct pushdown_safety_info
 	bool		unsafeVolatile; /* don't push down volatile quals */
 	bool		unsafeLeaky;	/* don't push down leaky quals */
 } pushdown_safety_info;
-
-/* These parameters are set by GUC */
-bool		enable_geqo = false;	/* just in case GUC doesn't set it */
-int			geqo_threshold;
 
 /* Hook for plugins to replace standard_join_search() */
 join_search_hook_type join_search_hook = NULL;
@@ -75,6 +84,7 @@ static void set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
 					Index rti, RangeTblEntry *rte);
 static void set_append_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 						Index rti, RangeTblEntry *rte);
+static bool has_multiple_baserels(PlannerInfo *root);
 static void generate_mergeappend_paths(PlannerInfo *root, RelOptInfo *rel,
 						   List *live_childrels,
 						   List *all_child_pathkeys);
@@ -82,11 +92,13 @@ static Path *get_cheapest_parameterized_child_path(PlannerInfo *root,
 									  RelOptInfo *rel,
 									  Relids required_outer);
 static List *accumulate_append_subpath(List *subpaths, Path *path);
-static void set_dummy_rel_pathlist(RelOptInfo *rel);
+static void set_dummy_rel_pathlist(PlannerInfo *root, RelOptInfo *rel);
 static void set_subquery_pathlist(PlannerInfo *root, RelOptInfo *rel,
 					  Index rti, RangeTblEntry *rte);
 static void set_function_pathlist(PlannerInfo *root, RelOptInfo *rel,
 					  RangeTblEntry *rte);
+static void set_tablefunction_pathlist(PlannerInfo *root, RelOptInfo *rel,
+						   RangeTblEntry *rte);
 static void set_values_pathlist(PlannerInfo *root, RelOptInfo *rel,
 					RangeTblEntry *rte);
 static void set_cte_pathlist(PlannerInfo *root, RelOptInfo *rel,
@@ -94,6 +106,8 @@ static void set_cte_pathlist(PlannerInfo *root, RelOptInfo *rel,
 static void set_worktable_pathlist(PlannerInfo *root, RelOptInfo *rel,
 					   RangeTblEntry *rte);
 static RelOptInfo *make_rel_from_joinlist(PlannerInfo *root, List *joinlist);
+static Query *push_down_restrict(PlannerInfo *root, RelOptInfo *rel,
+				   RangeTblEntry *rte, Index rti, Query *subquery);
 static bool subquery_is_pushdown_safe(Query *subquery, Query *topquery,
 						  pushdown_safety_info *safetyInfo);
 static bool recurse_pushdown_safe(Node *setOp, Query *topquery,
@@ -102,13 +116,16 @@ static void check_output_expressions(Query *subquery,
 						 pushdown_safety_info *safetyInfo);
 static void compare_tlist_datatypes(List *tlist, List *colTypes,
 						pushdown_safety_info *safetyInfo);
+static bool targetIsInAllPartitionLists(TargetEntry *tle, Query *query);
 static bool qual_is_pushdown_safe(Query *subquery, Index rti, Node *qual,
 					  pushdown_safety_info *safetyInfo);
 static void subquery_push_qual(Query *subquery,
 				   RangeTblEntry *rte, Index rti, Node *qual);
 static void recurse_push_qual(Node *setOp, Query *topquery,
 				  RangeTblEntry *rte, Index rti, Node *qual);
-
+static void bring_to_singleQE(PlannerInfo *root, RelOptInfo *rel,  List *outer_quals);
+static bool is_query_contain_limit_groupby(Query *parse);
+static void handle_gen_seggen_volatile_path(PlannerInfo *root, RelOptInfo *rel);
 
 /*
  * make_one_rel
@@ -262,6 +279,9 @@ set_base_rel_pathlists(PlannerInfo *root)
 		if (rel->reloptkind != RELOPT_BASEREL)
 			continue;
 
+		/* CDB: Warn if ctid column is referenced but gp_segment_id is not. */
+		cdbmutate_warn_ctid_without_segid(root, rel);
+
 		set_rel_pathlist(root, rel, rti, root->simple_rte_array[rti]);
 	}
 }
@@ -288,7 +308,7 @@ set_rel_size(PlannerInfo *root, RelOptInfo *rel,
 		 * we don't have a convention for marking a rel as dummy except by
 		 * assigning a dummy path to it.
 		 */
-		set_dummy_rel_pathlist(rel);
+		set_dummy_rel_pathlist(root, rel);
 	}
 	else if (rte->inh)
 	{
@@ -323,6 +343,9 @@ set_rel_size(PlannerInfo *root, RelOptInfo *rel,
 			case RTE_FUNCTION:
 				set_function_size_estimates(root, rel);
 				break;
+			case RTE_TABLEFUNCTION:
+				set_tablefunction_pathlist(root, rel, rte);
+				break;
 			case RTE_VALUES:
 				set_values_size_estimates(root, rel);
 				break;
@@ -348,6 +371,119 @@ set_rel_size(PlannerInfo *root, RelOptInfo *rel,
 	 * We insist that all non-dummy rels have a nonzero rowcount estimate.
 	 */
 	Assert(rel->rows > 0 || IS_DUMMY_REL(rel));
+}
+
+/*
+ * Decorate the Paths of 'rel' with Motions to bring the relation's
+ * result to SingleQE locus. The final plan will look something like
+ * this:
+ *
+ *   Result (with quals from 'outer_quals')
+ *           \
+ *            \_Material
+ *                   \
+ *                    \_ Gather
+ *                           \
+ *                            \_SeqScan (with quals from 'baserestrictinfo')
+ */
+static void
+bring_to_singleQE(PlannerInfo *root, RelOptInfo *rel, List *outer_quals)
+{
+	List	   *origpathlist;
+	ListCell   *lc;
+
+	origpathlist = rel->pathlist;
+	rel->cheapest_startup_path = NULL;
+	rel->cheapest_total_path = NULL;
+	rel->cheapest_unique_path = NULL;
+	rel->cheapest_parameterized_paths = NIL;
+	rel->pathlist = NIL;
+
+	foreach(lc, origpathlist)
+	{
+		Path	     *origpath = (Path *) lfirst(lc);
+		Path	     *path;
+		CdbPathLocus  target_locus;
+
+		if (CdbPathLocus_IsGeneral(origpath->locus) ||
+			CdbPathLocus_IsSingleQE(origpath->locus))
+			path = origpath;
+		else
+		{
+			/*
+			 * Cannot pass a param through motion, so if this is a parameterized
+			 * path, we can't use it.
+			 */
+			if (origpath->param_info)
+				continue;
+
+			/*
+			 * param_info cannot cover the case that an index path's orderbyclauses
+			 * See github issue: https://github.com/greenplum-db/gpdb/issues/9733
+			 */
+			if (IsA(origpath, IndexPath))
+			{
+				IndexPath *ipath = (IndexPath *) origpath;
+				if (contains_outer_params((Node *) ipath->indexorderbys,
+										  (void *) root))
+					continue;
+			}
+
+			CdbPathLocus_MakeSingleQE(&target_locus,
+									  origpath->locus.numsegments);
+
+			path = cdbpath_create_motion_path(root,
+											  origpath,
+											  NIL, // DESTROY pathkeys
+											  false,
+											  target_locus);
+
+			path = (Path *) create_material_path(root, rel, path);
+
+			if (outer_quals)
+				path = (Path *) create_projection_path_with_quals(root,
+																  rel,
+																  path,
+																  outer_quals);
+		}
+
+		add_path(rel, path);
+	}
+	set_cheapest(rel);
+}
+
+/*
+ * handle_gen_seggen_volatile_path
+ *
+ * Only use for base replicated rel.
+ * Change the path in its pathlist if match the pattern
+ * (segmentgeneral or general path contains volatile restrictions).
+ */
+static void
+handle_gen_seggen_volatile_path(PlannerInfo *root, RelOptInfo *rel)
+{
+	List	   *origpathlist;
+	ListCell   *lc;
+
+	origpathlist = rel->pathlist;
+	rel->cheapest_startup_path = NULL;
+	rel->cheapest_total_path = NULL;
+	rel->cheapest_unique_path = NULL;
+	rel->cheapest_parameterized_paths = NIL;
+	rel->pathlist = NIL;
+
+	foreach(lc, origpathlist)
+	{
+		Path	     *origpath = (Path *) lfirst(lc);
+		Path	     *path;
+
+		path = turn_volatile_seggen_to_singleqe(root,
+												origpath,
+												(Node *) (rel->baserestrictinfo));
+		add_path(rel, path);
+	}
+
+	set_cheapest(rel);
 }
 
 /*
@@ -390,6 +526,9 @@ set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 				/* RangeFunction */
 				set_function_pathlist(root, rel, rte);
 				break;
+			case RTE_TABLEFUNCTION:
+				/* RangeFunction --- generate a suitable path for it */
+				break;
 			case RTE_VALUES:
 				/* Values list */
 				set_values_pathlist(root, rel, rte);
@@ -402,6 +541,26 @@ set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 				break;
 		}
 	}
+
+	if (root->config->force_singleQE)
+	{
+		/*
+		 * CDB: we cannot pass parameters across motion,
+		 * if this is the inner plan of a lateral join and
+		 * it contains limit clause, we will reach here.
+		 * Planner will gather all the data into singleQE
+		 * and materialize it.
+		 */
+		bring_to_singleQE(root, rel, rel->upperrestrictinfo);
+	}
+
+	/*
+	 * Greenplum specific behavior:
+	 * Change the path in pathlist if it is a general or segmentgeneral
+	 * path that contains volatile restrictions.
+	 */
+	if (rel->reloptkind == RELOPT_BASEREL)
+		handle_gen_seggen_volatile_path(root, rel);
 
 #ifdef OPTIMIZER_DEBUG
 	debug_print_rel(root, rel);
@@ -426,6 +585,154 @@ set_plain_rel_size(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 }
 
 /*
+ * is_table_distributed
+ *	  Is the table distributed?
+ */
+static bool
+is_table_distributed(Oid relid)
+{
+	HeapTuple	gp_policy_tuple;
+
+	gp_policy_tuple = SearchSysCache1(GPPOLICYID, ObjectIdGetDatum(relid));
+	if (HeapTupleIsValid(gp_policy_tuple))
+	{
+		ReleaseSysCache(gp_policy_tuple);
+		return true;
+	}
+
+	return false;
+}
+
+/*
+ * maybe_rte_non_distributed
+ *	  Is a range table entry non-distributed possibly?
+ */
+static bool
+maybe_rte_non_distributed(List *rtable, Index rtindex)
+{
+	RangeTblEntry *rte;
+
+	rte = rt_fetch(rtindex, rtable);
+
+	if (rte->rtekind == RTE_RELATION)
+		return !is_table_distributed(rte->relid);
+
+	/*
+	 * For other rte kind e.g. RTE_SUBQUERY or RTE_FUNCTION, we may
+	 * not be able to know the locus of its path at this moment so
+	 * set it as true.
+	 */
+	return true;
+}
+
+/*
+ * maybe_param_non_distributed
+ *	  Is a Param related to a non-distributed table possibly?
+ */
+static bool
+maybe_param_non_distributed(PlannerInfo *root, Param *param)
+{
+	Index rtindex;
+
+	for (root = root->parent_root; root != NULL; root = root->parent_root)
+	{
+		ListCell *ppl;
+
+		foreach(ppl, root->plan_params)
+		{
+			PlannerParamItem *pitem = (PlannerParamItem *) lfirst(ppl);
+
+			if (pitem->paramId == param->paramid)
+			{
+				if (IsA(pitem->item, Var))
+				{
+					Var *v = (Var *) pitem->item;
+					rtindex = v->varno;
+
+					return maybe_rte_non_distributed(root->parse->rtable, rtindex);
+				}
+				else if (IsA(pitem->item, PlaceHolderVar))
+				{
+					PlaceHolderVar *phv = (PlaceHolderVar *) pitem->item;
+					rtindex = bms_singleton_member(phv->phrels);
+
+					return maybe_rte_non_distributed(root->parse->rtable, rtindex);
+				}
+			}
+		}
+	}
+
+	return false;
+}
+
+/*
+ * maybe_contain_non_distributed_param_walker
+ *	  Does a Param contain a non-distributed table possibly?
+ */
+static bool
+maybe_contain_non_distributed_param_walker(Node *node, void *context)
+{
+	PlannerInfo *root =  (PlannerInfo *) context;
+
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, Param) && maybe_param_non_distributed(root, (Param *) node))
+		return true;
+
+	return expression_tree_walker(node, maybe_contain_non_distributed_param_walker, context);
+}
+
+/*
+ * maybe_restrictclauses_include_non_distributed_param
+ *	  Does a RestrictInfo list contain param with non distributed table possibly?
+ */
+static bool
+maybe_restrictclauses_include_non_distributed_param(PlannerInfo *root, List *clauses)
+{
+	ListCell   *l;
+
+	foreach(l, clauses)
+	{
+		RestrictInfo *c = (RestrictInfo *) lfirst(l);
+		Node *expr;
+
+		expr = (Node *) c->clause;
+
+		if (maybe_contain_non_distributed_param_walker(expr, root))
+			return true;
+	}
+
+	return false;
+}
+
+/*
+ * plain_allow_indexpath_under_subplan
+ *	  Determine whether create an index path for the RelOptInfo.
+ *    TODO: below might have been too ambitious.
+ */
+static bool
+plain_allow_indexpath_under_subplan(PlannerInfo *root, RelOptInfo *rel)
+{
+
+	if (!root->is_correlated_subplan)
+		return true;
+
+	if (GpPolicyIsPartitioned(rel->cdbpolicy))
+		return false;
+
+	if (GpPolicyIsReplicated(rel->cdbpolicy))
+	{
+		if (maybe_restrictclauses_include_non_distributed_param(root, rel->baserestrictinfo))
+			return false;
+		if (maybe_restrictclauses_include_non_distributed_param(root, rel->joininfo))
+			return false;
+	}
+
+	return true;
+}
+
+/*
  * set_plain_rel_pathlist
  *	  Build access paths for a plain relation (no subquery, no inheritance)
  */
@@ -433,6 +740,7 @@ static void
 set_plain_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 {
 	Relids		required_outer;
+	Path       *seqpath = NULL;
 
 	/*
 	 * We don't support pushing join clauses into the quals of a seqscan, but
@@ -442,13 +750,45 @@ set_plain_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	required_outer = rel->lateral_relids;
 
 	/* Consider sequential scan */
-	add_path(rel, create_seqscan_path(root, rel, required_outer));
 
-	/* Consider index scans */
-	create_index_paths(root, rel);
+	/*
+	 * Generate paths and add them to the rel's pathlist.
+	 *
+	 * Note: add_path() will discard any paths that are dominated by another
+	 * available path, keeping only those paths that are superior along at
+	 * least one dimension of cost or sortedness.
+	 */
 
-	/* Consider TID scans */
-	create_tidscan_paths(root, rel);
+	/* Consider sequential scan */
+	switch (rel->relstorage)
+	{
+		case RELSTORAGE_AOROWS:
+		case RELSTORAGE_AOCOLS:
+		case RELSTORAGE_HEAP:
+			seqpath = create_seqscan_path(root, rel, required_outer);
+			break;
+
+		default:
+
+			/*
+			 * Should not be feasible, usually indicates a failure to
+			 * correctly apply rewrite rules.
+			 */
+			elog(ERROR, "plan contains range table with relstorage='%c'",
+				 rel->relstorage);
+			return;
+	}
+
+	if (plain_allow_indexpath_under_subplan(root, rel))
+	{
+		/* Consider index and bitmap scans */
+		create_index_paths(root, rel);
+
+		if (rel->relstorage == RELSTORAGE_HEAP)
+			create_tidscan_paths(root, rel);
+	}
+	/* we can add the seqscan path now */
+	add_path(rel, seqpath);
 
 	/* Now find the cheapest of the paths for this rel */
 	set_cheapest(rel);
@@ -508,6 +848,9 @@ set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
 	int			nattrs;
 	ListCell   *l;
 
+	/* Mark rel with estimated output rows, width, etc */
+	set_baserel_size_estimates(root, rel);
+
 	/*
 	 * Initialize to compute size estimates for whole append relation.
 	 *
@@ -538,6 +881,7 @@ set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
 		Node	   *childqual;
 		ListCell   *parentvars;
 		ListCell   *childvars;
+		ListCell   *targetListVars;
 
 		/* append_rel_list contains all append rels; ignore others */
 		if (appinfo->parent_relid != parentRTindex)
@@ -581,7 +925,7 @@ set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
 			 * Restriction reduces to constant FALSE or constant NULL after
 			 * substitution, so this child need not be scanned.
 			 */
-			set_dummy_rel_pathlist(childrel);
+			set_dummy_rel_pathlist(root, childrel);
 			continue;
 		}
 		childquals = make_ands_implicit((Expr *) childqual);
@@ -595,7 +939,7 @@ set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
 			 * This child need not be scanned, so we can omit it from the
 			 * appendrel.
 			 */
-			set_dummy_rel_pathlist(childrel);
+			set_dummy_rel_pathlist(root, childrel);
 			continue;
 		}
 
@@ -616,6 +960,30 @@ set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
 			adjust_appendrel_attrs(root,
 								   (Node *) rel->reltargetlist,
 								   appinfo);
+
+		/*
+		 * Set a not-null value in childrel's attr_needed.
+		 * cdbpath_dedup_fixup_append() checkes the length of reltargetlist
+		 * and expects the length of append rel equal to the sub rel.
+		 *
+		 * GPDB_92_MERGE_FIXME: is childrel->attr_needed accurate?
+		 */
+		foreach (targetListVars, childrel->reltargetlist)
+		{
+			int attno;
+			Var *v = (Var*)lfirst(targetListVars);
+
+			if (!IsA(v, Var))
+				continue;
+
+			attno = v->varattno;
+			if (attno <= FirstLowInvalidHeapAttributeNumber)
+				continue;
+
+			attno -= childrel->min_attr;
+			if (childrel->attr_needed[attno] == NULL)
+				childrel->attr_needed[attno] = bms_make_singleton(childrel->relid);
+		}
 
 		/*
 		 * We have to make child entries in the EquivalenceClass data
@@ -722,7 +1090,7 @@ set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
 		 * appendrel dummy.  We must do this in this phase so that the rel's
 		 * dummy-ness is visible when we generate paths for other rels.
 		 */
-		set_dummy_rel_pathlist(rel);
+		set_dummy_rel_pathlist(root, rel);
 	}
 
 	pfree(parent_attrsizes);
@@ -859,13 +1227,19 @@ set_append_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 		}
 	}
 
+	/* CDB: Just one child (or none)?  Set flag if result is at most 1 row. */
+	if (!subpaths)
+		rel->onerow = true;
+	else if (list_length(subpaths) == 1)
+		rel->onerow = ((Path *) linitial(subpaths))->parent->onerow;
+
 	/*
 	 * If we found unparameterized paths for all children, build an unordered,
 	 * unparameterized Append path for the rel.  (Note: this is correct even
 	 * if we have zero or one live subpath due to constraint exclusion.)
 	 */
 	if (subpaths_valid)
-		add_path(rel, (Path *) create_append_path(rel, subpaths, NULL));
+		add_path(rel, (Path *) create_append_path(root, rel, subpaths, NULL));
 
 	/*
 	 * Also build unparameterized MergeAppend paths based on the collected
@@ -915,7 +1289,7 @@ set_append_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 
 		if (subpaths_valid)
 			add_path(rel, (Path *)
-					 create_append_path(rel, subpaths, required_outer));
+					 create_append_path(root, rel, subpaths, required_outer));
 	}
 
 	/* Select cheapest paths */
@@ -1136,7 +1510,7 @@ accumulate_append_subpath(List *subpaths, Path *path)
  * AppendPath with no members (see also IS_DUMMY_PATH/IS_DUMMY_REL macros).
  */
 static void
-set_dummy_rel_pathlist(RelOptInfo *rel)
+set_dummy_rel_pathlist(PlannerInfo *root, RelOptInfo *rel)
 {
 	/* Set dummy size estimates --- we leave attr_widths[] as zeroes */
 	rel->rows = 0;
@@ -1145,7 +1519,7 @@ set_dummy_rel_pathlist(RelOptInfo *rel)
 	/* Discard any pre-existing paths; no further need for them */
 	rel->pathlist = NIL;
 
-	add_path(rel, (Path *) create_append_path(rel, NIL,
+	add_path(rel, (Path *) create_append_path(root, rel, NIL,
 											  rel->lateral_relids));
 
 	/* Select cheapest path (pretty easy in this case...) */
@@ -1190,13 +1564,14 @@ static void
 set_subquery_pathlist(PlannerInfo *root, RelOptInfo *rel,
 					  Index rti, RangeTblEntry *rte)
 {
-	Query	   *parse = root->parse;
 	Query	   *subquery = rte->subquery;
 	Relids		required_outer;
-	pushdown_safety_info safetyInfo;
 	double		tuple_fraction;
 	PlannerInfo *subroot;
 	List	   *pathkeys;
+	bool		forceDistRand;
+	Path	   *subquery_path;
+	PlannerConfig *config;
 
 	/*
 	 * Must copy the Query so that planning doesn't mess up the RTE contents
@@ -1212,99 +1587,102 @@ set_subquery_pathlist(PlannerInfo *root, RelOptInfo *rel,
 	 */
 	required_outer = rel->lateral_relids;
 
-	/*
-	 * Zero out result area for subquery_is_pushdown_safe, so that it can set
-	 * flags as needed while recursing.  In particular, we need a workspace
-	 * for keeping track of unsafe-to-reference columns.  unsafeColumns[i]
-	 * will be set TRUE if we find that output column i of the subquery is
-	 * unsafe to use in a pushed-down qual.
-	 */
-	memset(&safetyInfo, 0, sizeof(safetyInfo));
-	safetyInfo.unsafeColumns = (bool *)
-		palloc0((list_length(subquery->targetList) + 1) * sizeof(bool));
 
-	/*
-	 * If the subquery has the "security_barrier" flag, it means the subquery
-	 * originated from a view that must enforce row-level security.  Then we
-	 * must not push down quals that contain leaky functions.  (Ideally this
-	 * would be checked inside subquery_is_pushdown_safe, but since we don't
-	 * currently pass the RTE to that function, we must do it here.)
-	 */
-	safetyInfo.unsafeLeaky = rte->security_barrier;
+	forceDistRand = rte->forceDistRandom;
 
-	/*
-	 * If there are any restriction clauses that have been attached to the
-	 * subquery relation, consider pushing them down to become WHERE or HAVING
-	 * quals of the subquery itself.  This transformation is useful because it
-	 * may allow us to generate a better plan for the subquery than evaluating
-	 * all the subquery output rows and then filtering them.
-	 *
-	 * There are several cases where we cannot push down clauses. Restrictions
-	 * involving the subquery are checked by subquery_is_pushdown_safe().
-	 * Restrictions on individual clauses are checked by
-	 * qual_is_pushdown_safe().  Also, we don't want to push down
-	 * pseudoconstant clauses; better to have the gating node above the
-	 * subquery.
-	 *
-	 * Non-pushed-down clauses will get evaluated as qpquals of the
-	 * SubqueryScan node.
-	 *
-	 * XXX Are there any cases where we want to make a policy decision not to
-	 * push down a pushable qual, because it'd result in a worse plan?
-	 */
-	if (rel->baserestrictinfo != NIL &&
-		subquery_is_pushdown_safe(subquery, subquery, &safetyInfo))
+	/* CDB: Could be a preplanned subquery from window_planner. */
+	if (rte->subquery_plan == NULL)
 	{
-		/* OK to consider pushing down individual quals */
-		List	   *upperrestrictlist = NIL;
-		ListCell   *l;
+		/*
+		 * push down quals if possible. Note subquery might be
+		 * different pointer from original one.
+		 */
+		subquery = push_down_restrict(root, rel, rte, rti, subquery);
 
-		foreach(l, rel->baserestrictinfo)
+		/*
+		 * CDB: Does the subquery return at most one row?
+		 */
+		rel->onerow = false;
+
+		/* Set-returning function in tlist could give any number of rows. */
+		if (expression_returns_set((Node *)subquery->targetList))
+		{}
+
+		/* Always one row if aggregate function without GROUP BY. */
+		else if (!subquery->groupClause &&
+				 (subquery->hasAggs || subquery->havingQual))
+			rel->onerow = true;
+
+		/* LIMIT 1 or less? */
+		else if (subquery->limitCount &&
+				 IsA(subquery->limitCount, Const) &&
+				 !((Const *) subquery->limitCount)->constisnull)
 		{
-			RestrictInfo *rinfo = (RestrictInfo *) lfirst(l);
-			Node	   *clause = (Node *) rinfo->clause;
+			Const	   *cnst = (Const *) subquery->limitCount;
 
-			if (!rinfo->pseudoconstant &&
-				qual_is_pushdown_safe(subquery, rti, clause, &safetyInfo))
-			{
-				/* Push it down */
-				subquery_push_qual(subquery, rte, rti, clause);
-			}
-			else
-			{
-				/* Keep it in the upper query */
-				upperrestrictlist = lappend(upperrestrictlist, rinfo);
-			}
+			if (cnst->consttype == INT8OID &&
+				DatumGetInt64(cnst->constvalue) <= 1)
+				rel->onerow = true;
 		}
-		rel->baserestrictinfo = upperrestrictlist;
-	}
 
-	pfree(safetyInfo.unsafeColumns);
+		/*
+		 * We can safely pass the outer tuple_fraction down to the subquery if the
+		 * outer level has no joining, aggregation, or sorting to do. Otherwise
+		 * we'd better tell the subquery to plan for full retrieval. (XXX This
+		 * could probably be made more intelligent ...)
+		 */
+		if (subquery->hasAggs ||
+			subquery->groupClause ||
+			subquery->havingQual ||
+			subquery->distinctClause ||
+			subquery->sortClause ||
+			has_multiple_baserels(root))
+			tuple_fraction = 0.0;	/* default case */
+		else
+			tuple_fraction = root->tuple_fraction;
 
-	/*
-	 * We can safely pass the outer tuple_fraction down to the subquery if the
-	 * outer level has no joining, aggregation, or sorting to do. Otherwise
-	 * we'd better tell the subquery to plan for full retrieval. (XXX This
-	 * could probably be made more intelligent ...)
-	 */
-	if (parse->hasAggs ||
-		parse->groupClause ||
-		parse->havingQual ||
-		parse->distinctClause ||
-		parse->sortClause ||
-		has_multiple_baserels(root))
-		tuple_fraction = 0.0;	/* default case */
-	else
-		tuple_fraction = root->tuple_fraction;
+		/* Generate the plan for the subquery */
+		config = CopyPlannerConfig(root->config);
+		config->honor_order_by = false;		/* partial order is enough */
+		/*
+		 * CDB: if this subquery is the inner plan of a lateral
+		 * join and if it contains a limit, we can only gather
+		 * it to singleQE and materialize the data because we
+		 * cannot pass params across motion.
+		 */
+		if ((!bms_is_empty(required_outer)) &&
+			is_query_contain_limit_groupby(subquery))
+			config->force_singleQE = true;
 
-	/* plan_params should not be in use in current query level */
-	Assert(root->plan_params == NIL);
-
-	/* Generate the plan for the subquery */
-	rel->subplan = subquery_planner(root->glob, subquery,
+		rel->subplan = subquery_planner(root->glob, subquery,
 									root,
 									false, tuple_fraction,
-									&subroot);
+									&subroot,
+									config);
+	}
+	else
+	{
+		/* This is a preplanned sub-query RTE. */
+		rel->subplan = rte->subquery_plan;
+		subroot = root;
+		/* XXX rel->onerow = ??? */
+	}
+
+	if (rel->subplan->flow->locustype == CdbLocusType_General &&
+		(contain_volatile_functions((Node *) rel->subplan->targetlist) ||
+		 contain_volatile_functions(subquery->havingQual)))
+	{
+		rel->subplan->flow->locustype = CdbLocusType_SingleQE;
+		rel->subplan->flow->flotype = FLOW_SINGLETON;
+	}
+
+	if (rel->subplan->flow->locustype == CdbLocusType_SegmentGeneral &&
+		(contain_volatile_functions((Node *) rel->subplan->targetlist) ||
+		 contain_volatile_functions(subquery->havingQual)))
+	{
+		rel->subplan = (Plan *) make_motion_gather(subroot, rel->subplan, NIL, CdbLocusType_SingleQE);
+	}
+
 	rel->subroot = subroot;
 
 	/* Isolate the params needed by this specific subplan */
@@ -1318,7 +1696,7 @@ set_subquery_pathlist(PlannerInfo *root, RelOptInfo *rel,
 	 */
 	if (is_dummy_plan(rel->subplan))
 	{
-		set_dummy_rel_pathlist(rel);
+		set_dummy_rel_pathlist(root, rel);
 		return;
 	}
 
@@ -1329,7 +1707,13 @@ set_subquery_pathlist(PlannerInfo *root, RelOptInfo *rel,
 	pathkeys = convert_subquery_pathkeys(root, rel, subroot->query_pathkeys);
 
 	/* Generate appropriate path */
-	add_path(rel, create_subqueryscan_path(root, rel, pathkeys, required_outer));
+	subquery_path = create_subqueryscan_path(root, rel, pathkeys, required_outer);
+
+	if (forceDistRand)
+		CdbPathLocus_MakeStrewn(&subquery_path->locus,
+								CdbPathLocus_NumSegments(subquery_path->locus));
+
+	add_path(rel, subquery_path);
 
 	/* Select cheapest path (pretty easy in this case...) */
 	set_cheapest(rel);
@@ -1399,8 +1783,77 @@ set_function_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	}
 
 	/* Generate appropriate path */
-	add_path(rel, create_functionscan_path(root, rel,
+	add_path(rel, create_functionscan_path(root, rel, rte,
 										   pathkeys, required_outer));
+
+	/* Select cheapest path (pretty easy in this case...) */
+	set_cheapest(rel);
+}
+
+/*
+ * set_tablefunction_pathlist
+ *		Build the (single) access path for a table function RTE
+ */
+static void
+set_tablefunction_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
+{
+	PlannerConfig *config;
+	PlannerInfo *subroot = NULL;
+	RangeTblFunction *rtfunc;
+	FuncExpr   *fexpr;
+	ListCell   *arg;
+	Relids		required_outer;
+
+	/* Cannot be a preplanned subquery from window_planner. */
+	Assert(!rte->subquery_plan);
+
+	Assert(list_length(rte->functions) == 1);
+	rtfunc = (RangeTblFunction *) linitial(rte->functions);
+	Assert(rtfunc->funcexpr && IsA(rtfunc->funcexpr, FuncExpr));
+	fexpr= (FuncExpr *) rtfunc->funcexpr;
+
+	/*
+	 * We don't support pushing join clauses into the quals of a function
+	 * scan, but it could still have required parameterization due to LATERAL
+	 * refs in the function expression.
+	 */
+	required_outer = rel->lateral_relids;
+
+	config = CopyPlannerConfig(root->config);
+	config->honor_order_by = false;		/* partial order is enough */
+
+	/* Plan input subquery */
+	rel->subplan = subquery_planner(root->glob, rte->subquery, root,
+									false,
+									0.0, //tuple_fraction
+									& subroot,
+									config);
+	rel->subroot = subroot;
+
+	/*
+	 * With the subquery planned we now need to clear the subquery from the
+	 * TableValueExpr nodes, otherwise preprocess_expression will trip over
+	 * it.
+	 */
+	foreach(arg, fexpr->args)
+	{
+		if (IsA(arg, TableValueExpr))
+		{
+			TableValueExpr *tve = (TableValueExpr *) arg;
+
+			tve->subquery = NULL;
+		}
+	}
+
+	/* Could the function return more than one row? */
+	rel->onerow = !expression_returns_set((Node *) fexpr);
+
+	/* Mark rel with estimated output rows, width, etc */
+	set_table_function_size_estimates(root, rel);
+
+	/* Generate appropriate path */
+	add_path(rel, create_tablefunction_path(root, rel, rte,
+											required_outer));
 
 	/* Select cheapest path (pretty easy in this case...) */
 	set_cheapest(rel);
@@ -1422,8 +1875,12 @@ set_values_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	 */
 	required_outer = rel->lateral_relids;
 
+	/* CDB: Just one row? */
+	rel->onerow = (rel->tuples <= 1 &&
+				   !expression_returns_set((Node *) rte->values_lists));
+
 	/* Generate appropriate path */
-	add_path(rel, create_valuesscan_path(root, rel, required_outer));
+	add_path(rel, create_valuesscan_path(root, rel, rte, required_outer));
 
 	/* Select cheapest path (pretty easy in this case...) */
 	set_cheapest(rel);
@@ -1439,16 +1896,21 @@ set_values_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 static void
 set_cte_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 {
-	Plan	   *cteplan;
 	PlannerInfo *cteroot;
 	Index		levelsup;
 	int			ndx;
 	ListCell   *lc;
-	int			plan_id;
+	int			planinfo_id;
+	CommonTableExpr *cte = NULL;
+	double		tuple_fraction = 0.0;
+	CtePlanInfo *cteplaninfo;
+	Plan	   *subplan = NULL;
+	List	   *pathkeys = NULL;
+	PlannerInfo *subroot = NULL;
 	Relids		required_outer;
 
 	/*
-	 * Find the referenced CTE, and locate the plan previously made for it.
+	 * Find the referenced CTE based on the given range table entry
 	 */
 	levelsup = rte->ctelevelsup;
 	cteroot = root;
@@ -1459,15 +1921,10 @@ set_cte_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 			elog(ERROR, "bad levelsup for CTE \"%s\"", rte->ctename);
 	}
 
-	/*
-	 * Note: cte_plan_ids can be shorter than cteList, if we are still working
-	 * on planning the CTEs (ie, this is a side-reference from another CTE).
-	 * So we mustn't use forboth here.
-	 */
 	ndx = 0;
 	foreach(lc, cteroot->parse->cteList)
 	{
-		CommonTableExpr *cte = (CommonTableExpr *) lfirst(lc);
+		cte = (CommonTableExpr *) lfirst(lc);
 
 		if (strcmp(cte->ctename, rte->ctename) == 0)
 			break;
@@ -1475,14 +1932,158 @@ set_cte_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	}
 	if (lc == NULL)				/* shouldn't happen */
 		elog(ERROR, "could not find CTE \"%s\"", rte->ctename);
-	if (ndx >= list_length(cteroot->cte_plan_ids))
-		elog(ERROR, "could not find plan for CTE \"%s\"", rte->ctename);
-	plan_id = list_nth_int(cteroot->cte_plan_ids, ndx);
-	Assert(plan_id > 0);
-	cteplan = (Plan *) list_nth(root->glob->subplans, plan_id - 1);
+
+	Assert(IsA(cte->ctequery, Query));
+
+	/*
+	 * In PostgreSQL, we use the index to look up the plan ID in the
+	 * cteroot->cte_plan_ids list. In GPDB, CTE plans work differently, and
+	 * we look up the CtePlanInfo struct in the list_cteplaninfo instead.
+	 */
+	planinfo_id = ndx;
+
+	/*
+	 * Determine whether we need to generate a new subplan for this CTE.
+	 *
+	 * There are the following cases:
+	 *   (1) If this subquery can be pulled up as an InitPlan, we will
+	 *       generate a new subplan. In InitPlan case, the subplan can
+	 *       not be shared with the main query or other InitPlans. We
+	 *       do not store this subplan in cteplaninfo.
+	 *   (2) If we never generate a subplan for this CTE, then we generate
+	 *       one. If the reference count for this CTE is greater than 1
+	 *       (excluding ones used in InitPlans), we create multiple subplans,
+	 *       each of which has a SharedNode on top. We store these subplans
+	 *       in cteplaninfo so that they can be used later.
+	 */
+	Assert(list_length(cteroot->list_cteplaninfo) > planinfo_id);
+	cteplaninfo = list_nth(cteroot->list_cteplaninfo, planinfo_id);
+
+	/*
+	 * If there is exactly one reference to this CTE in the query, or plan
+	 * sharing is disabled, create a new subplan for this CTE. It will
+	 * become simple subquery scan.
+	 *
+	 * NOTE: The check for "exactly one reference" is a bit fuzzy. The
+	 * references are counted in parse analysis phase, and it's possible
+	 * that we duplicate a reference during query planning. So the check
+	 * for number of references must be treated merely as a hint. If it
+	 * turns out that there are in fact multiple references to the same
+	 * CTE, even though we thought that there is only one, we might choose
+	 * a sub-optimal plan because we missed the opportunity to share the
+	 * subplan. That's acceptable for now.
+	 *
+	 * subquery tree will be modified if any qual is pushed down.
+	 * There's risk that it'd be confusing if the tree is used
+	 * later. At the moment InitPlan case uses the tree, but it
+	 * is called earlier than this pass always, so we don't avoid it.
+	 *
+	 * Also, we might want to think extracting "common"
+	 * qual expressions between multiple references, but
+	 * so far we don't support it.
+	 */
+	if (!root->config->gp_cte_sharing || cte->cterefcount == 1)
+	{
+		PlannerConfig *config = CopyPlannerConfig(root->config);
+
+		/*
+		 * Copy query node since subquery_planner may trash it, and we need it
+		 * intact in case we need to create another plan for the CTE
+		 */
+		Query	   *subquery = (Query *) copyObject(cte->ctequery);
+
+		/*
+		 * Having multiple SharedScans can lead to deadlocks. For now,
+		 * disallow sharing of ctes at lower levels.
+		 */
+		config->gp_cte_sharing = false;
+
+		config->honor_order_by = false;
+
+		if (!cte->cterecursive)
+		{
+			/*
+			 * Adjust the subquery so that 'root', i.e. this subquery, is the
+			 * parent of the CTE subquery, even though the CTE might've been
+			 * higher up syntactically. This is because some of the quals that
+			 * we push down might refer to relations between the current level
+			 * and the CTE's syntactical level. Such relations are not visible
+			 * at the CTE's syntactical level, and SS_finalize_plan() would
+			 * throw an error on them.
+			 */
+			IncrementVarSublevelsUp((Node *) subquery, rte->ctelevelsup, 1);
+
+			/*
+			 * Push down quals, like we do in set_subquery_pathlist()
+			 */
+			subquery = push_down_restrict(root, rel, rte, rel->relid, subquery);
+
+			subplan = subquery_planner(cteroot->glob, subquery, root,
+									   cte->cterecursive,
+									   tuple_fraction, &subroot, config);
+		}
+		else
+		{
+			subplan = subquery_planner(cteroot->glob, subquery, cteroot,
+									   cte->cterecursive,
+									   tuple_fraction, &subroot, config);
+		}
+
+		/*
+		 * Do not store the subplan in cteplaninfo, since we will not share
+		 * this plan.
+		 */
+	}
+	else
+	{
+		/*
+		 * If we haven't created a subplan for this CTE yet, do it now. This
+		 * subplan will not be used by InitPlans, so that they can be shared
+		 * if this CTE is referenced multiple times (excluding in InitPlans).
+		 */
+		if (cteplaninfo->shared_plan == NULL)
+		{
+			PlannerConfig *config = CopyPlannerConfig(root->config);
+
+			/*
+			 * Copy query node since subquery_planner may trash it and we need
+			 * it intact in case we need to create another plan for the CTE
+			 */
+			Query	   *subquery = (Query *) copyObject(cte->ctequery);
+
+			/*
+			 * Having multiple SharedScans can lead to deadlocks. For now,
+			 * disallow sharing of ctes at lower levels.
+			 */
+			config->gp_cte_sharing = false;
+
+			config->honor_order_by = false;
+
+			subplan = subquery_planner(cteroot->glob, subquery, cteroot, cte->cterecursive,
+									   tuple_fraction, &subroot, config);
+
+			cteplaninfo->shared_plan = prepare_plan_for_sharing(cteroot, subplan);
+			cteplaninfo->subroot = subroot;
+		}
+
+		/*
+		 * Create another ShareInputScan to reference the already-created
+		 * subplan.
+		 */
+		subplan = share_prepared_plan(cteroot, cteplaninfo->shared_plan);
+		subroot = cteplaninfo->subroot;
+	}
+
+	pathkeys = subroot->query_pathkeys;
+
+	rel->subplan = subplan;
+	rel->subroot = subroot;
 
 	/* Mark rel with estimated output rows, width, etc */
-	set_cte_size_estimates(root, rel, cteplan);
+	set_cte_size_estimates(root, rel, rel->subplan);
+
+	/* Convert subquery pathkeys to outer representation */
+	pathkeys = convert_subquery_pathkeys(root, rel, pathkeys);
 
 	/*
 	 * We don't support pushing join clauses into the quals of a CTE scan, but
@@ -1492,7 +2093,7 @@ set_cte_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	required_outer = rel->lateral_relids;
 
 	/* Generate appropriate path */
-	add_path(rel, create_ctescan_path(root, rel, required_outer));
+	add_path(rel, create_ctescan_path(root, rel, pathkeys,required_outer));
 
 	/* Select cheapest path (pretty easy in this case...) */
 	set_cheapest(rel);
@@ -1512,6 +2113,7 @@ set_worktable_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	PlannerInfo *cteroot;
 	Index		levelsup;
 	Relids		required_outer;
+	CdbLocusType ctelocus;
 
 	/*
 	 * We need to find the non-recursive term's plan, which is in the plan
@@ -1544,8 +2146,29 @@ set_worktable_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	 */
 	required_outer = rel->lateral_relids;
 
+	/*
+	 * Between Recursive union plannode node and WorkTableScan plannode
+	 * there must be no Motion nodes because the execution of WorkTableScan
+	 * depends on the Recursive union's data structure.
+	 *
+	 * And the logic here is always use cteplan's locus as WTS's locus.
+	 * Remember WTS path cannot be turned to replicated(means broadcast)
+	 * when dealing with join. Most of the cases, it is OK. But for
+	 * replicated table whose locus is CdbLocusType_SegmentGeneral,
+	 * it can not be taken as everywhere, we will gather it to singleQE
+	 * or redistribute it when joining.
+	 *
+	 * To avoid such case, if cteplan's locus is CdbLocusType_SegmentGeneral,
+	 * we build WTS path using singlQE, and later in the function
+	 * `set_recursive_union_flow` to add a gather on the top of cteplan.
+	 */
+	if (cteplan->flow->locustype == CdbLocusType_SegmentGeneral)
+		ctelocus = CdbLocusType_SingleQE;
+	else
+		ctelocus = cteplan->flow->locustype;
+
 	/* Generate appropriate path */
-	add_path(rel, create_worktablescan_path(root, rel, required_outer));
+	add_path(rel, create_worktablescan_path(root, rel, ctelocus, required_outer));
 
 	/* Select cheapest path (pretty easy in this case...) */
 	set_cheapest(rel);
@@ -1627,8 +2250,6 @@ make_rel_from_joinlist(PlannerInfo *root, List *joinlist)
 
 		if (join_search_hook)
 			return (*join_search_hook) (root, levels_needed, initial_rels);
-		else if (enable_geqo && levels_needed >= geqo_threshold)
-			return geqo(root, levels_needed, initial_rels);
 		else
 			return standard_join_search(root, levels_needed, initial_rels);
 	}
@@ -1736,6 +2357,90 @@ standard_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
  *****************************************************************************/
 
 /*
+ * push_down_restrict
+ *   push down restrictinfo to subquery if any.
+ *
+ * If there are any restriction clauses that have been attached to the
+ * subquery relation, consider pushing them down to become WHERE or HAVING
+ * quals of the subquery itself.  This transformation is useful because it
+ * may allow us to generate a better plan for the subquery than evaluating
+ * all the subquery output rows and then filtering them.
+ *
+ * There are several cases where we cannot push down clauses. Restrictions
+ * involving the subquery are checked by subquery_is_pushdown_safe().
+ * Restrictions on individual clauses are checked by
+ * qual_is_pushdown_safe().  Also, we don't want to push down
+ * pseudoconstant clauses; better to have the gating node above the
+ * subquery.
+ *
+ * Non-pushed-down clauses will get evaluated as qpquals of the
+ * SubqueryScan node.
+ *
+ * XXX Are there any cases where we want to make a policy decision not to
+ * push down a pushable qual, because it'd result in a worse plan?
+ */
+static Query *
+push_down_restrict(PlannerInfo *root, RelOptInfo *rel,
+				   RangeTblEntry *rte, Index rti, Query *subquery)
+{
+	pushdown_safety_info safetyInfo;
+
+	/* Nothing to do here if it doesn't have qual at all */
+	if (rel->baserestrictinfo == NIL)
+		return subquery;
+
+	/*
+	 * Zero out result area for subquery_is_pushdown_safe, so that it can set
+	 * flags as needed while recursing.  In particular, we need a workspace
+	 * for keeping track of unsafe-to-reference columns.  unsafeColumns[i]
+	 * will be set TRUE if we find that output column i of the subquery is
+	 * unsafe to use in a pushed-down qual.
+	 */
+	memset(&safetyInfo, 0, sizeof(safetyInfo));
+	safetyInfo.unsafeColumns = (bool *)
+		palloc0((list_length(subquery->targetList) + 1) * sizeof(bool));
+
+	/*
+	 * If the subquery has the "security_barrier" flag, it means the subquery
+	 * originated from a view that must enforce row-level security.  Then we
+	 * must not push down quals that contain leaky functions.  (Ideally this
+	 * would be checked inside subquery_is_pushdown_safe, but since we don't
+	 * currently pass the RTE to that function, we must do it here.)
+	 */
+	safetyInfo.unsafeLeaky = rte->security_barrier;
+
+	if (subquery_is_pushdown_safe(subquery, subquery, &safetyInfo))
+	{
+		/* OK to consider pushing down individual quals */
+		List	   *upperrestrictlist = NIL;
+		ListCell   *l;
+
+		foreach(l, rel->baserestrictinfo)
+		{
+			RestrictInfo *rinfo = (RestrictInfo *) lfirst(l);
+			Node	   *clause = (Node *) rinfo->clause;
+
+			if (!rinfo->pseudoconstant &&
+				qual_is_pushdown_safe(subquery, rti, clause, &safetyInfo))
+			{
+				/* Push it down */
+				subquery_push_qual(subquery, rte, rti, clause);
+			}
+			else
+			{
+				/* Keep it in the upper query */
+				upperrestrictlist = lappend(upperrestrictlist, rinfo);
+			}
+		}
+		rel->baserestrictinfo = upperrestrictlist;
+	}
+
+	pfree(safetyInfo.unsafeColumns);
+
+	return subquery;
+}
+
+/*
  * subquery_is_pushdown_safe - is a subquery safe for pushing down quals?
  *
  * subquery is the particular component query being checked.  topquery
@@ -1747,19 +2452,25 @@ standard_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
  * 1. If the subquery has a LIMIT clause, we must not push down any quals,
  * since that could change the set of rows returned.
  *
- * 2. If the subquery contains any window functions, we can't push quals
- * into it, because that could change the results.
- *
- * 3. If the subquery contains EXCEPT or EXCEPT ALL set ops we cannot push
+ * 2. If the subquery contains EXCEPT or EXCEPT ALL set ops we cannot push
  * quals into it, because that could change the results.
  *
- * 4. If the subquery uses DISTINCT, we cannot push volatile quals into it.
+ * 3. If the subquery uses DISTINCT, we cannot push volatile quals into it.
  * This is because upper-level quals should semantically be evaluated only
  * once per distinct row, not once per original row, and if the qual is
  * volatile then extra evaluations could change the results.  (This issue
  * does not apply to other forms of aggregation such as GROUP BY, because
  * when those are present we push into HAVING not WHERE, so that the quals
  * are still applied after aggregation.)
+ *
+ * 4. If the subquery contains window functions, we cannot push volatile quals
+ * into it.  The issue here is a bit different from DISTINCT: a volatile qual
+ * might succeed for some rows of a window partition and fail for others,
+ * thereby changing the partition contents and thus the window functions'
+ * results for rows that remain.
+ *
+ * 5. Do not push down quals if the subquery is a grouping extension
+ * query, since this may change the meaning of the query.
  *
  * In addition, we make several checks on the subquery's output columns to see
  * if it is safe to reference them in pushed-down quals.  If output column k
@@ -1782,6 +2493,18 @@ standard_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
  * more than we save by eliminating rows before the DISTINCT step.  But it
  * would be very hard to estimate that at this stage, and in practice pushdown
  * seldom seems to make things worse, so we ignore that problem too.
+ *
+ * Note: likewise, pushing quals into a subquery with window functions is a
+ * bit dubious: the quals might remove some rows of a window partition while
+ * leaving others, causing changes in the window functions' results for the
+ * surviving rows.  We insist that such a qual reference only partitioning
+ * columns, but again that only protects us if the qual does not distinguish
+ * values that the partitioning equality operator sees as equal.  The risks
+ * here are perhaps larger than for DISTINCT, since no de-duplication of rows
+ * occurs and thus there is no theoretical problem with such a qual.  But
+ * we'll do this anyway because the potential performance benefits are very
+ * large, and we've seen no field complaints about the longstanding comparable
+ * behavior with DISTINCT.
  */
 static bool
 subquery_is_pushdown_safe(Query *subquery, Query *topquery,
@@ -1793,13 +2516,14 @@ subquery_is_pushdown_safe(Query *subquery, Query *topquery,
 	if (subquery->limitOffset != NULL || subquery->limitCount != NULL)
 		return false;
 
-	/* Check point 2 */
-	if (subquery->hasWindowFuncs)
-		return false;
-
-	/* Check point 4 */
-	if (subquery->distinctClause)
+	/* Check points 3 and 4 */
+	if (subquery->distinctClause || subquery->hasWindowFuncs)
 		safetyInfo->unsafeVolatile = true;
+
+	/* Check point 5 */
+	if (subquery->groupClause != NULL &&
+		contain_extended_grouping(subquery->groupClause))
+		return false;
 
 	/*
 	 * If we're at a leaf query, check for unsafe expressions in its target
@@ -1854,7 +2578,7 @@ recurse_pushdown_safe(Node *setOp, Query *topquery,
 	{
 		SetOperationStmt *op = (SetOperationStmt *) setOp;
 
-		/* EXCEPT is no good (point 3 for subquery_is_pushdown_safe) */
+		/* EXCEPT is no good (point 2 for subquery_is_pushdown_safe) */
 		if (op->op == SETOP_EXCEPT)
 			return false;
 		/* Else recurse */
@@ -1894,6 +2618,15 @@ recurse_pushdown_safe(Node *setOp, Query *topquery,
  * there are no non-DISTINCT output columns, so we needn't check.  Note that
  * subquery_is_pushdown_safe already reported that we can't use volatile
  * quals if there's DISTINCT or DISTINCT ON.)
+ *
+ * 4. If the subquery has any window functions, we must not push down quals
+ * that reference any output columns that are not listed in all the subquery's
+ * window PARTITION BY clauses.  We can push down quals that use only
+ * partitioning columns because they should succeed or fail identically for
+ * every row of any one window partition, and totally excluding some
+ * partitions will not change a window function's results for remaining
+ * partitions.  (Again, this also requires nonvolatile quals, but
+ * subquery_is_pushdown_safe handles that.)
  */
 static void
 check_output_expressions(Query *subquery, pushdown_safety_info *safetyInfo)
@@ -1930,6 +2663,22 @@ check_output_expressions(Query *subquery, pushdown_safety_info *safetyInfo)
 			!targetIsInSortList(tle, InvalidOid, subquery->distinctClause))
 		{
 			/* non-DISTINCT column, so mark it unsafe */
+			safetyInfo->unsafeColumns[tle->resno] = true;
+			continue;
+		}
+
+		/* If subquery uses window functions, check point 4 */
+		if (subquery->hasWindowFuncs &&
+			!targetIsInAllPartitionLists(tle, subquery))
+		{
+			/* not present in all PARTITION BY clauses, so mark it unsafe */
+			safetyInfo->unsafeColumns[tle->resno] = true;
+			continue;
+		}
+
+		/* Refuse subplans */
+		if (contain_subplans((Node *) tle->expr))
+		{
 			safetyInfo->unsafeColumns[tle->resno] = true;
 			continue;
 		}
@@ -1974,6 +2723,31 @@ compare_tlist_datatypes(List *tlist, List *colTypes,
 	}
 	if (colType != NULL)
 		elog(ERROR, "wrong number of tlist entries");
+}
+
+/*
+ * targetIsInAllPartitionLists
+ *		True if the TargetEntry is listed in the PARTITION BY clause
+ *		of every window defined in the query.
+ *
+ * It would be safe to ignore windows not actually used by any window
+ * function, but it's not easy to get that info at this stage; and it's
+ * unlikely to be useful to spend any extra cycles getting it, since
+ * unreferenced window definitions are probably infrequent in practice.
+ */
+static bool
+targetIsInAllPartitionLists(TargetEntry *tle, Query *query)
+{
+	ListCell   *lc;
+
+	foreach(lc, query->windowClause)
+	{
+		WindowClause *wc = (WindowClause *) lfirst(lc);
+
+		if (!targetIsInSortList(tle, InvalidOid, wc->partitionClause))
+			return false;
+	}
+	return true;
 }
 
 /*
@@ -2152,6 +2926,31 @@ recurse_push_qual(Node *setOp, Query *topquery,
 	}
 }
 
+static bool
+is_query_contain_limit_groupby(Query *parse)
+{
+	if (parse->limitCount || parse->limitOffset ||
+		parse->groupClause || parse->distinctClause)
+		return true;
+
+	if (parse->setOperations)
+	{
+		SetOperationStmt *sop_stmt = (SetOperationStmt *) (parse->setOperations);
+		RangeTblRef   *larg = (RangeTblRef *) sop_stmt->larg;
+		RangeTblRef   *rarg = (RangeTblRef *) sop_stmt->rarg;
+		RangeTblEntry *lrte = list_nth(parse->rtable, larg->rtindex-1);
+		RangeTblEntry *rrte = list_nth(parse->rtable, rarg->rtindex-1);
+
+		if ((lrte->rtekind == RTE_SUBQUERY &&
+			 is_query_contain_limit_groupby(lrte->subquery)) ||
+			(rrte->rtekind == RTE_SUBQUERY &&
+			 is_query_contain_limit_groupby(rrte->subquery)))
+			return true;
+	}
+
+	return false;
+}
+
 /*****************************************************************************
  *			DEBUG SUPPORT
  *****************************************************************************/
@@ -2195,6 +2994,7 @@ static void
 print_path(PlannerInfo *root, Path *path, int indent)
 {
 	const char *ptype;
+	const char *ltype;
 	bool		join = false;
 	Path	   *subpath = NULL;
 	int			i;
@@ -2251,6 +3051,10 @@ print_path(PlannerInfo *root, Path *path, int indent)
 			ptype = "HashJoin";
 			join = true;
 			break;
+		case T_CdbMotionPath:
+			ptype = "Motion";
+			subpath = ((CdbMotionPath *) path)->subpath;
+			break;
 		default:
 			ptype = "???Path";
 			break;
@@ -2266,6 +3070,38 @@ print_path(PlannerInfo *root, Path *path, int indent)
 		print_relids(path->parent->relids);
 		printf(") rows=%.0f", path->parent->rows);
 	}
+
+	switch (path->locus.locustype)
+	{
+		case CdbLocusType_Entry:
+			ltype = "Entry";
+			break;
+		case CdbLocusType_SingleQE:
+			ltype = "SingleQE";
+			break;
+		case CdbLocusType_General:
+			ltype = "General";
+			break;
+		case CdbLocusType_SegmentGeneral:
+			ltype = "SegmentGeneral";
+			break;
+		case CdbLocusType_Replicated:
+			ltype = "Replicated";
+			break;
+		case CdbLocusType_Hashed:
+			ltype = "Hashed";
+			break;
+		case CdbLocusType_HashedOJ:
+			ltype = "HashedOJ";
+			break;
+		case CdbLocusType_Strewn:
+			ltype = "Strewn";
+			break;
+		default:
+			ltype = "???CdbLocus";
+			break;
+	}
+	printf(" locus=%s", ltype);
 	printf(" cost=%.2f..%.2f\n", path->startup_cost, path->total_cost);
 
 	if (path->pathkeys)

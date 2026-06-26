@@ -17,18 +17,28 @@ OBJS = catalog.o dependency.o heap.o index.o indexing.o namespace.o aclchk.o \
        pg_operator.o pg_proc.o pg_range.o pg_db_role_setting.o pg_shdepend.o \
        pg_type.o storage.o toasting.o
 
+OBJS += pg_proc_callback.o \
+       aoseg.o aoblkdir.o gp_fastsequence.o gp_segment_config.o \
+       pg_attribute_encoding.o pg_compression.o aovisimap.o \
+       pg_appendonly.o \
+       oid_dispatch.o aocatalog.o storage_tablespace.o storage_database.o \
+       storage_tablespace_twophase.o storage_tablespace_xact.o
+
+
 BKIFILES = postgres.bki postgres.description postgres.shdescription
+
+CATALOG_JSON:= $(addprefix $(top_srcdir)/gpMgmt/bin/gppylib/data/, $(addsuffix .json,$(GP_MAJORVERSION)))
 
 include $(top_srcdir)/src/backend/common.mk
 
-all: $(BKIFILES) schemapg.h postgres.description postgres.shdescription
+all: $(BKIFILES) schemapg.h $(CATALOG_JSON) postgres.description postgres.shdescription
 
 # Note: there are some undocumented dependencies on the ordering in which
 # the catalog header files are assembled into postgres.bki.  In particular,
 # indexing.h had better be last, and toasting.h just before it.
 
 POSTGRES_BKI_SRCS = $(addprefix $(top_srcdir)/src/include/catalog/,\
-	pg_proc.h pg_type.h pg_attribute.h pg_class.h \
+	pg_type.h pg_attribute.h pg_class.h \
 	pg_attrdef.h pg_constraint.h pg_inherits.h pg_index.h pg_operator.h \
 	pg_opfamily.h pg_opclass.h pg_am.h pg_amop.h pg_amproc.h \
 	pg_language.h pg_largeobject_metadata.h pg_largeobject.h pg_aggregate.h \
@@ -41,8 +51,25 @@ POSTGRES_BKI_SRCS = $(addprefix $(top_srcdir)/src/include/catalog/,\
 	pg_foreign_data_wrapper.h pg_foreign_server.h pg_user_mapping.h \
 	pg_foreign_table.h \
 	pg_default_acl.h pg_seclabel.h pg_shseclabel.h pg_collation.h pg_range.h \
+	pg_resqueue.h pg_resqueuecapability.h pg_resourcetype.h \
+	pg_resgroup.h pg_resgroupcapability.h \
+	gp_configuration_history.h gp_id.h gp_policy.h gp_version.h \
+	gp_segment_config.h \
+	pg_appendonly.h \
+	gp_fastsequence.h \
+	pg_partition.h pg_partition_rule.h \
+	pg_attribute_encoding.h \
+	pg_auth_time_constraint.h \
+	pg_compression.h \
+	pg_proc_callback.h \
+	pg_partition_encoding.h \
+	pg_type_encoding.h \
+	pg_stat_last_operation.h pg_stat_last_shoperation.h \
 	toasting.h indexing.h \
     )
+
+POSTGRES_BKI_SRCS := pg_proc_combined.h $(POSTGRES_BKI_SRCS)
+
 
 # location of Catalog.pm
 catalogdir = $(top_srcdir)/src/backend/catalog
@@ -60,6 +87,17 @@ postgres.shdescription: postgres.bki
 schemapg.h: postgres.bki
 	touch $@
 
+# In Greenplum, contents of the pg_proc catalog is in two files, pg_proc.h
+# and pg_proc_gp.h. Combine them into a single file, so that genbki.pl can
+# process it.
+pg_proc_combined.h: $(top_srcdir)/src/include/catalog/pg_proc.h $(top_srcdir)/src/include/catalog/pg_proc_gp.h
+	cat $^ > $@
+
+catalog_json: $(CATALOG_JSON)
+
+$(CATALOG_JSON): process_foreign_keys.pl $(POSTGRES_BKI_SRCS) $(top_srcdir)/src/include/catalog/catversion.h
+	cat $(POSTGRES_BKI_SRCS) $(top_srcdir)/src/include/catalog/catversion.h | $(PERL) process_foreign_keys.pl > $@
+
 # Technically, this should depend on Makefile.global, but then
 # postgres.bki would need to be rebuilt after every configure run,
 # even in distribution tarballs.  So this is cheating a bit, but it
@@ -67,7 +105,7 @@ schemapg.h: postgres.bki
 # changes.
 postgres.bki: genbki.pl Catalog.pm $(POSTGRES_BKI_SRCS) $(top_srcdir)/configure $(top_srcdir)/src/include/catalog/duplicate_oids
 	cd $(top_srcdir)/src/include/catalog && $(PERL) ./duplicate_oids
-	$(PERL) -I $(catalogdir) $< $(pg_includes) --set-version=$(MAJORVERSION) $(POSTGRES_BKI_SRCS)
+	$(PERL) -I $(catalogdir) $< $(pg_includes) --set-version=$(PG_MAJORVERSION) $(POSTGRES_BKI_SRCS)
 
 .PHONY: install-data
 install-data: $(BKIFILES) installdirs
@@ -76,18 +114,22 @@ install-data: $(BKIFILES) installdirs
 	$(INSTALL_DATA) $(call vpathsearch,postgres.shdescription) '$(DESTDIR)$(datadir)/postgres.shdescription'
 	$(INSTALL_DATA) $(srcdir)/system_views.sql '$(DESTDIR)$(datadir)/system_views.sql'
 	$(INSTALL_DATA) $(srcdir)/information_schema.sql '$(DESTDIR)$(datadir)/information_schema.sql'
+	$(INSTALL_DATA) $(call vpathsearch,cdb_schema.sql) '$(DESTDIR)$(datadir)/cdb_init.d/cdb_schema.sql'
 	$(INSTALL_DATA) $(srcdir)/sql_features.txt '$(DESTDIR)$(datadir)/sql_features.txt'
+	$(INSTALL_DATA) $(call vpathsearch,gp_toolkit.sql) '$(DESTDIR)$(datadir)/cdb_init.d/gp_toolkit.sql'
 
 installdirs:
 	$(MKDIR_P) '$(DESTDIR)$(datadir)'
+	$(MKDIR_P) '$(DESTDIR)$(datadir)/cdb_init.d'
 
 .PHONY: uninstall-data
 uninstall-data:
-	rm -f $(addprefix '$(DESTDIR)$(datadir)'/, $(BKIFILES) system_views.sql information_schema.sql sql_features.txt)
+	rm -f $(addprefix '$(DESTDIR)$(datadir)'/, $(BKIFILES) system_views.sql information_schema.sql cdb_init.d/cdb_schema.sql sql_features.txt)
 
 # postgres.bki, postgres.description, postgres.shdescription, and schemapg.h
 # are in the distribution tarball, so they are not cleaned here.
 clean:
+	rm -f pg_proc_combined.h
 
 maintainer-clean: clean
 	rm -f $(BKIFILES)

@@ -47,6 +47,11 @@ WorkTableScanNext(WorkTableScanState *node)
 	 * worktable.  Therefore, we don't need a private read pointer for the
 	 * tuplestore, nor do we need to tell tuplestore_gettupleslot to copy.
 	 */
+
+	/*
+	 * RECURSIVE_CTE_FIXME: Double check we don't have backward scan required by
+	 * plan (both planner and ORCA).
+	 */
 	Assert(ScanDirectionIsForward(node->ss.ps.state->es_direction));
 
 	tuplestorestate = node->rustate->working_table;
@@ -130,6 +135,10 @@ ExecInitWorkTableScan(WorkTableScan *node, EState *estate, int eflags)
 	WorkTableScanState *scanstate;
 
 	/* check for unsupported flags */
+	/*
+	 * RECURSIVE_CTE_FIXME: Make sure we don't require EXEC_FLAG_BACKWARD
+	 * in GPDB.
+	 */
 	Assert(!(eflags & (EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK)));
 
 	/*
@@ -174,7 +183,7 @@ ExecInitWorkTableScan(WorkTableScan *node, EState *estate, int eflags)
 	 */
 	ExecAssignResultTypeFromTL(&scanstate->ss.ps);
 
-	scanstate->ss.ps.ps_TupFromTlist = false;
+	/* scanstate->ss.ps.ps_TupFromTlist = false; */
 
 	return scanstate;
 }

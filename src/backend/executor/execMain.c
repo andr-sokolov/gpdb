@@ -26,6 +26,8 @@
  *	before ExecutorEnd.  This can be omitted only in case of EXPLAIN,
  *	which should also omit ExecutorRun.
  *
+ * Portions Copyright (c) 2005-2010, Greenplum inc
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -37,16 +39,35 @@
  */
 #include "postgres.h"
 
+#include "access/aosegfiles.h"
+#include "access/appendonlywriter.h"
 #include "access/htup_details.h"
 #include "access/sysattr.h"
 #include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_tablespace.h"
+#include "catalog/aoseg.h"
+#include "catalog/aoblkdir.h"
+#include "catalog/aovisimap.h"
+#include "catalog/catalog.h"
+#include "catalog/oid_dispatch.h"
+#include "catalog/pg_attribute_encoding.h"
+#include "catalog/pg_type.h"
+#include "cdb/cdbpartition.h"
+#include "commands/copy.h"
+#include "commands/createas.h"
 #include "commands/matview.h"
+#include "commands/tablecmds.h" /* XXX: temp for get_parts() */
+#include "commands/tablespace.h"
 #include "commands/trigger.h"
+#include "executor/execDML.h"
 #include "executor/execdebug.h"
+#include "executor/execUtils.h"
+#include "executor/instrument.h"
 #include "executor/nodeSubplan.h"
 #include "foreign/fdwapi.h"
+#include "libpq/pqformat.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "optimizer/clauses.h"
@@ -55,10 +76,43 @@
 #include "storage/lmgr.h"
 #include "tcop/utility.h"
 #include "utils/acl.h"
+#include "utils/builtins.h" /* dumpDynamicTableScanPidIndex() */
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
 #include "utils/tqual.h"
+#include "utils/metrics_utils.h"
+
+#include "utils/ps_status.h"
+#include "utils/snapmgr.h"
+#include "utils/typcache.h"
+#include "utils/workfile_mgr.h"
+#include "utils/faultinjector.h"
+#include "utils/resource_manager.h"
+
+#include "catalog/pg_inherits_fn.h"
+#include "catalog/pg_statistic.h"
+#include "catalog/pg_class.h"
+
+#include "tcop/tcopprot.h"
+
+#include "cdb/cdbappendonlyam.h"
+#include "cdb/cdbaocsam.h"
+#include "cdb/cdbdisp_query.h"
+#include "cdb/cdbdispatchresult.h"
+#include "cdb/cdbexplain.h"             /* cdbexplain_sendExecStats() */
+#include "cdb/cdbplan.h"
+#include "cdb/cdbsrlz.h"
+#include "cdb/cdbsubplan.h"
+#include "cdb/cdbvars.h"
+#include "cdb/ml_ipc.h"
+#include "cdb/cdbmotion.h"
+#include "cdb/cdbtm.h"
+#include "cdb/cdboidsync.h"
+#include "cdb/cdbllize.h"
+#include "cdb/memquota.h"
+#include "cdb/cdbtargeteddispatch.h"
+#include "cdb/cdbutil.h"
 
 
 /* Hooks for plugins to get control in ExecutorStart/Run/Finish/End */
@@ -81,7 +135,6 @@ static void ExecutePlan(EState *estate, PlanState *planstate,
 			long numberTuples,
 			ScanDirection direction,
 			DestReceiver *dest);
-static bool ExecCheckRTEPerms(RangeTblEntry *rte);
 static void ExecCheckXactReadOnly(PlannedStmt *plannedstmt);
 static char *ExecBuildSlotValueDescription(Oid reloid,
 							  TupleTableSlot *slot,
@@ -91,17 +144,86 @@ static char *ExecBuildSlotValueDescription(Oid reloid,
 static void EvalPlanQualStart(EPQState *epqstate, EState *parentestate,
 				  Plan *planTree);
 
-/*
- * Note that this macro also exists in commands/trigger.c.  There does not
- * appear to be any good header to put it into, given the structures that
- * it uses, so we let them be duplicated.  Be sure to update both if one needs
- * to be changed, however.
- */
-#define GetModifiedColumns(relinfo, estate) \
-	(rt_fetch((relinfo)->ri_RangeTableIndex, (estate)->es_range_table)->modifiedCols)
+static void FillSliceGangInfo(Slice *slice, int numsegments);
+static void FillSliceTable(EState *estate, PlannedStmt *stmt);
+
+static PartitionNode *BuildPartitionNodeFromRoot(Oid relid);
+static void InitializeQueryPartsMetadata(PlannedStmt *plannedstmt, EState *estate);
+static void AdjustReplicatedTableCounts(EState *estate);
 
 /* end of local decls */
 
+/*
+ * For a partitioned insert target only:  
+ * This type represents an entry in the per-part hash table stored at
+ * estate->es_partition_state->result_partition_hash.   The table maps 
+ * part OID -> ResultRelInfo and avoids repeated calculation of the
+ * result information.
+ */
+typedef struct ResultPartHashEntry 
+{
+	Oid			targetid; /* OID of part relation */
+	ResultRelInfo resultRelInfo;
+} ResultPartHashEntry;
+
+
+typedef struct CopyDirectDispatchToSliceContext
+{
+	plan_tree_base_prefix	base; /* Required prefix for plan_tree_walker/mutator */
+	EState					*estate; /* EState instance */
+} CopyDirectDispatchToSliceContext;
+
+static bool CopyDirectDispatchFromPlanToSliceTableWalker( Node *node, CopyDirectDispatchToSliceContext *context);
+
+static void
+CopyDirectDispatchToSlice( Plan *ddPlan, int sliceId, CopyDirectDispatchToSliceContext *context)
+{
+	EState	*estate = context->estate;
+	Slice *slice = (Slice *)list_nth(estate->es_sliceTable->slices, sliceId);
+
+	Assert( ! slice->directDispatch.isDirectDispatch );	/* should not have been set by some other process */
+	Assert(ddPlan != NULL);
+
+	if ( ddPlan->directDispatch.isDirectDispatch)
+	{
+		slice->directDispatch.isDirectDispatch = true;
+		slice->directDispatch.contentIds = list_copy(ddPlan->directDispatch.contentIds);
+	}
+}
+
+static bool
+CopyDirectDispatchFromPlanToSliceTableWalker( Node *node, CopyDirectDispatchToSliceContext *context)
+{
+	int sliceId = -1;
+	Plan *ddPlan = NULL;
+
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, Motion))
+	{
+		Motion *motion = (Motion *) node;
+
+		ddPlan = (Plan*)node;
+		sliceId = motion->motionID;
+	}
+
+	if (ddPlan != NULL)
+	{
+		CopyDirectDispatchToSlice(ddPlan, sliceId, context);
+	}
+	return plan_tree_walker(node, CopyDirectDispatchFromPlanToSliceTableWalker, context);
+}
+
+static void
+CopyDirectDispatchFromPlanToSliceTable(PlannedStmt *stmt, EState *estate)
+{
+	CopyDirectDispatchToSliceContext context;
+	exec_init_plan_tree_base(&context.base, stmt);
+	context.estate = estate;
+	CopyDirectDispatchToSlice( stmt->planTree, 0, &context);
+	CopyDirectDispatchFromPlanToSliceTableWalker((Node *) stmt->planTree, &context);
+}
 
 /* ----------------------------------------------------------------
  *		ExecutorStart
@@ -123,6 +245,11 @@ static void EvalPlanQualStart(EPQState *epqstate, EState *parentestate,
  * get control when ExecutorStart is called.  Such a plugin would
  * normally call standard_ExecutorStart().
  *
+ * MPP: In here we take care of setting up all the necessary items that
+ * will be needed to service the query, such as setting up interconnect,
+ * and dispatching the query. Any other items in the future
+ * must be added here.
+ *
  * ----------------------------------------------------------------
  */
 void
@@ -139,16 +266,83 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
 	EState	   *estate;
 	MemoryContext oldcontext;
+	Slice *slice0 = NULL;
+	GpExecIdentity exec_identity;
+	bool		shouldDispatch;
+	bool		needDtx;
 
 	/* sanity checks: queryDesc must not be started already */
 	Assert(queryDesc != NULL);
 	Assert(queryDesc->estate == NULL);
+	Assert(queryDesc->plannedstmt != NULL);
+	Assert(queryDesc->memoryAccountId == MEMORY_OWNER_TYPE_Undefined);
+
+	queryDesc->memoryAccountId = MemoryAccounting_CreateExecutorMemoryAccount();
+
+	START_MEMORY_ACCOUNT(queryDesc->memoryAccountId);
+
+	Assert(queryDesc->plannedstmt->intoPolicy == NULL ||
+		GpPolicyIsPartitioned(queryDesc->plannedstmt->intoPolicy) ||
+		GpPolicyIsReplicated(queryDesc->plannedstmt->intoPolicy));
+
+	/**
+	 * Perfmon related stuff.
+	 */
+	if (gp_enable_gpperfmon
+		&& Gp_role == GP_ROLE_DISPATCH
+		&& queryDesc->gpmon_pkt)
+	{
+		gpmon_qlog_query_start(queryDesc->gpmon_pkt);
+	}
+
+	/* GPDB hook for collecting query info */
+	if (query_info_collect_hook)
+		(*query_info_collect_hook)(METRICS_QUERY_START, queryDesc);
+
+	/**
+	 * Distribute memory to operators.
+	 */
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		if (!IsResManagerMemoryPolicyNone() &&
+			LogResManagerMemory())
+		{
+			elog(GP_RESMANAGER_MEMORY_LOG_LEVEL, "query requested %.0fKB of memory",
+				 (double) queryDesc->plannedstmt->query_mem / 1024.0);
+		}
+
+		/**
+		 * There are some statements that do not go through the resource queue, so we cannot
+		 * put in a strong assert here. Someday, we should fix resource queues.
+		 */
+		if (queryDesc->plannedstmt->query_mem > 0)
+		{
+			switch(*gp_resmanager_memory_policy)
+			{
+				case RESMANAGER_MEMORY_POLICY_AUTO:
+					PolicyAutoAssignOperatorMemoryKB(queryDesc->plannedstmt,
+													 queryDesc->plannedstmt->query_mem);
+					break;
+				case RESMANAGER_MEMORY_POLICY_EAGER_FREE:
+					PolicyEagerFreeAssignOperatorMemoryKB(queryDesc->plannedstmt,
+														  queryDesc->plannedstmt->query_mem);
+					break;
+				default:
+					Assert(IsResManagerMemoryPolicyNone());
+					break;
+			}
+		}
+	}
 
 	/*
 	 * If the transaction is read-only, we need to check if any writes are
 	 * planned to non-temporary tables.  EXPLAIN is considered read-only.
+	 *
+	 * In GPDB, we must call ExecCheckXactReadOnly() in the QD even if the
+	 * transaction is not read-only, because ExecCheckXactReadOnly() also
+	 * determines if two-phase commit is needed.
 	 */
-	if (XactReadOnly && !(eflags & EXEC_FLAG_EXPLAIN_ONLY))
+	if ((XactReadOnly || Gp_role == GP_ROLE_DISPATCH) && !(eflags & EXEC_FLAG_EXPLAIN_ONLY))
 		ExecCheckXactReadOnly(queryDesc->plannedstmt);
 
 	/*
@@ -158,6 +352,11 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	queryDesc->estate = estate;
 
 	oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
+
+	/**
+	 * Attached the plannedstmt from queryDesc
+	 */
+	estate->es_plannedstmt = queryDesc->plannedstmt;
 
 	/*
 	 * Fill in external parameters, if any, from queryDesc; and allocate
@@ -213,11 +412,409 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	estate->es_crosscheck_snapshot = RegisterSnapshot(queryDesc->crosscheck_snapshot);
 	estate->es_top_eflags = eflags;
 	estate->es_instrument = queryDesc->instrument_options;
+	estate->showstatctx = queryDesc->showstatctx;
 
 	/*
-	 * Initialize the plan state tree
+	 * Shared input info is needed when ROLE_EXECUTE or sequential plan
 	 */
-	InitPlan(queryDesc, eflags);
+	estate->es_sharenode = (List **) palloc0(sizeof(List *));
+
+	if (queryDesc->plannedstmt->nMotionNodes > 0)
+		estate->motionlayer_context = createMotionLayerState(queryDesc->plannedstmt->nMotionNodes);
+
+	/*
+	 * Handling of the Slice table depends on context.
+	 */
+	if (Gp_role == GP_ROLE_DISPATCH &&
+		(queryDesc->plannedstmt->planTree->dispatch == DISPATCH_PARALLEL ||
+		 queryDesc->plannedstmt->nMotionNodes > 0))
+	{
+		if (queryDesc->ddesc == NULL)
+		{
+			queryDesc->ddesc = makeNode(QueryDispatchDesc);;
+			queryDesc->ddesc->useChangedAOOpts = true;
+		}
+
+		/* Set up blank slice table to be filled in during InitPlan. */
+		InitSliceTable(estate, queryDesc->plannedstmt->nMotionNodes, queryDesc->plannedstmt->nInitPlans);
+
+		/**
+		 * Copy direct dispatch decisions out of the plan and into the slice table.  Must be done after slice table is built.
+		 * Note that this needs to happen whether or not the plan contains direct dispatch decisions. This
+		 * is because the direct dispatch partially forgets some of the decisions it has taken.
+		 **/
+		if (gp_enable_direct_dispatch)
+		{
+			CopyDirectDispatchFromPlanToSliceTable(queryDesc->plannedstmt, estate );
+		}
+
+		/* Pass EXPLAIN ANALYZE flag to qExecs. */
+		estate->es_sliceTable->instrument_options = queryDesc->instrument_options;
+
+		/* set our global sliceid variable for elog. */
+		currentSliceId = LocallyExecutingSliceIndex(estate);
+
+		/* Determine OIDs for into relation, if any */
+		if (queryDesc->plannedstmt->intoClause != NULL)
+		{
+			IntoClause *intoClause = queryDesc->plannedstmt->intoClause;
+			Oid         reltablespace;
+
+			cdb_sync_oid_to_segments();
+
+			/* MPP-10329 - must always dispatch the tablespace */
+			if (intoClause->tableSpaceName)
+			{
+				reltablespace = get_tablespace_oid(intoClause->tableSpaceName, false);
+				queryDesc->ddesc->intoTableSpaceName = intoClause->tableSpaceName;
+			}
+			else
+			{
+				reltablespace = GetDefaultTablespace(intoClause->rel->relpersistence);
+
+				/* Need the real tablespace id for dispatch */
+				if (!OidIsValid(reltablespace))
+					reltablespace = MyDatabaseTableSpace;
+
+				queryDesc->ddesc->intoTableSpaceName = get_tablespace_name(reltablespace);
+			}
+		}
+	}
+	else if (Gp_role == GP_ROLE_EXECUTE)
+	{
+		QueryDispatchDesc *ddesc = queryDesc->ddesc;
+
+		/* qDisp should have sent us a slice table via MPPEXEC */
+		if (ddesc && ddesc->sliceTable != NULL)
+		{
+			SliceTable *sliceTable;
+			Slice	   *slice;
+
+			sliceTable = ddesc->sliceTable;
+			Assert(IsA(sliceTable, SliceTable));
+			slice = (Slice *)list_nth(sliceTable->slices, sliceTable->localSlice);
+			Assert(IsA(slice, Slice));
+
+			estate->es_sliceTable = sliceTable;
+			estate->es_cursorPositions = ddesc->cursorPositions;
+
+			estate->currentSliceIdInPlan = slice->rootIndex;
+			estate->currentExecutingSliceId = slice->rootIndex;
+
+			/* set our global sliceid variable for elog. */
+			currentSliceId = LocallyExecutingSliceIndex(estate);
+
+			/* Should we collect statistics for EXPLAIN ANALYZE? */
+			estate->es_instrument = sliceTable->instrument_options;
+			queryDesc->instrument_options = sliceTable->instrument_options;
+		}
+
+		/* InitPlan() will acquire locks by walking the entire plan
+		 * tree -- we'd like to avoid acquiring the locks until
+		 * *after* we've set up the interconnect */
+		if (queryDesc->plannedstmt->nMotionNodes > 0)
+		{
+			PG_TRY();
+			{
+				/*
+				 * Initialize the motion layer for this query.
+				 */
+				Assert(!estate->interconnect_context);
+				SetupInterconnect(estate);
+				UpdateMotionExpectedReceivers(estate->motionlayer_context, estate->es_sliceTable);
+
+				SIMPLE_FAULT_INJECTOR("qe_got_snapshot_and_interconnect");
+				Assert(estate->interconnect_context);
+			}
+			PG_CATCH();
+			{
+				mppExecutorCleanup(queryDesc);
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
+		}
+	}
+
+	/*
+	 * We don't eliminate aliens if we don't have an MPP plan
+	 * or we are executing on master.
+	 *
+	 * TODO: eliminate aliens even on master, if not EXPLAIN ANALYZE
+	 */
+	estate->eliminateAliens = execute_pruned_plan && queryDesc->plannedstmt->nMotionNodes > 0 && !IS_QUERY_DISPATCHER();
+
+	/*
+	 * Assign a Motion Node to every Plan Node. This makes it
+	 * easy to identify which slice any Node belongs to
+	 */
+	AssignParentMotionToPlanNodes(queryDesc->plannedstmt);
+
+	/* If the interconnect has been set up; we need to catch any
+	 * errors to shut it down -- so we have to wrap InitPlan in a PG_TRY() block. */
+	PG_TRY();
+	{
+		/*
+		 * Initialize the plan state tree
+		 */
+		Assert(CurrentMemoryContext == estate->es_query_cxt);
+		InitPlan(queryDesc, eflags);
+
+		Assert(queryDesc->planstate);
+
+#ifdef USE_ASSERT_CHECKING
+		AssertSliceTableIsValid((struct SliceTable *) estate->es_sliceTable, queryDesc->plannedstmt);
+#endif
+
+		if (Debug_print_slice_table && Gp_role == GP_ROLE_DISPATCH)
+			elog_node_display(DEBUG3, "slice table", estate->es_sliceTable, true);
+
+		/*
+		 * If we're running as a QE and there's a slice table in our queryDesc,
+		 * then we need to finish the EState setup we prepared for back in
+		 * CdbExecQuery.
+		 */
+		if (Gp_role == GP_ROLE_EXECUTE && estate->es_sliceTable != NULL)
+		{
+			MotionState *motionstate = NULL;
+
+			/*
+			 * Note that, at this point on a QE, the estate is setup (based on the
+			 * slice table transmitted from the QD via MPPEXEC) so that fields
+			 * es_sliceTable, cur_root_idx and es_cur_slice_idx are correct for
+			 * the QE.
+			 *
+			 * If responsible for a non-root slice, arrange to enter the plan at the
+			 * slice's sending Motion node rather than at the top.
+			 */
+			if (LocallyExecutingSliceIndex(estate) != RootSliceIndex(estate))
+			{
+				motionstate = getMotionState(queryDesc->planstate, LocallyExecutingSliceIndex(estate));
+				Assert(motionstate != NULL && IsA(motionstate, MotionState));
+			}
+
+			if (Debug_print_slice_table)
+				elog_node_display(DEBUG3, "slice table", estate->es_sliceTable, true);
+
+			if (gp_log_interconnect >= GPVARS_VERBOSITY_DEBUG)
+				elog(DEBUG1, "seg%d executing slice%d under root slice%d",
+					 GpIdentity.segindex,
+					 LocallyExecutingSliceIndex(estate),
+					 RootSliceIndex(estate));
+		}
+
+		/*
+		 * Are we going to dispatch this plan parallel?  Only if we're running as
+		 * a QD and the plan is a parallel plan.
+		 */
+		if (Gp_role == GP_ROLE_DISPATCH &&
+			(queryDesc->plannedstmt->planTree->dispatch == DISPATCH_PARALLEL ||
+			 queryDesc->plannedstmt->nMotionNodes > 0) &&
+			!(eflags & EXEC_FLAG_EXPLAIN_ONLY))
+		{
+			shouldDispatch = true;
+		}
+		else
+		{
+			shouldDispatch = false;
+		}
+
+		/*
+		 * If this is CREATE TABLE AS ... WITH NO DATA, there's no need
+		 * need to actually execute the plan.
+		 */
+		if (Gp_role == GP_ROLE_DISPATCH &&
+			queryDesc->plannedstmt->intoClause &&
+			queryDesc->plannedstmt->intoClause->skipData)
+			shouldDispatch = false;
+
+		/*
+		 * slice0 is the root slice of the main plan if the query
+		 * needs to be dispatched.
+		 */
+		slice0 = getCurrentSlice(estate, 0);
+		/*
+		 * if in dispatch mode, time to serialize plan and query
+		 * trees, and fire off cdb_exec command to each of the qexecs
+		 */
+		if (shouldDispatch)
+		{
+			/*
+			 * MPP-2869: preprocess_initplans() may
+			 * dispatch. (interacted with MPP-2859, which caused an
+			 * initPlan to do a write which should have happened in
+			 * main body of query) We need to call
+			 * ExecutorSaysTransactionDoesWrites() before any dispatch
+			 * work for this query.
+			 */
+			needDtx = ExecutorSaysTransactionDoesWrites();
+			if (needDtx)
+				setupDtxTransaction();
+
+			/*
+			 * Avoid dispatching OIDs for InitPlan.
+			 *
+			 * CTAS will first define relation in QD, and generate the OIDs,
+			 * and then dispatch with these OIDs to QEs.
+			 * QEs store these OIDs in a static variable and delete the one
+			 * used to create table.
+			 *
+			 * If CTAS's query contains initplan, when we invoke
+			 * preprocess_initplan to dispatch initplans, if with
+			 * queryDesc->ddesc->oidAssignments be set, these OIDs are
+			 * also dispatched to QEs.
+			 *
+			 * For details please see github issue https://github.com/greenplum-db/gpdb/issues/10760
+			 */
+			List *toplevelOidCache = NIL;
+			if (queryDesc->ddesc != NULL)
+			{
+				queryDesc->ddesc->sliceTable = estate->es_sliceTable;
+				toplevelOidCache = GetAssignedOidsForDispatch();
+			}
+
+			/*
+			 * First, see whether we need to pre-execute any initPlan subplans.
+			 */
+			if (queryDesc->plannedstmt->nParamExec > 0)
+			{
+				ParamListInfoData *pli = queryDesc->params;
+
+				/*
+				 * First, use paramFetch to fetch any "lazy" parameters, so that
+				 * they are dispatched along with the queries. The QE nodes cannot
+				 * call the callback function on their own.
+				 */
+				if (pli && pli->paramFetch)
+				{
+					int			iparam;
+
+					for (iparam = 0; iparam < queryDesc->params->numParams; iparam++)
+					{
+						ParamExternData *prm = &pli->params[iparam];
+
+						if (!OidIsValid(prm->ptype))
+							(*pli->paramFetch) (pli, iparam + 1);
+					}
+				}
+
+				preprocess_initplans(queryDesc);
+
+				/*
+				 * Copy the values of the preprocessed subplans to the
+				 * external parameters.
+				 */
+				queryDesc->params = addRemoteExecParamsToParamList(queryDesc->plannedstmt,
+																   queryDesc->params,
+																   queryDesc->estate->es_param_exec_vals);
+			}
+
+			if (toplevelOidCache != NIL)
+			{
+				Assert(queryDesc->ddesc != NULL);
+				queryDesc->ddesc->oidAssignments = toplevelOidCache;
+			}
+
+			/*
+			 * This call returns after launching the threads that send the
+			 * plan to the appropriate segdbs.  It does not wait for them to
+			 * finish unless an error is detected before all slices have been
+			 * dispatched.
+			 *
+			 * Main plan is parallel, send plan to it.
+			 */
+			/*
+			 * When the gangType of slice0 is not GANGTYPE_UNALLOCATED,
+			 * the gang will execute on the QE, so the QD needs to dispatch
+			 * the plan to the segment.
+			 * Otherwise, it will run on QD process, i.e. the current process.
+			 * Only if the children of slice0 is not empty, the QD will dispatch.
+			 */
+			if (slice0 && (slice0->gangType != GANGTYPE_UNALLOCATED || slice0->children))
+				CdbDispatchPlan(queryDesc, needDtx, true);
+		}
+
+		/*
+		 * Get executor identity (who does the executor serve). we can assume
+		 * Forward scan direction for now just for retrieving the identity.
+		 */
+		if (!(eflags & EXEC_FLAG_EXPLAIN_ONLY))
+			exec_identity = getGpExecIdentity(queryDesc, ForwardScanDirection, estate);
+		else
+			exec_identity = GP_IGNORE;
+
+		/* non-root on QE */
+		if (exec_identity == GP_NON_ROOT_ON_QE)
+		{
+			MotionState *motionState = getMotionState(queryDesc->planstate, LocallyExecutingSliceIndex(estate));
+
+			Assert(motionState);
+
+			Assert(IsA(motionState->ps.plan, Motion));
+
+			/* update the connection information, if needed */
+			if (((PlanState *) motionState)->plan->nMotionNodes > 0)
+			{
+				ExecUpdateTransportState((PlanState *)motionState,
+										 estate->interconnect_context);
+			}
+		}
+		else if (exec_identity == GP_ROOT_SLICE)
+		{
+			/* Run a root slice. */
+			/*
+			 * Only if we run on the QD and the slice0 has children,
+			 * it should establish interconnect.
+			 * Note: calling CdbDispatchPlan() doesn't infer to call
+			 * SetupInterconnect(). Like simple INSERT, the QD dispatches
+			 * the plan to the QEs on segments, but it doesn't require
+			 * interconnect to the QE.
+			 */
+			if (queryDesc->planstate != NULL && slice0 &&
+				(slice0->gangType == GANGTYPE_UNALLOCATED && slice0->children) &&
+				!estate->es_interconnect_is_setup)
+			{
+				Assert(!estate->interconnect_context);
+				SetupInterconnect(estate);
+				Assert(estate->interconnect_context);
+				UpdateMotionExpectedReceivers(estate->motionlayer_context, estate->es_sliceTable);
+			}
+
+			if (estate->es_interconnect_is_setup)
+			{
+				ExecUpdateTransportState(queryDesc->planstate,
+										 estate->interconnect_context);
+			}
+		}
+		else if (exec_identity != GP_IGNORE)
+		{
+			/* should never happen */
+			Assert(!"unsupported parallel execution strategy");
+		}
+
+		if(estate->es_interconnect_is_setup)
+			Assert(estate->interconnect_context != NULL);
+
+	}
+	PG_CATCH();
+	{
+		mppExecutorCleanup(queryDesc);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	if (DEBUG1 >= log_min_messages)
+	{
+		char		msec_str[32];
+		switch (check_log_duration(msec_str, false))
+		{
+			case 1:
+			case 2:
+				ereport(LOG, (errmsg("duration to ExecutorStart end: %s ms", msec_str)));
+				break;
+		}
+	}
+
+	END_MEMORY_ACCOUNT();
 
 	/*
 	 * Set up an AFTER-trigger statement context, unless told not to, or
@@ -256,6 +853,9 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
  *		get control when ExecutorRun is called.  Such a plugin would
  *		normally call standard_ExecutorRun().
  *
+ *		MPP: In here we must ensure to only run the plan and not call
+ *		any setup/teardown items (unless in a CATCH block).
+ *
  * ----------------------------------------------------------------
  */
 void
@@ -277,6 +877,12 @@ standard_ExecutorRun(QueryDesc *queryDesc,
 	DestReceiver *dest;
 	bool		sendTuples;
 	MemoryContext oldcontext;
+	/*
+	 * NOTE: Any local vars that are set in the PG_TRY block and examined in the
+	 * PG_CATCH block should be declared 'volatile'. (setjmp shenanigans)
+	 */
+	Slice              *currentSlice;
+	GpExecIdentity		exec_identity;
 
 	/* sanity checks */
 	Assert(queryDesc != NULL);
@@ -286,6 +892,10 @@ standard_ExecutorRun(QueryDesc *queryDesc,
 	Assert(estate != NULL);
 	Assert(!(estate->es_top_eflags & EXEC_FLAG_EXPLAIN_ONLY));
 
+	Assert(NULL != queryDesc->plannedstmt && MEMORY_OWNER_TYPE_Undefined != queryDesc->memoryAccountId);
+
+	START_MEMORY_ACCOUNT(queryDesc->memoryAccountId);
+
 	/*
 	 * Switch into per-query memory context
 	 */
@@ -294,6 +904,17 @@ standard_ExecutorRun(QueryDesc *queryDesc,
 	/* Allow instrumentation of Executor overall runtime */
 	if (queryDesc->totaltime)
 		InstrStartNode(queryDesc->totaltime);
+
+	/*
+     * CDB: Update global slice id for log messages.
+     */
+    currentSlice = getCurrentSlice(estate, LocallyExecutingSliceIndex(estate));
+    if (currentSlice)
+    {
+        if (Gp_role == GP_ROLE_EXECUTE ||
+            sliceRunsOnQD(currentSlice))
+            currentSliceId = currentSlice->sliceIndex;
+    }
 
 	/*
 	 * extract information from the query descriptor and the query feature.
@@ -307,23 +928,144 @@ standard_ExecutorRun(QueryDesc *queryDesc,
 	estate->es_processed = 0;
 	estate->es_lastoid = InvalidOid;
 
-	sendTuples = (operation == CMD_SELECT ||
-				  queryDesc->plannedstmt->hasReturning);
+	sendTuples = (queryDesc->tupDesc != NULL &&
+				  (operation == CMD_SELECT ||
+				   queryDesc->plannedstmt->hasReturning));
 
 	if (sendTuples)
 		(*dest->rStartup) (dest, operation, queryDesc->tupDesc);
 
 	/*
-	 * run plan
+	 * Need a try/catch block here so that if an ereport is called from
+	 * within ExecutePlan, we can clean up by calling CdbCheckDispatchResult.
+	 * This cleans up the asynchronous commands running through the threads launched from
+	 * CdbDispatchCommand.
 	 */
-	if (!ScanDirectionIsNoMovement(direction))
-		ExecutePlan(estate,
-					queryDesc->planstate,
-					operation,
-					sendTuples,
-					count,
-					direction,
-					dest);
+	PG_TRY();
+	{
+		/*
+		 * Run the plan locally.  There are three ways;
+		 *
+		 * 1. Do nothing
+		 * 2. Run a root slice
+		 * 3. Run a non-root slice on a QE.
+		 *
+		 * Here we decide what is our identity -- root slice, non-root
+		 * on QE or other (in which case we do nothing), and then run
+		 * the plan if required. For more information see
+		 * getGpExecIdentity() in execUtils.
+		 */
+		exec_identity = getGpExecIdentity(queryDesc, direction, estate);
+
+		if (exec_identity == GP_IGNORE)
+		{
+			/* do nothing */
+			estate->es_got_eos = true;
+		}
+		else if (exec_identity == GP_NON_ROOT_ON_QE)
+		{
+			/*
+			 * Run a non-root slice on a QE.
+			 *
+			 * Since the top Plan node is a (Sending) Motion, run the plan
+			 * forward to completion. The plan won't return tuples locally
+			 * (tuples go out over the interconnect), so the destination is
+			 * uninteresting.  The command type should be SELECT, however, to
+			 * avoid other sorts of DML processing..
+			 *
+			 * This is the center of slice plan activity -- here we arrange to
+			 * blunder into the middle of the plan rather than entering at the
+			 * root.
+			 */
+
+			MotionState *motionState = getMotionState(queryDesc->planstate, LocallyExecutingSliceIndex(estate));
+
+			Assert(motionState);
+
+			ExecutePlan(estate,
+						(PlanState *) motionState,
+						CMD_SELECT,
+						sendTuples,
+						0,
+						ForwardScanDirection,
+						dest);
+		}
+		else if (exec_identity == GP_ROOT_SLICE)
+		{
+			/*
+			 * Run a root slice
+			 * It corresponds to the "normal" path through the executor
+			 * in that we enter the plan at the top and count on the
+			 * motion nodes at the fringe of the top slice to return
+			 * without ever calling nodes below them.
+			 */
+			ExecutePlan(estate,
+						queryDesc->planstate,
+						operation,
+						sendTuples,
+						count,
+						direction,
+						dest);
+		}
+		else
+		{
+			/* should never happen */
+			Assert(!"undefined parallel execution strategy");
+		}
+    }
+	PG_CATCH();
+	{
+        /* If EXPLAIN ANALYZE, let qExec try to return stats to qDisp. */
+        if (estate->es_sliceTable &&
+            estate->es_sliceTable->instrument_options &&
+            (estate->es_sliceTable->instrument_options & INSTRUMENT_CDB) &&
+            Gp_role == GP_ROLE_EXECUTE)
+        {
+            PG_TRY();
+            {
+                cdbexplain_sendExecStats(queryDesc);
+            }
+            PG_CATCH();
+            {
+                /* Close down interconnect etc. */
+				mppExecutorCleanup(queryDesc);
+		        PG_RE_THROW();
+            }
+            PG_END_TRY();
+        }
+
+        /* Close down interconnect etc. */
+		mppExecutorCleanup(queryDesc);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+
+#ifdef FAULT_INJECTOR
+	/*
+	 * Allow testing of very high number of processed rows, without spending
+	 * hours actually processing that many rows.
+	 *
+	 * Somewhat arbitrarily, only trigger this if more than 10000 rows were truly
+	 * processed. This screens out some internal queries that the system might
+	 * issue during planning.
+	 */
+	if (estate->es_processed >= 10000 && estate->es_processed <= 1000000)
+	//if (estate->es_processed >= 10000)
+	{
+		if (FaultInjector_InjectFaultIfSet("executor_run_high_processed",
+										   DDLNotSpecified,
+										   "" /* databaseName */,
+										   "" /* tableName */) == FaultInjectorTypeSkip)
+		{
+			/*
+			 * For testing purposes, pretend that we have already processed
+			 * almost 2^32 rows.
+			 */
+			estate->es_processed = UINT_MAX - 10;
+		}
+	}
+#endif /* FAULT_INJECTOR */
 
 	/*
 	 * shutdown tuple receiver, if we started it
@@ -335,6 +1077,7 @@ standard_ExecutorRun(QueryDesc *queryDesc,
 		InstrStopNode(queryDesc->totaltime, estate->es_processed);
 
 	MemoryContextSwitchTo(oldcontext);
+	END_MEMORY_ACCOUNT();
 }
 
 /* ----------------------------------------------------------------
@@ -425,6 +1168,9 @@ standard_ExecutorEnd(QueryDesc *queryDesc)
 {
 	EState	   *estate;
 	MemoryContext oldcontext;
+	
+	/* GPDB: whether this is a inner query for extension usage */
+	bool		isInnerQuery;
 
 	/* sanity checks */
 	Assert(queryDesc != NULL);
@@ -432,6 +1178,35 @@ standard_ExecutorEnd(QueryDesc *queryDesc)
 	estate = queryDesc->estate;
 
 	Assert(estate != NULL);
+
+	Assert(NULL != queryDesc->plannedstmt && MEMORY_OWNER_TYPE_Undefined != queryDesc->memoryAccountId);
+
+	/* GPDB: Save SPI flag first in case the memory context of plannedstmt is cleaned up*/
+	isInnerQuery = estate->es_plannedstmt->metricsQueryType > TOP_LEVEL_QUERY;
+
+	START_MEMORY_ACCOUNT(queryDesc->memoryAccountId);
+
+	if (DEBUG1 >= log_min_messages)
+	{
+		char		msec_str[32];
+		switch (check_log_duration(msec_str, false))
+		{
+			case 1:
+			case 2:
+				ereport(LOG, (errmsg("duration to ExecutorEnd starting: %s ms", msec_str)));
+				break;
+		}
+	}
+
+	if (gp_partitioning_dynamic_selection_log &&
+		estate->dynamicTableScanInfo != NULL &&
+		estate->dynamicTableScanInfo->numScans > 0)
+	{
+		for (int scanNo = 0; scanNo < estate->dynamicTableScanInfo->numScans; scanNo++)
+		{
+			dumpDynamicTableScanPidIndex(estate, scanNo);
+		}
+	}
 
 	/*
 	 * Check that ExecutorFinish was called, unless in EXPLAIN-only mode. This
@@ -446,7 +1221,77 @@ standard_ExecutorEnd(QueryDesc *queryDesc)
 	 */
 	oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
 
+    /*
+     * If EXPLAIN ANALYZE, qExec returns stats to qDisp now.
+     */
+    if (estate->es_sliceTable &&
+        estate->es_sliceTable->instrument_options &&
+        (estate->es_sliceTable->instrument_options & INSTRUMENT_CDB) &&
+        Gp_role == GP_ROLE_EXECUTE)
+        cdbexplain_sendExecStats(queryDesc);
+
+	/*
+	 * if needed, collect mpp dispatch results and tear down
+	 * all mpp specific resources (e.g. interconnect).
+	 */
+	PG_TRY();
+	{
+		mppExecutorFinishup(queryDesc);
+	}
+	PG_CATCH();
+	{
+		/*
+		 * we got an error. do all the necessary cleanup.
+		 */
+		mppExecutorCleanup(queryDesc);
+
+		/*
+		 * Remove our own query's motion layer.
+		 */
+		RemoveMotionLayer(estate->motionlayer_context);
+
+		/*
+		 * GPDB specific
+		 * Clean the special resources created by INITPLAN.
+		 * The resources have long life cycle and are used by the main plan.
+		 * It's too early to clean them in preprocess_initplans.
+		 */
+		if (queryDesc->plannedstmt->nParamExec > 0)
+		{
+			postprocess_initplans(queryDesc);
+		}
+
+		/*
+		 * Release EState and per-query memory context.
+		 */
+		FreeExecutorState(estate);
+
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	/*
+	 * GPDB specific
+	 * Clean the special resources created by INITPLAN.
+	 * The resources have long life cycle and are used by the main plan.
+	 * It's too early to clean them in preprocess_initplans.
+	 */
+	if (queryDesc->plannedstmt->nParamExec > 0)
+	{
+		postprocess_initplans(queryDesc);
+	}
+
+    /*
+     * If normal termination, let each operator clean itself up.
+     * Otherwise don't risk it... an error might have left some
+     * structures in an inconsistent state.
+     */
 	ExecEndPlan(queryDesc->planstate, estate);
+
+	/*
+	 * Remove our own query's motion layer.
+	 */
+	RemoveMotionLayer(estate->motionlayer_context);
 
 	/* do away with our snapshots */
 	UnregisterSnapshot(estate->es_snapshot);
@@ -457,17 +1302,49 @@ standard_ExecutorEnd(QueryDesc *queryDesc)
 	 */
 	MemoryContextSwitchTo(oldcontext);
 
+	queryDesc->es_processed = estate->es_processed;
+	queryDesc->es_lastoid = estate->es_lastoid;
+
 	/*
-	 * Release EState and per-query memory context.  This should release
-	 * everything the executor has allocated.
+	 * Release EState and per-query memory context
 	 */
 	FreeExecutorState(estate);
+	
+	/**
+	 * Perfmon related stuff.
+	 */
+	if (gp_enable_gpperfmon 
+			&& Gp_role == GP_ROLE_DISPATCH
+			&& queryDesc->gpmon_pkt)
+	{			
+		gpmon_qlog_query_end(queryDesc->gpmon_pkt);
+		queryDesc->gpmon_pkt = NULL;
+	}
+
+	/* GPDB hook for collecting query info */
+	if (query_info_collect_hook)
+		(*query_info_collect_hook)(isInnerQuery ? METRICS_INNER_QUERY_DONE : METRICS_QUERY_DONE, queryDesc);
 
 	/* Reset queryDesc fields that no longer point to anything */
 	queryDesc->tupDesc = NULL;
 	queryDesc->estate = NULL;
 	queryDesc->planstate = NULL;
 	queryDesc->totaltime = NULL;
+
+	if (DEBUG1 >= log_min_messages)
+	{
+		char		msec_str[32];
+		switch (check_log_duration(msec_str, false))
+		{
+			case 1:
+			case 2:
+				ereport(LOG, (errmsg("duration to ExecutorEnd end: %s ms", msec_str)));
+				break;
+		}
+	}
+	END_MEMORY_ACCOUNT();
+
+	ReportOOMConsumption();
 }
 
 /* ----------------------------------------------------------------
@@ -490,6 +1367,10 @@ ExecutorRewind(QueryDesc *queryDesc)
 
 	Assert(estate != NULL);
 
+	Assert(NULL != queryDesc->plannedstmt && MEMORY_OWNER_TYPE_Undefined != queryDesc->memoryAccountId);
+
+	START_MEMORY_ACCOUNT(queryDesc->memoryAccountId);
+
 	/* It's probably not sensible to rescan updating queries */
 	Assert(queryDesc->operation == CMD_SELECT);
 
@@ -504,6 +1385,8 @@ ExecutorRewind(QueryDesc *queryDesc)
 	ExecReScan(queryDesc->planstate);
 
 	MemoryContextSwitchTo(oldcontext);
+
+	END_MEMORY_ACCOUNT();
 }
 
 
@@ -545,7 +1428,7 @@ ExecCheckRTPerms(List *rangeTable, bool ereport_on_violation)
  * ExecCheckRTEPerms
  *		Check access permissions for a single RTE.
  */
-static bool
+bool
 ExecCheckRTEPerms(RangeTblEntry *rte)
 {
 	AclMode		requiredPerms;
@@ -688,19 +1571,50 @@ ExecCheckRTEPerms(RangeTblEntry *rte)
 /*
  * Check that the query does not imply any writes to non-temp tables.
  *
+ * This function is used to check if the current statement will perform any writes.
+ * It is used to enforce:
+ *  (1) read-only mode (both fts and transaction isolation level read only)
+ *      as well as
+ *  (2) to keep track of when a distributed transaction becomes
+ *      "dirty" and will require 2pc.
+ *
  * Note: in a Hot Standby slave this would need to reject writes to temp
  * tables as well; but an HS slave can't have created any temp tables
  * in the first place, so no need to check that.
+ *
+ * In GPDB, an important side-effect of this is to call
+ * ExecutorMarkTransactionDoesWrites(), if the query is not read-only. That
+ * ensures that we use two-phase commit for this transaction.
  */
 static void
 ExecCheckXactReadOnly(PlannedStmt *plannedstmt)
 {
 	ListCell   *l;
+	int         rti;
+	char		relstorage;
+
+	/*
+	 * CREATE TABLE AS or SELECT INTO?
+	 *
+	 * XXX should we allow this if the destination is temp?  Considering that
+	 * it would still require catalog changes, probably not.
+	 */
+	if (plannedstmt->intoClause != NULL)
+	{
+		Assert(plannedstmt->intoClause->rel);
+		if (plannedstmt->intoClause->rel->relpersistence == RELPERSISTENCE_TEMP)
+			ExecutorMarkTransactionDoesWrites();
+		else
+			PreventCommandIfReadOnly(CreateCommandTag((Node *) plannedstmt));
+	}
 
 	/* Fail if write permissions are requested on any non-temp table */
+    rti = 0;
 	foreach(l, plannedstmt->rtable)
 	{
 		RangeTblEntry *rte = (RangeTblEntry *) lfirst(l);
+
+		rti++;
 
 		if (rte->rtekind != RTE_RELATION)
 			continue;
@@ -708,8 +1622,41 @@ ExecCheckXactReadOnly(PlannedStmt *plannedstmt)
 		if ((rte->requiredPerms & (~ACL_SELECT)) == 0)
 			continue;
 
-		if (isTempNamespace(get_rel_namespace(rte->relid)))
+		/*
+		 * Foreign tables don't need two phase commit which is for
+		 * local mpp tables
+		 */
+		relstorage = get_rel_relstorage(rte->relid);
+		if (relstorage == RELSTORAGE_FOREIGN)
 			continue;
+
+		if (isTempNamespace(get_rel_namespace(rte->relid)))
+		{
+			ExecutorMarkTransactionDoesWrites();
+			continue;
+		}
+
+        /* CDB: Allow SELECT FOR SHARE/UPDATE *
+         *
+         */
+        if ((rte->requiredPerms & ~(ACL_SELECT | ACL_SELECT_FOR_UPDATE)) == 0)
+        {
+        	ListCell   *cell;
+        	bool foundRTI = false;
+
+        	foreach(cell, plannedstmt->rowMarks)
+			{
+				RowMarkClause *rmc = lfirst(cell);
+				if( rmc->rti == rti )
+				{
+					foundRTI = true;
+					break;
+				}
+			}
+
+			if (foundRTI)
+				continue;
+        }
 
 		PreventCommandIfReadOnly(CreateCommandTag((Node *) plannedstmt));
 	}
@@ -734,12 +1681,33 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 	PlanState  *planstate;
 	TupleDesc	tupType;
 	ListCell   *l;
-	int			i;
+
+	Assert(plannedstmt->intoPolicy == NULL ||
+		GpPolicyIsPartitioned(plannedstmt->intoPolicy) ||
+		GpPolicyIsReplicated(plannedstmt->intoPolicy));
+
+	if (DEBUG1 >= log_min_messages)
+	{
+		char msec_str[32];
+		switch (check_log_duration(msec_str, false))
+		{
+			case 1:
+			case 2:
+				ereport(LOG, (errmsg("duration to InitPlan start: %s ms", msec_str)));
+				break;
+			default:
+				/* do nothing */
+				break;
+		}
+	}
 
 	/*
 	 * Do permissions checks
 	 */
-	ExecCheckRTPerms(rangeTable, true);
+	if (operation != CMD_SELECT || Gp_role != GP_ROLE_EXECUTE)
+	{
+		ExecCheckRTPerms(rangeTable, true);
+	}
 
 	/*
 	 * initialize the node's execution state
@@ -752,6 +1720,10 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 	 *
 	 * We must do this before initializing the plan tree, else we might try to
 	 * do a lock upgrade if a result rel is also a source rel.
+	 *
+	 * CDB: Note that we need this info even if we aren't the slice that will be doing
+	 * the actual updating, since it's where we learn things, such as if the row needs to
+	 * contain OIDs or not.
 	 */
 	if (plannedstmt->resultRelations)
 	{
@@ -760,17 +1732,47 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 		ResultRelInfo *resultRelInfos;
 		ResultRelInfo *resultRelInfo;
 
+		/*
+		 * MPP-2879: The QEs don't pass their MPPEXEC statements through
+		 * the parse (where locks would ordinarily get acquired). So we
+		 * need to take some care to pick them up here (otherwise we get
+		 * some very strange interactions with QE-local operations (vacuum?
+		 * utility-mode ?)).
+		 *
+		 * NOTE: There is a comment in lmgr.c which reads forbids use of
+		 * heap_open/relation_open with "NoLock" followed by use of
+		 * RelationOidLock/RelationLock with a stronger lock-mode:
+		 * RelationOidLock/RelationLock expect a relation to already be
+		 * locked.
+		 *
+		 * But we also need to serialize CMD_UPDATE && CMD_DELETE to preserve
+		 * order on mirrors.
+		 *
+		 * So we're going to ignore the "NoLock" issue above.
+		 */
+
+		/* CDB: we must promote locks for UPDATE and DELETE operations for ao table. */
+		LOCKMODE    lockmode;
+		lockmode = (Gp_role != GP_ROLE_EXECUTE || Gp_is_writer) ? RowExclusiveLock : NoLock;
+
 		resultRelInfos = (ResultRelInfo *)
 			palloc(numResultRelations * sizeof(ResultRelInfo));
 		resultRelInfo = resultRelInfos;
-		foreach(l, resultRelations)
+		foreach(l, plannedstmt->resultRelations)
 		{
 			Index		resultRelationIndex = lfirst_int(l);
 			Oid			resultRelationOid;
 			Relation	resultRelation;
 
 			resultRelationOid = getrelid(resultRelationIndex, rangeTable);
-			resultRelation = heap_open(resultRelationOid, RowExclusiveLock);
+			if (operation == CMD_UPDATE || operation == CMD_DELETE)
+			{
+				resultRelation = CdbOpenRelation(resultRelationOid, lockmode, NULL);
+			}
+			else
+			{
+				resultRelation = heap_open(resultRelationOid, lockmode);
+			}
 			InitResultRelInfo(resultRelInfo,
 							  resultRelation,
 							  resultRelationIndex,
@@ -781,6 +1783,88 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 		estate->es_num_result_relations = numResultRelations;
 		/* es_result_relation_info is NULL except when within ModifyTable */
 		estate->es_result_relation_info = NULL;
+
+		/*
+		 * In some occasions when inserting data into a target relations we
+		 * need to pass some specific information from the QD to the QEs.
+		 * we do this information exchange here, via the parseTree. For now
+		 * this is used for partitioned and append-only tables.
+		 */
+		if (Gp_role == GP_ROLE_EXECUTE)
+		{
+			estate->es_result_partitions = plannedstmt->result_partitions;
+			estate->es_result_aosegnos = plannedstmt->result_aosegnos;
+		}
+		else
+		{
+			List          *resultRelations = plannedstmt->resultRelations;
+			int            numResultRelations = list_length(resultRelations);
+			List          *all_relids = NIL;
+			Oid            relid = getrelid(linitial_int(resultRelations), rangeTable);
+			bool           containRoot = false;
+
+			if (rel_is_child_partition(relid))
+				relid = rel_partition_get_master(relid);
+			else
+			{
+				/*
+				 * If root partition is in result_partitions, it must be
+				 * the first element.
+				 */
+				containRoot = true;
+			}
+
+			estate->es_result_partitions = BuildPartitionNodeFromRoot(relid);
+
+			/*
+			 * List all the relids that may take part in this insert operation.
+			 * The logic here is that:
+			 *   - If root partition is in the resultRelations, all_relids
+			 *     contains the root and all its all_inheritors
+			 *   - Otherwise, all_relids is a map of result_partitions to
+			 *     get each element's relation oid.
+			 */
+
+			if (containRoot)
+			{
+				/*
+				 * We already get all the locks in the parse-analyze stage.
+				 * So we don't need to acquire any locks here.
+				 */
+				all_relids = find_all_inheritors(relid, NoLock, NULL);
+			}
+			else
+			{
+				ListCell *lc;
+				int       idx;
+
+				foreach(lc, resultRelations)
+				{
+					idx = lfirst_int(lc);
+					all_relids = lappend_oid(all_relids,
+											 getrelid(idx, rangeTable));
+				}
+			}
+
+			/*
+			 * We also assign a segno for a deletion operation.
+			 * That segno will later be touched to ensure a correct
+			 * incremental backup.
+			 */
+			estate->es_result_aosegnos = assignPerRelSegno(all_relids);
+
+			plannedstmt->result_partitions = estate->es_result_partitions;
+			plannedstmt->result_aosegnos = estate->es_result_aosegnos;
+
+			/* Set any QD resultrels segno, just in case. The QEs set their own in ExecInsert(). */
+			int relno = 0;
+			ResultRelInfo* relinfo;
+			for (relno = 0; relno < numResultRelations; relno ++)
+			{
+				relinfo = &(resultRelInfos[relno]);
+				ResultRelInfoSetSegno(relinfo, estate->es_result_aosegnos);
+			}
+		}
 	}
 	else
 	{
@@ -790,7 +1874,26 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 		estate->es_result_relations = NULL;
 		estate->es_num_result_relations = 0;
 		estate->es_result_relation_info = NULL;
+		estate->es_result_partitions = NULL;
+		estate->es_result_aosegnos = NIL;
 	}
+
+	estate->es_partition_state = NULL;
+	if (estate->es_result_partitions)
+	{
+		estate->es_partition_state = createPartitionState(estate->es_result_partitions,
+														  estate->es_num_result_relations);
+	}
+
+	/*
+	 * If there are partitions involved in the query, initialize partitioning metadata.
+	 */
+	InitializeQueryPartsMetadata(plannedstmt, estate);
+
+	/*
+	 * set the number of partition selectors for every dynamic scan id
+	 */
+	estate->dynamicTableScanInfo->numSelectorsPerScanId = plannedstmt->numSelectorsPerScanId;
 
 	/*
 	 * Similarly, we have to lock relations selected FOR [KEY] UPDATE/SHARE
@@ -815,6 +1918,14 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 		 */
 		switch (rc->markType)
 		{
+			case ROW_MARK_TABLE_EXCLUSIVE:
+				relid = getrelid(rc->rti, rangeTable);
+				relation = heap_open(relid, ExclusiveLock);
+				break;
+			case ROW_MARK_TABLE_SHARE:
+				relid = getrelid(rc->rti, rangeTable);
+				relation = heap_open(relid, RowShareLock);
+				break;
 			case ROW_MARK_EXCLUSIVE:
 			case ROW_MARK_NOKEYEXCLUSIVE:
 			case ROW_MARK_SHARE:
@@ -834,6 +1945,46 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 				elog(ERROR, "unrecognized markType: %d", rc->markType);
 				relation = NULL;	/* keep compiler quiet */
 				break;
+		}
+
+		/*
+		 * Check that relation is a legal target for marking.
+		 *
+		 * In most cases parser and/or planner should have noticed this
+		 * already, but they don't cover all cases.
+		 */
+		if (relation)
+		{
+			switch (relation->rd_rel->relkind)
+			{
+				case RELKIND_RELATION:
+				case RELKIND_MATVIEW:
+					/* OK */
+					break;
+				case RELKIND_SEQUENCE:
+					/* Must disallow this because we don't vacuum sequences */
+					ereport(ERROR,
+							(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+							 errmsg("cannot lock rows in sequence \"%s\"",
+									RelationGetRelationName(relation))));
+					break;
+				case RELKIND_TOASTVALUE:
+					/* This will be disallowed in 9.1, but for now OK */
+					break;
+				case RELKIND_VIEW:
+					/* Should not get here */
+					ereport(ERROR,
+							(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+							 errmsg("cannot lock rows in view \"%s\"",
+									RelationGetRelationName(relation))));
+					break;
+				default:
+					ereport(ERROR,
+							(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+							 errmsg("cannot lock rows in relation \"%s\"",
+									RelationGetRelationName(relation))));
+					break;
+			}
 		}
 
 		/* Check that relation is a legal target for marking */
@@ -865,42 +2016,95 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 	estate->es_epqScanDone = NULL;
 
 	/*
+	 * Initialize the slice table.
+	 */
+	if (Gp_role == GP_ROLE_DISPATCH)
+		FillSliceTable(estate, plannedstmt);
+
+	/*
 	 * Initialize private state information for each SubPlan.  We must do this
 	 * before running ExecInitNode on the main query tree, since
 	 * ExecInitSubPlan expects to be able to find these entries.
 	 */
 	Assert(estate->es_subplanstates == NIL);
-	i = 1;						/* subplan indices count from 1 */
-	foreach(l, plannedstmt->subplans)
+	Bitmapset *locallyExecutableSubplans = NULL;
+	Plan *start_plan_node = plannedstmt->planTree;
+
+	/*
+	 * If eliminateAliens is true then we extract the local Motion node
+	 * and subplans for our current slice. This enables us to call ExecInitNode
+	 * for only a subset of the plan tree.
+	 */
+	if (estate->eliminateAliens)
 	{
-		Plan	   *subplan = (Plan *) lfirst(l);
-		PlanState  *subplanstate;
-		int			sp_eflags;
+		Motion *m = findSenderMotion(plannedstmt, LocallyExecutingSliceIndex(estate));
 
 		/*
-		 * A subplan will never need to do BACKWARD scan nor MARK/RESTORE. If
-		 * it is a parameterless subplan (not initplan), we suggest that it be
-		 * prepared to handle REWIND efficiently; otherwise there is no need.
+		 * We may not have any motion in the current slice, e.g., in insert query
+		 * the root may not have any motion.
 		 */
-		sp_eflags = eflags
-			& (EXEC_FLAG_EXPLAIN_ONLY | EXEC_FLAG_WITH_NO_DATA);
-		if (bms_is_member(i, plannedstmt->rewindPlanIDs))
+		if (NULL != m)
+		{
+			start_plan_node = (Plan *) m;
+		}
+		/* Compute SubPlans' root plan nodes for SubPlans reachable from this plan root */
+		locallyExecutableSubplans = getLocallyExecutableSubplans(plannedstmt, start_plan_node);
+	}
+
+	int subplan_idx = 0;
+	foreach(l, plannedstmt->subplans)
+	{
+		PlanState  *subplanstate = NULL;
+		int			sp_eflags = 0;
+
+		/*
+		 * Initialize only the subplans that are reachable from our local slice.
+		 * If alien elimination is not turned on, then all subplans are considered
+		 * reachable.
+		 */
+		if (!estate->eliminateAliens || bms_is_member(subplan_idx, locallyExecutableSubplans))
+		{
+			/*
+			 * A subplan will never need to do BACKWARD scan nor MARK/RESTORE.
+			 *
+			 * GPDB: We always set the REWIND flag, to delay eagerfree.
+			 */
+			sp_eflags = eflags
+				& (EXEC_FLAG_EXPLAIN_ONLY | EXEC_FLAG_WITH_NO_DATA);
 			sp_eflags |= EXEC_FLAG_REWIND;
 
-		subplanstate = ExecInitNode(subplan, estate, sp_eflags);
+			Plan	   *subplan = (Plan *) lfirst(l);
+			subplanstate = ExecInitNode(subplan, estate, sp_eflags);
+		}
 
-		estate->es_subplanstates = lappend(estate->es_subplanstates,
-										   subplanstate);
+		estate->es_subplanstates = lappend(estate->es_subplanstates, subplanstate);
 
-		i++;
+		++subplan_idx;
 	}
+
+	/* No more use for locallyExecutableSubplans */
+	bms_free(locallyExecutableSubplans);
+
+	/* Extract all precomputed parameters from init plans */
+	ExtractParamsFromInitPlans(plannedstmt, plannedstmt->planTree, estate);
 
 	/*
 	 * Initialize the private state information for all the nodes in the query
 	 * tree.  This opens files, allocates storage and leaves us ready to start
 	 * processing tuples.
 	 */
-	planstate = ExecInitNode(plan, estate, eflags);
+	planstate = ExecInitNode(start_plan_node, estate, eflags);
+
+	queryDesc->planstate = planstate;
+
+	Assert(queryDesc->planstate);
+
+	/* GPDB hook for collecting query info */
+	if (query_info_collect_hook)
+		(*query_info_collect_hook)(METRICS_PLAN_NODE_INITIALIZE, queryDesc);
+
+	if (RootSliceIndex(estate) != LocallyExecutingSliceIndex(estate))
+		return;
 
 	/*
 	 * Get the tuple descriptor describing the type of tuples to return.
@@ -942,7 +2146,32 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 	}
 
 	queryDesc->tupDesc = tupType;
-	queryDesc->planstate = planstate;
+
+	/*
+	 * GPDB: Hack for CTAS/MatView:
+	 *   Need to switch to IntoRelDest for CTAS.
+	 *   Also need to create tables in advance.
+	 */
+	if (queryDesc->plannedstmt->intoClause != NULL)
+		intorel_initplan(queryDesc, eflags);
+	else if(queryDesc->plannedstmt->copyIntoClause != NULL)
+	{
+		queryDesc->dest = CreateCopyDestReceiver();
+		((DR_copy*)queryDesc->dest)->queryDesc = queryDesc;
+	}
+	else if (queryDesc->plannedstmt->refreshClause != NULL && Gp_role == GP_ROLE_EXECUTE)
+		transientrel_init(queryDesc);
+	if (DEBUG1 >= log_min_messages)
+			{
+				char		msec_str[32];
+				switch (check_log_duration(msec_str, false))
+				{
+					case 1:
+					case 2:
+						ereport(LOG, (errmsg("duration to InitPlan end: %s ms", msec_str)));
+						break;
+				}
+			}
 }
 
 /*
@@ -986,6 +2215,25 @@ CheckValidResultRel(Relation resultRel, CmdType operation)
 			 * got the information handy (and given that we really shouldn't
 			 * get here anyway, it's not worth great exertion to get).
 			 */
+			/*
+			 * GPDB_91_MERGE_FIXME: In Greenplum, views are treated as non
+			 * partitioned relations, gp_distribution_policy contains no entry
+			 * for views.  Consequently, flow of a ModifyTable node for a view
+			 * is determined such that it is not dispatched to segments.
+			 * Things get confused if the DML statement has a where clause that
+			 * results in a direct dispatch to one segment.  Underlying scan
+			 * nodes have direct dispatch set but when it's time to commit, the
+			 * direct dispatch information is not passed on to the DTM and it
+			 * sends PREPARE to all segments, causing "Distributed transaction
+			 * ... not found" error.  Until this is fixed, INSTEAD OF triggers
+			 * and DML on views need to be disabled.
+			 */
+			ereport(ERROR,
+					(errcode(ERRCODE_GP_FEATURE_NOT_YET),
+					 errmsg("cannot change view \"%s\"",
+							RelationGetRelationName(resultRel)),
+					 errhint("changing views is not supported in Greenplum")));
+
 			switch (operation)
 			{
 				case CMD_INSERT:
@@ -1073,6 +2321,30 @@ CheckValidResultRel(Relation resultRel, CmdType operation)
 					break;
 			}
 			break;
+
+		/* GPDB additions */
+		case RELKIND_AOSEGMENTS:
+			if (!allowSystemTableMods)
+				ereport(ERROR,
+						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+						 errmsg("cannot change AO segment listing relation \"%s\"",
+								RelationGetRelationName(resultRel))));
+			break;
+		case RELKIND_AOBLOCKDIR:
+			if (!allowSystemTableMods)
+				ereport(ERROR,
+						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+						 errmsg("cannot change AO block directory relation \"%s\"",
+								RelationGetRelationName(resultRel))));
+			break;
+		case RELKIND_AOVISIMAP:
+			if (!allowSystemTableMods)
+				ereport(ERROR,
+						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+						 errmsg("cannot change AO visibility map relation \"%s\"",
+								RelationGetRelationName(resultRel))));
+			break;
+
 		default:
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
@@ -1187,7 +2459,138 @@ InitResultRelInfo(ResultRelInfo *resultRelInfo,
 	resultRelInfo->ri_FdwState = NULL;
 	resultRelInfo->ri_ConstraintExprs = NULL;
 	resultRelInfo->ri_junkFilter = NULL;
+	resultRelInfo->ri_segid_attno = InvalidAttrNumber;
 	resultRelInfo->ri_projectReturning = NULL;
+	resultRelInfo->ri_aoInsertDesc = NULL;
+	resultRelInfo->ri_aocsInsertDesc = NULL;
+	resultRelInfo->ri_aoInsertDesc = NULL;
+	resultRelInfo->ri_deleteDesc = NULL;
+	resultRelInfo->ri_updateDesc = NULL;
+	resultRelInfo->ri_aosegno = InvalidFileSegNumber;
+	resultRelInfo->bufferedTuplesSize = 0;
+	resultRelInfo->nBufferedTuples = 0;
+	resultRelInfo->bufferedTuples = NULL;
+	resultRelInfo->biState = GetBulkInsertState();
+}
+
+
+void
+CloseResultRelInfo(ResultRelInfo *resultRelInfo)
+{
+	/* end (flush) the INSERT operation in the access layer */
+	if (resultRelInfo->ri_aoInsertDesc)
+		appendonly_insert_finish(resultRelInfo->ri_aoInsertDesc);
+	if (resultRelInfo->ri_aocsInsertDesc)
+		aocs_insert_finish(resultRelInfo->ri_aocsInsertDesc);
+
+	if (resultRelInfo->ri_deleteDesc != NULL)
+	{
+		if (RelationIsAoRows(resultRelInfo->ri_RelationDesc))
+			appendonly_delete_finish(resultRelInfo->ri_deleteDesc);
+		else
+		{
+			Assert(RelationIsAoCols(resultRelInfo->ri_RelationDesc));
+			aocs_delete_finish(resultRelInfo->ri_deleteDesc);
+		}
+		resultRelInfo->ri_deleteDesc = NULL;
+	}
+	if (resultRelInfo->ri_updateDesc != NULL)
+	{
+		if (RelationIsAoRows(resultRelInfo->ri_RelationDesc))
+			appendonly_update_finish(resultRelInfo->ri_updateDesc);
+		else
+		{
+			Assert(RelationIsAoCols(resultRelInfo->ri_RelationDesc));
+			aocs_update_finish(resultRelInfo->ri_updateDesc);
+		}
+		resultRelInfo->ri_updateDesc = NULL;
+	}
+
+	if (resultRelInfo->ri_resultSlot)
+	{
+		Assert(resultRelInfo->ri_resultSlot->tts_tupleDescriptor);
+		ReleaseTupleDesc(resultRelInfo->ri_resultSlot->tts_tupleDescriptor);
+		ExecClearTuple(resultRelInfo->ri_resultSlot);
+	}
+
+	if (resultRelInfo->ri_PartitionParent)
+		relation_close(resultRelInfo->ri_PartitionParent, AccessShareLock);
+
+	/* Close indices and then the relation itself */
+	ExecCloseIndices(resultRelInfo);
+	heap_close(resultRelInfo->ri_RelationDesc, NoLock);
+
+	if (resultRelInfo->biState != NULL)
+	{
+		FreeBulkInsertState(resultRelInfo->biState);
+		resultRelInfo->biState = NULL;
+	}
+
+	/* Recurse into partitions */
+	/* Examine each hash table entry. */
+	if (resultRelInfo->ri_partition_hash)
+	{
+		HASH_SEQ_STATUS hash_seq_status;
+		ResultPartHashEntry *entry;
+
+		hash_freeze(resultRelInfo->ri_partition_hash);
+		hash_seq_init(&hash_seq_status, resultRelInfo->ri_partition_hash);
+		while ((entry = hash_seq_search(&hash_seq_status)) != NULL)
+		{
+			CloseResultRelInfo(&entry->resultRelInfo);
+		}
+		/* No need for hash_seq_term() since we iterated to end. */
+	}
+}
+
+/*
+ * ResultRelInfoSetSegno
+ *
+ * based on a list of relid->segno mapping, look for our own resultRelInfo
+ * relid in the mapping and find the segfile number that this resultrel should
+ * use if it is inserting into an AO relation. for any non AO relation this is
+ * irrelevant and will return early.
+ *
+ * Note that we rely on the fact that the caller has a well constructed mapping
+ * and that it includes all the relids of *any* AO relation that may insert
+ * data during this transaction. For non partitioned tables the mapping list
+ * will have only one element - our table. for partitioning it may have
+ * multiple (depending on how many partitions are AO).
+ *
+ */
+void
+ResultRelInfoSetSegno(ResultRelInfo *resultRelInfo, List *mapping)
+{
+   	ListCell *relid_to_segno;
+   	bool	  found = false;
+
+	/* only relevant for AO relations */
+	if(!relstorage_is_ao(RelinfoGetStorage(resultRelInfo)))
+		return;
+
+	Assert(mapping);
+	Assert(resultRelInfo->ri_RelationDesc);
+
+   	/* lookup the segfile # to write into, according to my relid */
+
+   	foreach(relid_to_segno, mapping)
+   	{
+		SegfileMapNode *n = (SegfileMapNode *)lfirst(relid_to_segno);
+		Oid myrelid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
+		if(n->relid == myrelid)
+		{
+			Assert(n->segno != InvalidFileSegNumber);
+			resultRelInfo->ri_aosegno = n->segno;
+
+			elogif(Debug_appendonly_print_insert, LOG,
+				"Appendonly: setting pre-assigned segno %d in result "
+				"relation with relid %d", n->segno, n->relid);
+
+			found = true;
+		}
+	}
+
+	Assert(found);
 }
 
 /*
@@ -1298,10 +2701,19 @@ ExecGetTriggerResultRel(EState *estate, Oid relid)
 bool
 ExecContextForcesOids(PlanState *planstate, bool *hasoids)
 {
-	ResultRelInfo *ri = planstate->state->es_result_relation_info;
+	/*
+	 * In PostgreSQL, we check the "currently active" result relation,
+	 * es_result_relation_info. In GPDB, however, the node that produces
+	 * the tuple can be in a different slice than the ModifyTable node,
+	 * and thanks to "alien elimination" in InitPlan, we might not have
+	 * initialized the ModifyTable node at all in this process. Therefore,
+	 * force OIDs if there are any result relations that need OIDs.
+	 */
+	int			i;
 
-	if (ri != NULL)
+	for (i = 0; i < planstate->state->es_num_result_relations; i++)
 	{
+		ResultRelInfo *ri = &planstate->state->es_result_relations[i];
 		Relation	rel = ri->ri_RelationDesc;
 
 		if (rel != NULL)
@@ -1323,6 +2735,71 @@ ExecContextForcesOids(PlanState *planstate, bool *hasoids)
 	}
 
 	return false;
+}
+
+void
+SendAOTupCounts(EState *estate)
+{
+	StringInfoData buf;
+	ResultRelInfo *resultRelInfo;
+	int			i;
+	List	   *all_ao_rels = NIL;
+	ListCell   *lc;
+
+	/*
+	 * If we're inserting into partitions, send tuple counts for
+	 * AO tables back to the QD.
+	 */
+	if (Gp_role != GP_ROLE_EXECUTE || !estate->es_result_partitions)
+		return;
+
+	resultRelInfo = estate->es_result_relations;
+	for (i = 0; i < estate->es_num_result_relations; i++)
+	{
+		resultRelInfo = &estate->es_result_relations[i];
+
+		if (relstorage_is_ao(RelinfoGetStorage(resultRelInfo)))
+			all_ao_rels = lappend(all_ao_rels, resultRelInfo);
+
+		if (resultRelInfo->ri_partition_hash)
+		{
+			HASH_SEQ_STATUS hash_seq_status;
+			ResultPartHashEntry *entry;
+
+			hash_seq_init(&hash_seq_status, resultRelInfo->ri_partition_hash);
+			while ((entry = hash_seq_search(&hash_seq_status)) != NULL)
+			{
+				if (relstorage_is_ao(RelinfoGetStorage(&entry->resultRelInfo)))
+					all_ao_rels = lappend(all_ao_rels, &entry->resultRelInfo);
+			}
+		}
+	}
+
+	if (!all_ao_rels)
+		return;
+
+	if (Debug_appendonly_print_insert)
+		ereport(LOG,(errmsg("QE sending tuple counts of %d partitioned "
+							"AO relations... ", list_length(all_ao_rels))));
+
+	pq_beginmessage(&buf, 'o');
+	pq_sendint(&buf, list_length(all_ao_rels), 4);
+
+	foreach(lc, all_ao_rels)
+	{
+		resultRelInfo = (ResultRelInfo *) lfirst(lc);
+		Oid			relid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
+		uint64		tupcount = resultRelInfo->ri_aoprocessed;
+
+		pq_sendint(&buf, relid, 4);
+		pq_sendint64(&buf, tupcount);
+
+		if (Debug_appendonly_print_insert)
+			ereport(LOG,(errmsg("sent tupcount " INT64_FORMAT " for "
+								"relation %d", tupcount, relid)));
+
+	}
+	pq_endmessage(&buf);
 }
 
 /* ----------------------------------------------------------------
@@ -1377,7 +2854,7 @@ ExecPostprocessPlan(EState *estate)
  * tuple tables must be cleared or dropped to ensure pins are released.
  * ----------------------------------------------------------------
  */
-static void
+void
 ExecEndPlan(PlanState *planstate, EState *estate)
 {
 	ResultRelInfo *resultRelInfo;
@@ -1387,7 +2864,8 @@ ExecEndPlan(PlanState *planstate, EState *estate)
 	/*
 	 * shut down the node-type-specific query processing
 	 */
-	ExecEndNode(planstate);
+	if (planstate != NULL)
+		ExecEndNode(planstate);
 
 	/*
 	 * for subplans too
@@ -1395,8 +2873,10 @@ ExecEndPlan(PlanState *planstate, EState *estate)
 	foreach(l, estate->es_subplanstates)
 	{
 		PlanState  *subplanstate = (PlanState *) lfirst(l);
-
-		ExecEndNode(subplanstate);
+		if (subplanstate != NULL)
+		{
+			ExecEndNode(subplanstate);
+		}
 	}
 
 	/*
@@ -1407,15 +2887,19 @@ ExecEndPlan(PlanState *planstate, EState *estate)
 	 */
 	ExecResetTupleTable(estate->es_tupleTable, false);
 
+	/* Report how many tuples we may have inserted into AO tables */
+	SendAOTupCounts(estate);
+
+	/* Adjust INSERT/UPDATE/DELETE count for replicated table ON QD */
+	AdjustReplicatedTableCounts(estate);
+
 	/*
 	 * close the result relation(s) if any, but hold locks until xact commit.
 	 */
 	resultRelInfo = estate->es_result_relations;
-	for (i = estate->es_num_result_relations; i > 0; i--)
+	for (i = 0; i < estate->es_num_result_relations; i++)
 	{
-		/* Close indices and then the relation itself */
-		ExecCloseIndices(resultRelInfo);
-		heap_close(resultRelInfo->ri_RelationDesc, NoLock);
+		CloseResultRelInfo(resultRelInfo);
 		resultRelInfo++;
 	}
 
@@ -1468,6 +2952,13 @@ ExecutePlan(EState *estate,
 	long		current_tuple_count;
 
 	/*
+	 * For holdable cursor, the plan is executed without rewinding on gpdb. We
+	 * need to quit if the executor has already emitted all tuples.
+	 */
+	if (estate->es_got_eos)
+		return;
+
+	/*
 	 * initialize local variables
 	 */
 	current_tuple_count = 0;
@@ -1476,6 +2967,11 @@ ExecutePlan(EState *estate,
 	 * Set the direction.
 	 */
 	estate->es_direction = direction;
+
+	/*
+	 * Make sure slice dependencies are met
+	 */
+	ExecSliceDependencyNode(planstate);
 
 	/*
 	 * Loop until we've processed the proper number of tuples from the plan.
@@ -1495,7 +2991,16 @@ ExecutePlan(EState *estate,
 		 * process so we just end the loop...
 		 */
 		if (TupIsNull(slot))
+		{
+			/*
+			 * We got end-of-stream. We need to mark it since with a cursor
+			 * end-of-stream will only be received with the fetch that
+			 * returns the last tuple. ExecutorEnd needs to know if EOS was
+			 * received in order to do the right cleanup.
+			 */
+			estate->es_got_eos = true;
 			break;
+		}
 
 		/*
 		 * If we have a junk filter, then project a new tuple with the junk
@@ -1507,6 +3012,11 @@ ExecutePlan(EState *estate,
 		 */
 		if (estate->es_junkFilter != NULL)
 			slot = ExecFilterJunk(estate->es_junkFilter, slot);
+
+		if (operation != CMD_SELECT && Gp_role == GP_ROLE_EXECUTE && !Gp_is_writer)
+		{
+			elog(ERROR, "INSERT/UPDATE/DELETE must be executed by a writer segworker group");
+		}
 
 		/*
 		 * If we are supposed to send the tuple somewhere, do so. (In
@@ -1521,7 +3031,30 @@ ExecutePlan(EState *estate,
 		 * events.)
 		 */
 		if (operation == CMD_SELECT)
+		{
 			(estate->es_processed)++;
+
+#ifdef FAULT_INJECTOR
+			/*
+			 * bump es_processed using the fault injector, but only if the number rows is in a certain range
+			 * this avoids bumping the counter every time after we bumped it once
+			 */
+			if (estate->es_processed >= 10000 && estate->es_processed <= 1000000)
+			{
+				if (FaultInjector_InjectFaultIfSet("executor_run_high_processed",
+												   DDLNotSpecified,
+												   "" /* databaseName */,
+												   "" /* tableName */) == FaultInjectorTypeSkip)
+				{
+					/*
+					 * For testing purposes, pretend that we have already processed
+					 * almost 2^32 rows.
+					 */
+					estate->es_processed = UINT_MAX - 10;
+				}
+			}
+#endif /* FAULT_INJECTOR */
+		}
 
 		/*
 		 * check our tuple count.. if we've processed the proper number then
@@ -1694,6 +3227,28 @@ ExecWithCheckOptions(ResultRelInfo *resultRelInfo,
 		ExprState  *wcoExpr = (ExprState *) lfirst(l2);
 
 		/*
+		 * GPDB_94_MERGE_FIXME
+		 * When we update the view, we need to check if the updated tuple belongs
+		 * to the view. Sometimes we need to execute a subplan to help check.
+		 * The subplan is executed under the update or delete node on segment.
+		 * But we can't correctly execute a mpp subplan in the segment. So let's
+		 * disable the check first.
+		 */
+		ListCell *l;
+		bool is_subplan = false;
+		foreach(l, (List*)wcoExpr)
+		{
+			ExprState  *clause = (ExprState *) lfirst(l);
+			if (*(clause->evalfunc) == (ExprStateEvalFunc)ExecAlternativeSubPlan)
+			{
+				is_subplan = true;
+				break;
+			}
+		}
+		if (is_subplan)
+			continue;
+
+		/*
 		 * WITH CHECK OPTION checks are intended to ensure that the new tuple
 		 * is visible in the view.  If the view's qual evaluates to NULL, then
 		 * the new tuple won't be included in the view.  Therefore we need to
@@ -1817,7 +3372,7 @@ ExecBuildSlotValueDescription(Oid reloid,
 
 		if (table_perm || column_perm)
 		{
-			if (slot->tts_isnull[i])
+			if (slot->PRIVATE_tts_isnull[i])
 				val = "null";
 			else
 			{
@@ -1826,7 +3381,7 @@ ExecBuildSlotValueDescription(Oid reloid,
 
 				getTypeOutputInfo(tupdesc->attrs[i]->atttypid,
 								  &foutoid, &typisvarlena);
-				val = OidOutputFunctionCall(foutoid, slot->tts_values[i]);
+				val = OidOutputFunctionCall(foutoid, slot->PRIVATE_tts_values[i]);
 			}
 
 			if (write_comma)
@@ -1972,8 +3527,25 @@ EvalPlanQual(EState *estate, EPQState *epqstate,
 {
 	TupleTableSlot *slot;
 	HeapTuple	copyTuple;
+	Plan *subPlan = epqstate->plan;
 
 	Assert(rti > 0);
+
+	/*
+	 * Greenplum cannot create gang in QEs so it does not support
+	 * EvalPlanQual that subplan contain motions. This can happen
+	 * in two cases:
+	 *   1. GDD is enabled, so update|delete can be concurrently executing
+	 *   2. Utility mode connect to a segment and other global transaction
+	 *      do UpdateStatement.
+	 */
+	Assert(subPlan != NULL);
+	if (subPlan->nMotionNodes > 0)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("EvalPlanQual can not handle subPlan with Motion node")));
+	}
 
 	/*
 	 * Get and lock the updated version of the row; if fail, return NULL.
@@ -2137,7 +3709,8 @@ EvalPlanQualFetch(EState *estate, Relation relation, int lockmode, bool noWait,
 			 */
 			test = heap_lock_tuple(relation, &tuple,
 								   estate->es_output_cid,
-								   lockmode, noWait,
+								   lockmode,
+								   (noWait ? LockTupleNoWait : LockTupleWait),
 								   false, &buffer, &hufd);
 			/* We now have two pins on the buffer, get rid of one */
 			ReleaseBuffer(buffer);
@@ -2172,6 +3745,10 @@ EvalPlanQualFetch(EState *estate, Relation relation, int lockmode, bool noWait,
 						ereport(ERROR,
 								(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 								 errmsg("could not serialize access due to concurrent update")));
+					if (ItemPointerIndicatesMovedPartitions(&hufd.ctid))
+						ereport(ERROR,
+								(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+								 errmsg("tuple to be locked was already moved to another segment due to concurrent update")));
 					if (!ItemPointerEquals(&hufd.ctid, &tuple.t_self))
 					{
 						/* it was updated, so look at the updated version */
@@ -2230,6 +3807,14 @@ EvalPlanQualFetch(EState *estate, Relation relation, int lockmode, bool noWait,
 		 * As above, it should be safe to examine xmax and t_ctid without the
 		 * buffer content lock, because they can't be changing.
 		 */
+
+		/* check whether next version would be in a different segment */
+		if (HeapTupleHeaderIndicatesMovedPartitions(tuple.t_data))
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("tuple to be locked was already moved to another segment due to concurrent update")));
+
+		/* check whether tuple has been deleted */
 		if (ItemPointerEquals(&tuple.t_self, &tuple.t_data->t_ctid))
 		{
 			/* deleted, so forget about it */
@@ -2412,9 +3997,11 @@ EvalPlanQualFetchRowMarks(EPQState *epqstate)
 			/* build a temporary HeapTuple control structure */
 			tuple.t_len = HeapTupleHeaderGetDatumLength(td);
 			ItemPointerSetInvalid(&(tuple.t_self));
+#if 0
 			/* relation might be a foreign table, if so provide tableoid */
 			tuple.t_tableOid = getrelid(erm->rti,
 										epqstate->estate->es_range_table);
+#endif
 			tuple.t_data = td;
 
 			/* copy and store tuple */
@@ -2476,7 +4063,8 @@ EvalPlanQualBegin(EPQState *epqstate, EState *parentestate)
 			 * EvalPlanQualStart (see comments therein).
 			 */
 			ExecSetParamPlanMulti(planstate->plan->extParam,
-								  GetPerTupleExprContext(parentestate));
+								  GetPerTupleExprContext(parentestate),
+								  NULL);
 
 			i = parentestate->es_plannedstmt->nParamExec;
 
@@ -2589,7 +4177,8 @@ EvalPlanQualStart(EPQState *epqstate, EState *parentestate, Plan *planTree)
 		 * doing EvalPlanQual again.
 		 */
 		ExecSetParamPlanMulti(planTree->extParam,
-							  GetPerTupleExprContext(parentestate));
+							  GetPerTupleExprContext(parentestate),
+							  NULL);
 
 		/* now make the internal param workspace ... */
 		i = parentestate->es_plannedstmt->nParamExec;
@@ -2711,4 +4300,913 @@ EvalPlanQualEnd(EPQState *epqstate)
 	epqstate->estate = NULL;
 	epqstate->planstate = NULL;
 	epqstate->origslot = NULL;
+}
+
+/*
+ * Calculate the part to use for the given key, then find or calculate
+ * and cache required information about that part in the hash table
+ * anchored in estate.
+ * 
+ * Return a pointer to the information, an entry in the table
+ * estate->es_result_relations.  Note that the first entry in this
+ * table is for the partitioned table itself and that the entire table
+ * may be reallocated, changing the addresses of its entries.  
+ *
+ * Thus, it is important to avoid holding long-lived pointers to 
+ * table entries (such as the pointer returned from this function).
+ */
+static ResultRelInfo *
+get_part(EState *estate, Datum *values, bool *isnull, TupleDesc tupdesc,
+		 bool openIndices)
+{
+	Oid			targetid;
+
+	/* add a short term memory context if one wasn't assigned already */
+	Assert(estate->es_partition_state != NULL &&
+		estate->es_partition_state->accessMethods != NULL);
+	if (!estate->es_partition_state->accessMethods->part_cxt)
+		estate->es_partition_state->accessMethods->part_cxt =
+			GetPerTupleExprContext(estate)->ecxt_per_tuple_memory;
+
+	targetid = selectPartition(estate->es_result_partitions, values,
+							   isnull, tupdesc, estate->es_partition_state->accessMethods);
+
+	if (!OidIsValid(targetid))
+		ereport(ERROR,
+				(errcode(ERRCODE_NO_PARTITION_FOR_PARTITIONING_KEY),
+				 errmsg("no partition for partitioning key")));
+
+	return targetid_get_partition(targetid, estate, openIndices);
+}
+
+ResultRelInfo *
+targetid_get_partition(Oid targetid, EState *estate, bool openIndices)
+{
+	ResultRelInfo *parentInfo = estate->es_result_relations;
+	ResultRelInfo *childInfo = estate->es_result_relations;
+	ResultPartHashEntry *entry;
+	bool		found;
+
+	if (parentInfo->ri_partition_hash == NULL)
+	{
+		HASHCTL ctl;
+
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(*entry);
+		ctl.hash = oid_hash;
+		ctl.hcxt = estate->es_query_cxt;
+
+		parentInfo->ri_partition_hash =
+			hash_create("Partition Result Relation Hash",
+						10,
+						&ctl,
+						HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+	}
+
+	entry = hash_search(parentInfo->ri_partition_hash,
+						&targetid,
+						HASH_ENTER,
+						&found);
+
+	childInfo = &entry->resultRelInfo;
+	if (found)
+	{
+		Assert(RelationGetRelid(childInfo->ri_RelationDesc) == targetid);
+	}
+	else
+	{
+		int			natts;
+		Relation	resultRelation;
+
+		natts = parentInfo->ri_RelationDesc->rd_att->natts; /* in base relation */
+
+		resultRelation = heap_open(targetid, RowExclusiveLock);
+		InitResultRelInfo(childInfo,
+						  resultRelation,
+						  1,
+						  estate->es_instrument);
+
+		if (openIndices)
+			ExecOpenIndices(childInfo);
+
+		map_part_attrs(parentInfo->ri_RelationDesc,
+					   childInfo->ri_RelationDesc,
+					   &(childInfo->ri_partInsertMap),
+					   TRUE); /* throw on error, so result not needed */
+	}
+	return childInfo;
+}
+
+ResultRelInfo *
+values_get_partition(Datum *values, bool *nulls, TupleDesc tupdesc,
+					 EState *estate, bool openIndices)
+{
+	ResultRelInfo *relinfo;
+
+	Assert(PointerIsValid(estate->es_result_partitions));
+
+	relinfo = get_part(estate, values, nulls, tupdesc, openIndices);
+
+	return relinfo;
+}
+
+/*
+ * Find the partition we want and get the ResultRelInfo for the
+ * partition.
+ */
+ResultRelInfo *
+slot_get_partition(TupleTableSlot *slot, EState *estate)
+{
+	ResultRelInfo *resultRelInfo;
+	AttrNumber max_attr;
+	Datum *values;
+	bool *nulls;
+
+	Assert(PointerIsValid(estate->es_result_partitions));
+
+	max_attr = estate->es_partition_state->max_partition_attr;
+
+	slot_getsomeattrs(slot, max_attr);
+	values = slot_get_values(slot);
+	nulls = slot_get_isnull(slot);
+
+	resultRelInfo = get_part(estate, values, nulls, slot->tts_tupleDescriptor,
+							 true);
+
+	return resultRelInfo;
+}
+
+/* Wrap an attribute map (presumably from base partitioned table to part
+ * as created by map_part_attrs in execMain.c) with an AttrMap. The new
+ * AttrMap will contain a copy of the argument map.  The caller retains
+ * the responsibility to dispose of the argument map eventually.
+ *
+ * If the input AttrNumber vector is empty or null, it is taken as an
+ * identity map, i.e., a null AttrMap.
+ */
+AttrMap *makeAttrMap(int base_count, AttrNumber *base_map)
+{
+	int i, n, p;
+	AttrMap *map;
+	
+	if ( base_count < 1 || base_map == NULL )
+		return NULL;
+	
+	map = palloc0(sizeof(AttrMap) + base_count * sizeof(AttrNumber));
+	
+	for ( i = n = p = 0; i <= base_count; i++ )
+	{
+		map->attr_map[i] = base_map[i];
+		
+		if ( map->attr_map[i] != 0 ) 
+		{
+			if ( map->attr_map[i] > p ) p = map->attr_map[i];
+			n++;
+		}
+	}	
+	
+	map->live_count = n;
+	map->attr_max = p;
+	map->attr_count = base_count;
+	
+	return map;
+}
+
+/* Use the given attribute map to convert an attribute number in the
+ * base relation to an attribute number in the other relation.  Forgive
+ * out-of-range attributes by mapping them to zero.  Treat null as
+ * the identity map.
+ */
+AttrNumber attrMap(AttrMap *map, AttrNumber anum)
+{
+	if ( map == NULL )
+		return anum;
+	if ( 0 < anum && anum <= map->attr_count )
+		return map->attr_map[anum];
+	return 0;
+}
+
+/* For attrMapExpr below.
+ *
+ * Mutate Var nodes in an expression using the given attribute map.
+ * Insist the Var nodes have varno == 1 and the that the mapping
+ * yields a live attribute number (non-zero).
+ */
+static Node *apply_attrmap_mutator(Node *node, AttrMap *map)
+{
+	if ( node == NULL )
+		return NULL;
+	
+	if (IsA(node, Var) )
+	{
+		AttrNumber anum = 0;
+		Var *var = (Var*)node;
+		Assert(var->varno == 1); /* in CHECK constraints */
+		anum = attrMap(map, var->varattno);
+		
+		if ( anum == 0 )
+		{
+			/* Should never happen, but best caught early. */
+			elog(ERROR, "attribute map discrepancy");
+		}
+		else if ( anum != var->varattno )
+		{
+			var = copyObject(var);
+			var->varattno = anum;
+		}
+		return (Node *)var;
+	}
+	return expression_tree_mutator(node, apply_attrmap_mutator, (void *)map);
+}
+
+/* Apply attrMap over the Var nodes in an expression.
+ */
+Node *attrMapExpr(AttrMap *map, Node *expr)
+{
+	return apply_attrmap_mutator(expr, map);
+}
+
+
+/* Check compatibility of the attributes of the given partitioned
+ * table and part for purposes of INSERT (through the partitioned
+ * table) or EXCHANGE (of the part into the partitioned table).
+ * Don't use any partitioning catalogs, because this must run
+ * on the segment databases as well as on the entry database.
+ *
+ * If requested and needed, make a vector mapping the attribute
+ * numbers of the partitioned table to corresponding attribute 
+ * numbers in the part.  Represent the "unneeded" identity map
+ * as null.
+ *
+ * base -- the partitioned table
+ * part -- the part table
+ * map_ptr -- where to store a pointer to the result, or NULL
+ * throw -- whether to throw an error in case of incompatibility
+ *
+ * The implicit result is a vector one longer than the number
+ * of attributes (existing or not) in the base relation.
+ * It is returned through the map_ptr argument, if that argument
+ * is non-null.
+ *
+ * The explicit result indicates whether the part is compatible
+ * with the base relation.  If the throw argument is true, however,
+ * an error is issued rather than returning false.
+ *
+ * Note that, in the map, element 0 is wasted and is always zero, 
+ * so the vector is indexed by attribute number (origin 1).
+ *
+ * The i-th element of the map is the attribute number in 
+ * the part relation that corresponds to attribute i of the  
+ * base relation, or it is zero to indicate that attribute 
+ * i of the base relation doesn't exist (has been dropped).
+ *
+ * This is a handy map for renumbering attributes for use with
+ * part relations that may have a different configuration of 
+ * "holes" than the partitioned table in which they occur.
+ * 
+ * Be sure to call this in the memory context in which the result
+ * vector ought to be stored.
+ *
+ * Though some error checking is done, it is not comprehensive.
+ * If internal assumptions about possible tuple formats are
+ * correct, errors should not occur.  Still, the downside is
+ * incorrect data, so use errors (not assertions) for the case.
+ *
+ * Checks include same number of non-dropped attributes in all 
+ * parts of a partitioned table, non-dropped attributes in 
+ * corresponding relative positions must match in name, type
+ * and alignment, attribute numbers must agree with their
+ * position in tuple, etc.
+ */
+bool 
+map_part_attrs(Relation base, Relation part, AttrMap **map_ptr, bool throw)
+{	
+	AttrNumber i = 1;
+	AttrNumber n = base->rd_att->natts;
+	FormData_pg_attribute *battr = NULL;
+	
+	AttrNumber j = 1;
+	AttrNumber m = part->rd_att->natts;
+	FormData_pg_attribute *pattr = NULL;
+	
+	AttrNumber *v = NULL;
+	
+	/* If we might want a map, allocate one. */
+	if ( map_ptr != NULL )
+	{
+		v = palloc0(sizeof(AttrNumber)*(n+1));
+		*map_ptr = NULL;
+	}
+	
+	bool is_identical = TRUE;
+	bool is_compatible = TRUE;
+	
+	/* For each matched pair of attributes ... */
+	while ( i <= n && j <= m )
+	{
+		battr = base->rd_att->attrs[i-1];
+		pattr = part->rd_att->attrs[j-1];
+		
+		/* Skip dropped attributes. */
+		
+		if ( battr->attisdropped )
+		{
+			i++;
+			continue;
+		}
+		
+		if ( pattr->attisdropped )
+		{
+			j++;
+			continue;
+		}
+		
+		/* Check attribute conformability requirements. */
+		
+		/* -- Names must match. */
+		if ( strncmp(NameStr(battr->attname), NameStr(pattr->attname), NAMEDATALEN) != 0 )
+		{
+			if ( throw )
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("relation \"%s\" must have the same "
+								"column names and column order as \"%s\"",
+								RelationGetRelationName(part),
+								RelationGetRelationName(base))));
+			is_compatible = FALSE;
+			break;
+		}
+		
+		/* -- Types must match. */
+		if (battr->atttypid != pattr->atttypid)
+		{
+			if ( throw )
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("type mismatch for attribute \"%s\"",
+								NameStr((battr->attname)))));
+			is_compatible = FALSE;
+			break;
+		}
+		
+		/* -- Alignment should match, but check just to be safe. */
+		if (battr->attalign != pattr->attalign )
+		{
+			if ( throw )
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("alignment mismatch for attribute \"%s\"",
+								NameStr((battr->attname)))));
+			is_compatible = FALSE;
+			break;
+		}
+		
+		/* -- Attribute numbers must match position (+1) in tuple. 
+		 *    This is a hard requirement so always throw.  This could
+		 *    be an assertion, except that we want to fail even in a 
+		 *    distribution build.
+		 */
+		if ( battr->attnum != i || pattr->attnum != j )
+			elog(ERROR,
+				 "attribute numbers out of order");
+		
+		/* Note any attribute number difference. */
+		if ( i != j )
+			is_identical = FALSE;
+		
+		/* If we're building a map, update it. */
+		if ( v != NULL )
+			v[i] = j;
+		
+		i++;
+		j++;
+	}
+	
+	if ( is_compatible )
+	{
+		/* Any excess attributes in parent better be marked dropped */
+		for ( ; i <= n; i++ )
+		{
+			if ( !base->rd_att->attrs[i-1]->attisdropped )
+			{
+				if ( throw )
+				/* the partitioned table has more columns than the part */
+					ereport(ERROR,
+							(errcode(ERRCODE_SYNTAX_ERROR),
+							 errmsg("relation \"%s\" must have the same number columns as relation \"%s\"",
+									RelationGetRelationName(part),
+									RelationGetRelationName(base))));
+				is_compatible = FALSE;
+			}
+		}
+
+		/* Any excess attributes in part better be marked dropped */
+		for ( ; j <= m; j++ )
+		{
+			if ( !part->rd_att->attrs[j-1]->attisdropped )
+			{
+				if ( throw )
+				/* the partitioned table has fewer columns than the part */
+					ereport(ERROR,
+							(errcode(ERRCODE_SYNTAX_ERROR),
+							 errmsg("relation \"%s\" must have the same number columns as relation \"%s\"",
+									RelationGetRelationName(part),
+									RelationGetRelationName(base))));
+				is_compatible = FALSE;
+			}
+		}
+	}
+
+	/* Identical tuple descriptors should have the same number of columns */
+	if (n != m)
+	{
+		is_identical = FALSE;
+	}
+	
+	if ( !is_compatible )
+	{
+		Assert( !throw );
+		if ( v != NULL )
+			pfree(v);
+		return FALSE;
+	}
+
+	/* If parent and part are the same, don't use a map */
+	if ( is_identical && v != NULL )
+	{
+		pfree(v);
+		v = NULL;
+	}
+	
+	if ( map_ptr != NULL && v != NULL )
+	{
+		*map_ptr = makeAttrMap(n, v);
+		pfree(v);
+	}
+	return TRUE;
+}
+
+#if 0 /* for debugging purposes only */
+char *
+DumpSliceTable(SliceTable *table)
+{
+	StringInfoData buf;
+	ListCell *lc;
+
+	if (!table)
+		return "No slice table";
+
+	initStringInfo(&buf);
+
+	foreach(lc, table->slices)
+	{
+		Slice *slice = (Slice *) lfirst(lc);
+
+		appendStringInfo(&buf, "Slice %d: rootIndex %d gangType %d parent %d\n",
+						 slice->sliceIndex, slice->rootIndex, slice->gangType, slice->parentIndex);
+	}
+	return buf.data;
+}
+#endif
+
+typedef struct
+{
+	plan_tree_base_prefix prefix;
+	EState	   *estate;
+	/*
+	 * record the visited subplans that refer to an init plan,
+	 * to avoid re-visit the motion that is under an init plan.
+	 */
+	Bitmapset *unique_init_plans; 
+	int			currentSliceId;
+} FillSliceTable_cxt;
+
+static void
+FillSliceGangInfo(Slice *slice, int numsegments)
+{
+	switch (slice->gangType)
+	{
+		case GANGTYPE_UNALLOCATED:
+			slice->gangSize = 0;
+			break;
+		case GANGTYPE_PRIMARY_WRITER:
+		case GANGTYPE_PRIMARY_READER:
+			if (slice->directDispatch.isDirectDispatch)
+			{
+				slice->gangSize = list_length(slice->directDispatch.contentIds);
+				slice->segments = slice->directDispatch.contentIds;
+			}
+			else
+			{
+				int i;
+				slice->gangSize = numsegments;
+				slice->segments = NIL;
+				for (i = 0; i < numsegments; i++)
+					slice->segments = lappend_int(slice->segments, i);
+			}
+			break;
+		case GANGTYPE_ENTRYDB_READER:
+			slice->gangSize = 1;
+			slice->segments = list_make1_int(-1);
+			break;
+		case GANGTYPE_SINGLETON_READER:
+			slice->gangSize = 1;
+			slice->segments = list_make1_int(gp_session_id % numsegments);
+			break;
+		default:
+			elog(ERROR, "unexpected gang type");
+	}
+}
+
+static bool
+FillSliceTable_walker(Node *node, void *context)
+{
+	FillSliceTable_cxt *cxt = (FillSliceTable_cxt *) context;
+	PlannedStmt *stmt = (PlannedStmt *) cxt->prefix.node;
+	EState	   *estate = cxt->estate;
+	Bitmapset  *unique_init_plans = cxt->unique_init_plans;
+	SliceTable *sliceTable = estate->es_sliceTable;
+	int			parentSliceIndex = cxt->currentSliceId;
+	bool		result;
+
+	if (node == NULL)
+		return false;
+
+	/*
+	 * When we encounter a ModifyTable node, mark the slice it's in as the
+	 * primary writer slice. (There should be only one.)
+	 */
+	if (IsA(node, ModifyTable))
+	{
+		ModifyTable *mt = (ModifyTable *) node;
+
+		if (list_length(mt->resultRelations) > 0)
+		{
+			ListCell   *lc = list_head(mt->resultRelations);
+			int			idx = lfirst_int(lc);
+			Oid			reloid = getrelid(idx, stmt->rtable);
+			GpPolicyType policyType;
+
+			policyType = GpPolicyFetch(reloid)->ptype;
+
+#ifdef USE_ASSERT_CHECKING
+			{
+				lc = lc->next;
+				for (; lc != NULL; lc = lnext(lc))
+				{
+					idx = lfirst_int(lc);
+					reloid = getrelid(idx, stmt->rtable);
+
+					if (policyType != GpPolicyFetch(reloid)->ptype)
+						elog(ERROR, "ModifyTable mixes distributed and entry-only tables");
+
+				}
+			}
+#endif
+
+			if (policyType != POLICYTYPE_ENTRY)
+			{
+				Slice	   *currentSlice = (Slice *) list_nth(sliceTable->slices, cxt->currentSliceId);
+
+				currentSlice->gangType = GANGTYPE_PRIMARY_WRITER;
+
+				/*
+				 * If the PLAN is generated by ORCA, We assume that they
+				 * distpatch on all segments.
+				 */
+				if (stmt->planGen == PLANGEN_PLANNER)
+					FillSliceGangInfo(currentSlice, mt->plan.flow->numsegments);
+				else
+					FillSliceGangInfo(currentSlice, getgpsegmentCount());
+			}
+		}
+	}
+	/* A DML node is the same as a ModifyTable node, in ORCA plans. */
+	if (IsA(node, DML))
+	{
+		DML		   *dml = (DML *) node;
+		int			idx = dml->scanrelid;
+		Oid			reloid = getrelid(idx, stmt->rtable);
+		GpPolicyType policyType;
+
+		policyType = GpPolicyFetch(reloid)->ptype;
+
+		if (policyType != POLICYTYPE_ENTRY)
+		{
+			Slice	   *currentSlice = (Slice *) list_nth(sliceTable->slices, cxt->currentSliceId);
+
+			currentSlice->gangType = GANGTYPE_PRIMARY_WRITER;
+
+			/* DML node can only be genereated by ORCA */
+			Assert(stmt->planGen == PLANGEN_OPTIMIZER);
+			FillSliceGangInfo(currentSlice, getgpsegmentCount());
+		}
+	}
+
+	if (IsA(node, Motion))
+	{
+		Motion	   *motion = (Motion *) node;
+		MemoryContext oldcxt = MemoryContextSwitchTo(estate->es_query_cxt);
+		Flow	   *sendFlow;
+		Slice	   *sendSlice;
+		Slice	   *recvSlice;
+
+		/* Top node of subplan should have a Flow node. */
+		Insist(motion->plan.lefttree && motion->plan.lefttree->flow);
+		sendFlow = motion->plan.lefttree->flow;
+
+		/* Look up the sending gang's slice table entry. */
+		sendSlice = (Slice *) list_nth(sliceTable->slices, motion->motionID);
+
+		/* Look up the receiving (parent) gang's slice table entry. */
+		recvSlice = (Slice *)list_nth(sliceTable->slices, parentSliceIndex);
+
+		Assert(IsA(recvSlice, Slice));
+		Assert(recvSlice->sliceIndex == parentSliceIndex);
+		Assert(recvSlice->rootIndex == 0 ||
+			   (recvSlice->rootIndex > sliceTable->nMotions &&
+				recvSlice->rootIndex < list_length(sliceTable->slices)));
+
+		/* Sending slice become a children of recv slice */
+		recvSlice->children = lappend_int(recvSlice->children, sendSlice->sliceIndex);
+		sendSlice->parentIndex = parentSliceIndex;
+		sendSlice->rootIndex = recvSlice->rootIndex;
+
+		/* The gang beneath a Motion will be a reader. */
+		sendSlice->gangType = GANGTYPE_PRIMARY_READER;
+
+		if (sendFlow->flotype != FLOW_SINGLETON)
+		{
+			sendSlice->gangType = GANGTYPE_PRIMARY_READER;
+
+			/*
+			 * If the PLAN is generated by ORCA, We assume that they
+			 * distpatch on all segments.
+			 */
+			if (stmt->planGen == PLANGEN_PLANNER)
+				FillSliceGangInfo(sendSlice, sendFlow->numsegments);
+			else
+				FillSliceGangInfo(sendSlice, getgpsegmentCount());
+		}
+		else
+		{
+			sendSlice->gangType =
+				sendFlow->segindex == -1 ?
+				GANGTYPE_ENTRYDB_READER : GANGTYPE_SINGLETON_READER;
+
+			/*
+			 * If the PLAN is generated by ORCA, We assume that they
+			 * distpatch on all segments.
+			 */
+			if (stmt->planGen == PLANGEN_PLANNER)
+				FillSliceGangInfo(sendSlice, sendFlow->numsegments);
+			else
+				FillSliceGangInfo(sendSlice, getgpsegmentCount());
+		}
+
+		MemoryContextSwitchTo(oldcxt);
+
+		/* recurse into children */
+		cxt->currentSliceId = motion->motionID;
+		result = plan_tree_walker(node, FillSliceTable_walker, cxt);
+		cxt->currentSliceId = parentSliceIndex;
+		return result;
+	}
+
+	if (IsA(node, SubPlan))
+	{
+		SubPlan *subplan = (SubPlan *) node;
+
+		if (subplan->is_initplan)
+		{
+			/* do not re-visit the init plan */
+			if (bms_is_member(subplan->plan_id, unique_init_plans))
+				return false;
+			cxt->unique_init_plans = bms_add_member(unique_init_plans, subplan->plan_id);
+			cxt->currentSliceId = subplan->qDispSliceId;
+			result = plan_tree_walker(node, FillSliceTable_walker, cxt);
+			cxt->currentSliceId = parentSliceIndex;
+			return result;
+		}
+	}
+
+	return plan_tree_walker(node, FillSliceTable_walker, cxt);
+}
+
+/*
+ * Set up the parent-child relationships in the slice table.
+ *
+ * We used to do this as part of ExecInitMotion(), but because ExecInitNode()
+ * no longer recurses into subplans, at SubPlan nodes, we cannot easily track
+ * the parent-child slice relationships across SubPlan nodes at that phase
+ * anymore. We now do this separate walk of the whole plantree, recursing
+ * into SubPlan nodes, to do the same.
+ */
+static void
+FillSliceTable(EState *estate, PlannedStmt *stmt)
+{
+	FillSliceTable_cxt cxt;
+	SliceTable *sliceTable = estate->es_sliceTable;
+
+	if (!sliceTable)
+		return;
+
+	cxt.prefix.node = (Node *) stmt;
+	cxt.estate = estate;
+	cxt.unique_init_plans = NULL;
+	cxt.currentSliceId = 0;
+
+	if (stmt->intoClause != NULL || stmt->copyIntoClause != NULL || stmt->refreshClause)
+	{
+		Slice	   *currentSlice = (Slice *) linitial(sliceTable->slices);
+		int			numsegments;
+		if (stmt->commandType == CMD_SELECT && stmt->intoPolicy)
+			/*
+			 * For CTAS although the data is distributed on part of the
+			 * segments, the catalog changes must be dispatched to all the
+			 * segments, so a full gang is required.
+			 */
+			numsegments = getgpsegmentCount();
+		else
+			/* FIXME: ->lefttree or planTree? */
+			numsegments = stmt->planTree->flow->numsegments;
+		currentSlice->gangType = GANGTYPE_PRIMARY_WRITER;
+		FillSliceGangInfo(currentSlice, numsegments);
+	}
+
+	/*
+	 * NOTE: We depend on plan_tree_walker() to recurse into subplans of
+	 * SubPlan nodes.
+	 */
+	FillSliceTable_walker((Node *) stmt->planTree, &cxt);
+	bms_free(cxt.unique_init_plans);
+}
+
+
+
+/*
+ * BuildPartitionNodeFromRoot
+ *   Build PartitionNode for the root partition of a given partition oid.
+ */
+static PartitionNode *
+BuildPartitionNodeFromRoot(Oid relid)
+{
+	PartitionNode *partitionNode;
+
+	if (rel_is_child_partition(relid))
+	{
+		relid = rel_partition_get_master(relid);
+	}
+
+	partitionNode = RelationBuildPartitionDescByOid(relid, false /* inctemplate */);
+
+	return partitionNode;
+}
+
+/*
+ * createPartitionAccessMethods
+ *   Create a PartitionAccessMethods object.
+ *
+ * Note that the memory context for the access method is not set at this point. It will
+ * be set during execution.
+ */
+static PartitionAccessMethods *
+createPartitionAccessMethods(int numLevels)
+{
+	PartitionAccessMethods *accessMethods = palloc(sizeof(PartitionAccessMethods));;
+	accessMethods->partLevels = numLevels;
+	accessMethods->amstate = palloc0(numLevels * sizeof(void *));
+	accessMethods->part_cxt = NULL;
+
+	return accessMethods;
+}
+
+/*
+ * createPartitionState
+ *   Create a PartitionState object.
+ *
+ * Note that the memory context for the access method is not set at this point. It will
+ * be set during execution.
+ */
+PartitionState *
+createPartitionState(PartitionNode *partsAndRules,
+					 int resultPartSize)
+{
+	Assert(partsAndRules != NULL);
+
+	PartitionState *partitionState = makeNode(PartitionState);
+	partitionState->accessMethods = createPartitionAccessMethods(num_partition_levels(partsAndRules));
+	partitionState->max_partition_attr = max_partition_attr(partsAndRules);
+
+	return partitionState;
+}
+
+/*
+ * InitializeQueryPartsMetadata
+ *   Initialize partitioning metadata for all partitions involved in the query.
+ */
+static void
+InitializeQueryPartsMetadata(PlannedStmt *plannedstmt, EState *estate)
+{
+	Assert(plannedstmt != NULL && estate != NULL);
+
+	if (plannedstmt->queryPartOids == NIL)
+	{
+		plannedstmt->queryPartsMetadata = NIL;
+		return;
+	}
+
+	if (Gp_role != GP_ROLE_EXECUTE)
+	{
+		/*
+		 * Non-QEs populate the partitioning metadata for all
+		 * relevant partitions in the query.
+		 */
+		plannedstmt->queryPartsMetadata = NIL;
+		ListCell *lc = NULL;
+		foreach (lc, plannedstmt->queryPartOids)
+		{
+			Oid relid = (Oid)lfirst_oid(lc);
+			PartitionNode *partitionNode = BuildPartitionNodeFromRoot(relid);
+			Assert(partitionNode != NULL);
+			plannedstmt->queryPartsMetadata =
+				lappend(plannedstmt->queryPartsMetadata, partitionNode);
+		}
+	}
+
+	/* Populate the partitioning metadata to EState */
+	Assert(estate->dynamicTableScanInfo != NULL);
+
+	MemoryContext oldContext = MemoryContextSwitchTo(estate->es_query_cxt);
+
+	ListCell *lc = NULL;
+	foreach(lc, plannedstmt->queryPartsMetadata)
+	{
+		PartitionNode *partsAndRules = (PartitionNode *)lfirst(lc);
+
+		PartitionMetadata *metadata = palloc(sizeof(PartitionMetadata));
+		metadata->partsAndRules = partsAndRules;
+		Assert(metadata->partsAndRules != NULL);
+		metadata->accessMethods = createPartitionAccessMethods(num_partition_levels(metadata->partsAndRules));
+		estate->dynamicTableScanInfo->partsMetadata =
+			lappend(estate->dynamicTableScanInfo->partsMetadata, metadata);
+	}
+
+	MemoryContextSwitchTo(oldContext);
+}
+
+/*
+ * InitializePartsMetadata
+ *   Initialize partitioning metadata for the given partitioned table oid
+ */
+List *
+InitializePartsMetadata(Oid rootOid)
+{
+	PartitionMetadata *metadata = palloc(sizeof(PartitionMetadata));
+	metadata->partsAndRules = BuildPartitionNodeFromRoot(rootOid);
+	Assert(metadata->partsAndRules != NULL);
+
+	metadata->accessMethods = createPartitionAccessMethods(num_partition_levels(metadata->partsAndRules));
+	return list_make1(metadata);
+}
+
+/*
+ * Adjust INSERT/UPDATE/DELETE count for replicated table ON QD
+ */
+static void
+AdjustReplicatedTableCounts(EState *estate)
+{
+	int i;
+	ResultRelInfo *resultRelInfo;
+	bool containReplicatedTable = false;
+	int			numsegments = getgpsegmentCount();
+
+	if (Gp_role != GP_ROLE_DISPATCH)
+		return;
+
+	/* check if result_relations contain replicated table*/
+	for (i = 0; i < estate->es_num_result_relations; i++)
+	{
+		resultRelInfo = estate->es_result_relations + i;
+
+		if (!resultRelInfo->ri_RelationDesc->rd_cdbpolicy)
+			continue;
+
+		if (GpPolicyIsReplicated(resultRelInfo->ri_RelationDesc->rd_cdbpolicy))
+		{
+			containReplicatedTable = true;
+			numsegments = resultRelInfo->ri_RelationDesc->rd_cdbpolicy->numsegments;
+		}
+		else if (containReplicatedTable)
+		{
+			/*
+			 * If one is replicated table, assert that other
+			 * tables are also replicated table.
+ 			 */
+			Insist(0);
+		}
+	}
+
+	if (containReplicatedTable)
+		estate->es_processed = estate->es_processed / numsegments;
 }

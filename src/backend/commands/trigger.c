@@ -31,6 +31,7 @@
 #include "commands/trigger.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
+#include "nodes/execnodes.h"
 #include "nodes/bitmapset.h"
 #include "nodes/makefuncs.h"
 #include "optimizer/clauses.h"
@@ -43,6 +44,7 @@
 #include "pgstat.h"
 #include "rewrite/rewriteManip.h"
 #include "storage/bufmgr.h"
+#include "storage/itemptr.h"
 #include "storage/lmgr.h"
 #include "tcop/utility.h"
 #include "utils/acl.h"
@@ -58,22 +60,14 @@
 #include "utils/tqual.h"
 #include "utils/tuplestore.h"
 
+#include "cdb/cdbvars.h"
+#include "cdb/cdbdisp_query.h"
 
 /* GUC variables */
 int			SessionReplicationRole = SESSION_REPLICATION_ROLE_ORIGIN;
 
 /* How many levels deep into trigger execution are we? */
 static int	MyTriggerDepth = 0;
-
-/*
- * Note that this macro also exists in executor/execMain.c.  There does not
- * appear to be any good header to put it into, given the structures that
- * it uses, so we let them be duplicated.  Be sure to update both if one needs
- * to be changed, however.
- */
-#define GetModifiedColumns(relinfo, estate) \
-	(rt_fetch((relinfo)->ri_RangeTableIndex, (estate)->es_range_table)->modifiedCols)
-
 /* Local function prototypes */
 static void ConvertTriggerToFK(CreateTrigStmt *stmt, Oid funcoid);
 static void SetTriggerFlags(TriggerDesc *trigdesc, Trigger *trigger);
@@ -83,15 +77,7 @@ static HeapTuple GetTupleForTrigger(EState *estate,
 				   ItemPointer tid,
 				   LockTupleMode lockmode,
 				   TupleTableSlot **newSlot);
-static bool TriggerEnabled(EState *estate, ResultRelInfo *relinfo,
-			   Trigger *trigger, TriggerEvent event,
-			   Bitmapset *modifiedCols,
-			   HeapTuple oldtup, HeapTuple newtup);
-static HeapTuple ExecCallTriggerFunc(TriggerData *trigdata,
-					int tgindx,
-					FmgrInfo *finfo,
-					Instrumentation *instr,
-					MemoryContext per_tuple_context);
+
 static void AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 					  int event, bool row_trigger,
 					  HeapTuple oldtup, HeapTuple newtup,
@@ -184,6 +170,15 @@ CreateTrigger(CreateTrigStmt *stmt, const char *queryString,
 	}
 	else if (rel->rd_rel->relkind == RELKIND_VIEW)
 	{
+		/*
+		 * Greenplum cannot support INSTEAD OF triggers, see merge fixme in
+		 * CheckValidResultRel().
+		 */
+		if (stmt->timing == TRIGGER_TYPE_INSTEAD)
+			ereport(ERROR,
+					(errcode(ERRCODE_GP_FEATURE_NOT_YET),
+					 errmsg("INSTEAD OF triggers are not supported in Greenplum")));
+
 		/*
 		 * Views can have INSTEAD OF triggers (which we check below are
 		 * row-level), or statement-level BEFORE/AFTER triggers.
@@ -429,6 +424,7 @@ CreateTrigger(CreateTrigStmt *stmt, const char *queryString,
 		 */
 		if (funcrettype == OPAQUEOID)
 		{
+			if (Gp_role != GP_ROLE_EXECUTE)
 			ereport(WARNING,
 					(errmsg("changing return type of function %s from \"opaque\" to \"trigger\"",
 							NameListToString(stmt->funcname))));
@@ -439,6 +435,21 @@ CreateTrigger(CreateTrigStmt *stmt, const char *queryString,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 					 errmsg("function %s must return type \"trigger\"",
 							NameListToString(stmt->funcname))));
+	}
+
+	/* Check GPDB limitations */
+	if (RelationIsAppendOptimized(rel) &&
+		TRIGGER_FOR_ROW(tgtype) &&
+		!stmt->isconstraint)
+	{
+		if (TRIGGER_FOR_UPDATE(tgtype))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("ON UPDATE triggers are not supported on append-only tables")));
+		if (TRIGGER_FOR_DELETE(tgtype))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("ON DELETE triggers are not supported on append-only tables")));
 	}
 
 	/*
@@ -505,7 +516,18 @@ CreateTrigger(CreateTrigStmt *stmt, const char *queryString,
 	 */
 	tgrel = heap_open(TriggerRelationId, RowExclusiveLock);
 
-	trigoid = GetNewOid(tgrel);
+	/*
+	 * For RI constraint triggers, the trigger's name is derived from the
+	 * trigger OID. That creates a chicken-and-egg problem with the usual
+	 * GPDB OID dispatching mechanism. In a QE, we cannot look up the
+	 * trigger OID to use by trigger name, because the trigger name is
+	 * derived from the OID. To work around that, the trigger OID is
+	 * included directly in the CreateTrigStmt struct.
+	 */
+	if (OidIsValid(stmt->trigOid))
+		trigoid = stmt->trigOid;
+	else
+		trigoid = GetNewOid(tgrel);
 
 	/*
 	 * If trigger is internally generated, modify the provided trigger name to
@@ -565,7 +587,29 @@ CreateTrigger(CreateTrigStmt *stmt, const char *queryString,
 												  CStringGetDatum(trigname));
 	values[Anum_pg_trigger_tgfoid - 1] = ObjectIdGetDatum(funcoid);
 	values[Anum_pg_trigger_tgtype - 1] = Int16GetDatum(tgtype);
-	values[Anum_pg_trigger_tgenabled - 1] = CharGetDatum(TRIGGER_FIRES_ON_ORIGIN);
+	
+	/*
+	 * Special for Greenplum Database: Ignore foreign keys for now. Create
+	 * the triggers to back them as 'disabled'.
+	 */
+	char		tgenabled = TRIGGER_FIRES_ON_ORIGIN;
+	if (isInternal)
+	{
+		if (RI_FKey_trigger_type(funcoid))
+		{
+			tgenabled = TRIGGER_DISABLED;
+		}
+		else if (funcoid == F_UNIQUE_KEY_RECHECK)
+		{
+			/*
+			 * unique_key_recheck is used for deferrable unique constraints.
+			 * We do enforce unique constraints.
+			 */
+		}
+		else
+			elog(WARNING, "unrecognized internal trigger function %u", funcoid);
+	}
+	values[Anum_pg_trigger_tgenabled - 1] = CharGetDatum(tgenabled);
 	values[Anum_pg_trigger_tgisinternal - 1] = BoolGetDatum(isInternal);
 	values[Anum_pg_trigger_tgconstrrelid - 1] = ObjectIdGetDatum(constrrelid);
 	values[Anum_pg_trigger_tgconstrindid - 1] = ObjectIdGetDatum(indexOid);
@@ -1854,7 +1898,7 @@ equalTriggerDescs(TriggerDesc *trigdesc1, TriggerDesc *trigdesc2)
  *
  * Returns the tuple (or NULL) as returned by the function.
  */
-static HeapTuple
+HeapTuple
 ExecCallTriggerFunc(TriggerData *trigdata,
 					int tgindx,
 					FmgrInfo *finfo,
@@ -1942,6 +1986,12 @@ ExecBSInsertTriggers(EState *estate, ResultRelInfo *relinfo)
 	TriggerDesc *trigdesc;
 	int			i;
 	TriggerData LocTriggerData;
+
+	if (Gp_role == GP_ROLE_EXECUTE)
+	{
+		/* Don't fire statement-triggers in executor nodes. */
+		return;
+	}
 
 	trigdesc = relinfo->ri_TrigDesc;
 
@@ -2054,7 +2104,7 @@ ExecBRInsertTriggers(EState *estate, ResultRelInfo *relinfo,
 
 		if (newslot->tts_tupleDescriptor != tupdesc)
 			ExecSetSlotDescriptor(newslot, tupdesc);
-		ExecStoreTuple(newtuple, newslot, InvalidBuffer, false);
+		ExecStoreHeapTuple(newtuple, newslot, InvalidBuffer, false);
 		slot = newslot;
 	}
 	return slot;
@@ -2067,8 +2117,13 @@ ExecARInsertTriggers(EState *estate, ResultRelInfo *relinfo,
 	TriggerDesc *trigdesc = relinfo->ri_TrigDesc;
 
 	if (trigdesc && trigdesc->trig_insert_after_row)
+	{
+		if(RelationIsAoCols(relinfo->ri_RelationDesc))
+			elog(ERROR, "Trigger is not supported on AOCS yet");
+
 		AfterTriggerSaveEvent(estate, relinfo, TRIGGER_EVENT_INSERT,
 							  true, NULL, trigtuple, recheckIndexes, NULL);
+	}
 }
 
 TupleTableSlot *
@@ -2129,7 +2184,7 @@ ExecIRInsertTriggers(EState *estate, ResultRelInfo *relinfo,
 
 		if (newslot->tts_tupleDescriptor != tupdesc)
 			ExecSetSlotDescriptor(newslot, tupdesc);
-		ExecStoreTuple(newtuple, newslot, InvalidBuffer, false);
+		ExecStoreHeapTuple(newtuple, newslot, InvalidBuffer, false);
 		slot = newslot;
 	}
 	return slot;
@@ -2141,6 +2196,12 @@ ExecBSDeleteTriggers(EState *estate, ResultRelInfo *relinfo)
 	TriggerDesc *trigdesc;
 	int			i;
 	TriggerData LocTriggerData;
+
+	if (Gp_role == GP_ROLE_EXECUTE)
+	{
+		/* Don't fire statement-triggers in executor nodes. */
+		return;
+	}
 
 	trigdesc = relinfo->ri_TrigDesc;
 
@@ -2344,6 +2405,12 @@ ExecBSUpdateTriggers(EState *estate, ResultRelInfo *relinfo)
 	TriggerData LocTriggerData;
 	Bitmapset  *modifiedCols;
 
+	if (Gp_role == GP_ROLE_EXECUTE)
+	{
+		/* Don't fire statement-triggers in executor nodes. */
+		return;
+	}
+
 	trigdesc = relinfo->ri_TrigDesc;
 
 	if (trigdesc == NULL)
@@ -2408,7 +2475,7 @@ ExecBRUpdateTriggers(EState *estate, EPQState *epqstate,
 					 TupleTableSlot *slot)
 {
 	TriggerDesc *trigdesc = relinfo->ri_TrigDesc;
-	HeapTuple	slottuple = ExecMaterializeSlot(slot);
+	HeapTuple	slottuple = ExecFetchSlotHeapTuple(slot);
 	HeapTuple	newtuple = slottuple;
 	TriggerData LocTriggerData;
 	HeapTuple	trigtuple;
@@ -2460,8 +2527,8 @@ ExecBRUpdateTriggers(EState *estate, EPQState *epqstate,
 	 */
 	if (newSlot != NULL)
 	{
-		slot = ExecFilterJunk(relinfo->ri_junkFilter, newSlot);
-		slottuple = ExecMaterializeSlot(slot);
+		slot = ExecFilterJunk(estate->es_junkFilter, newSlot);
+		slottuple = ExecFetchSlotHeapTuple(slot);
 		newtuple = slottuple;
 	}
 
@@ -2521,7 +2588,7 @@ ExecBRUpdateTriggers(EState *estate, EPQState *epqstate,
 
 		if (newslot->tts_tupleDescriptor != tupdesc)
 			ExecSetSlotDescriptor(newslot, tupdesc);
-		ExecStoreTuple(newtuple, newslot, InvalidBuffer, false);
+		ExecStoreHeapTuple(newtuple, newslot, InvalidBuffer, false);
 		slot = newslot;
 	}
 	return slot;
@@ -2617,7 +2684,7 @@ ExecIRUpdateTriggers(EState *estate, ResultRelInfo *relinfo,
 
 		if (newslot->tts_tupleDescriptor != tupdesc)
 			ExecSetSlotDescriptor(newslot, tupdesc);
-		ExecStoreTuple(newtuple, newslot, InvalidBuffer, false);
+		ExecStoreHeapTuple(newtuple, newslot, InvalidBuffer, false);
 		slot = newslot;
 	}
 	return slot;
@@ -2629,6 +2696,12 @@ ExecBSTruncateTriggers(EState *estate, ResultRelInfo *relinfo)
 	TriggerDesc *trigdesc;
 	int			i;
 	TriggerData LocTriggerData;
+
+	if (Gp_role == GP_ROLE_EXECUTE)
+	{
+		/* Don't fire statement-triggers in executor nodes. */
+		return;
+	}
 
 	trigdesc = relinfo->ri_TrigDesc;
 
@@ -2697,6 +2770,12 @@ GetTupleForTrigger(EState *estate,
 	HeapTuple	result;
 	Buffer		buffer;
 
+	/* these should be rejected when you try to create such triggers, but let's check */
+	if (RelationIsAppendOptimized(relation))
+		elog(ERROR, "UPDATE and DELETE triggers are not supported on append-only tables");
+
+	Assert(RelationIsHeap(relation));
+
 	if (newSlot != NULL)
 	{
 		HTSU_Result test;
@@ -2714,7 +2793,7 @@ ltrmark:;
 		tuple.t_self = *tid;
 		test = heap_lock_tuple(relation, &tuple,
 							   estate->es_output_cid,
-							   lockmode, false /* wait */ ,
+							   lockmode, LockTupleWait,
 							   false, &buffer, &hufd);
 		switch (test)
 		{
@@ -2747,6 +2826,11 @@ ltrmark:;
 					ereport(ERROR,
 							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 							 errmsg("could not serialize access due to concurrent update")));
+				if (ItemPointerIndicatesMovedPartitions(&hufd.ctid))
+					ereport(ERROR,
+							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+							 errmsg("tuple to be locked was already moved to another segment due to concurrent update")));
+
 				if (!ItemPointerEquals(&hufd.ctid, &tuple.t_self))
 				{
 					/* it was updated, so look at the updated version */
@@ -2811,7 +2895,6 @@ ltrmark:;
 		tuple.t_data = (HeapTupleHeader) PageGetItem(page, lp);
 		tuple.t_len = ItemIdGetLength(lp);
 		tuple.t_self = *tid;
-		tuple.t_tableOid = RelationGetRelid(relation);
 
 		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 	}
@@ -2825,7 +2908,7 @@ ltrmark:;
 /*
  * Is trigger enabled to fire?
  */
-static bool
+bool
 TriggerEnabled(EState *estate, ResultRelInfo *relinfo,
 			   Trigger *trigger, TriggerEvent event,
 			   Bitmapset *modifiedCols,
@@ -2930,7 +3013,7 @@ TriggerEnabled(EState *estate, ResultRelInfo *relinfo,
 			oldslot = estate->es_trig_oldtup_slot;
 			if (oldslot->tts_tupleDescriptor != tupdesc)
 				ExecSetSlotDescriptor(oldslot, tupdesc);
-			ExecStoreTuple(oldtup, oldslot, InvalidBuffer, false);
+			ExecStoreHeapTuple(oldtup, oldslot, InvalidBuffer, false);
 		}
 		if (HeapTupleIsValid(newtup))
 		{
@@ -2943,7 +3026,7 @@ TriggerEnabled(EState *estate, ResultRelInfo *relinfo,
 			newslot = estate->es_trig_newtup_slot;
 			if (newslot->tts_tupleDescriptor != tupdesc)
 				ExecSetSlotDescriptor(newslot, tupdesc);
-			ExecStoreTuple(newtup, newslot, InvalidBuffer, false);
+			ExecStoreHeapTuple(newtup, newslot, InvalidBuffer, false);
 		}
 
 		/*
@@ -3705,6 +3788,7 @@ afterTriggerMarkEvents(AfterTriggerEventList *events,
 					   bool immediate_only)
 {
 	bool		found = false;
+	bool		deferred_found = false;
 	AfterTriggerEvent event;
 	AfterTriggerEventChunk *chunk;
 
@@ -3740,12 +3824,23 @@ afterTriggerMarkEvents(AfterTriggerEventList *events,
 		 */
 		if (defer_it && move_list != NULL)
 		{
+			deferred_found = true;
 			/* add it to move_list */
 			afterTriggerAddEvent(move_list, event, evtshared);
 			/* mark original copy "done" so we don't do it again */
 			event->ate_flags |= AFTER_TRIGGER_DONE;
 		}
 	}
+
+	/*
+	 * We could allow deferred triggers if, before the end of the
+	 * security-restricted operation, we were to verify that a SET CONSTRAINTS
+	 * ... IMMEDIATE has fired all such triggers.  For now, don't bother.
+	 */
+	if (deferred_found && InSecurityRestrictedOperation())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("cannot fire deferred trigger within security-restricted operation")));
 
 	return found;
 }
@@ -3754,7 +3849,9 @@ afterTriggerMarkEvents(AfterTriggerEventList *events,
  * afterTriggerInvokeEvents()
  *
  *	Scan the given event list for events that are marked as to be fired
- *	in the current firing cycle, and fire them.
+ *	in the current firing cycle, and fire them.  query_depth is the index in
+ *	afterTriggers->query_stack, or -1 to examine afterTriggers->events.
+ *	(We have to be careful here because query_stack could move under us.)
  *
  *	If estate isn't NULL, we use its result relation info to avoid repeated
  *	openings and closing of trigger target relations.  If it is NULL, we
@@ -4736,6 +4833,18 @@ AfterTriggerSetState(ConstraintsSetStmt *stmt)
 		if (snapshot_set)
 			PopActiveSnapshot();
 	}
+	else
+	{
+		/* no snapshot needed */
+	}
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_NEED_TWO_PHASE,
+									NIL,
+									NULL);
+	}
 }
 
 /* ----------
@@ -4840,6 +4949,10 @@ AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 		elog(ERROR, "AfterTriggerSaveEvent() called outside of transaction");
 	if (afterTriggers->query_depth < 0)
 		elog(ERROR, "AfterTriggerSaveEvent() called outside of query");
+
+	/* Don't fire statement-triggers in executor nodes. */
+	if (!row_trigger && Gp_role == GP_ROLE_EXECUTE)
+		return;
 
 	/*
 	 * Validate the event code and collect the associated tuple CTIDs.

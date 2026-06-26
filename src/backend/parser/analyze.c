@@ -14,6 +14,8 @@
  * contain optimizable statements, which we should transform.
  *
  *
+ * Portions Copyright (c) 2005-2010, Greenplum inc
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -29,6 +31,8 @@
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "optimizer/plancat.h"
+#include "optimizer/tlist.h"
 #include "optimizer/var.h"
 #include "parser/analyze.h"
 #include "parser/parse_agg.h"
@@ -36,6 +40,7 @@
 #include "parser/parse_coerce.h"
 #include "parser/parse_collate.h"
 #include "parser/parse_cte.h"
+#include "parser/parse_func.h"
 #include "parser/parse_oper.h"
 #include "parser/parse_param.h"
 #include "parser/parse_relation.h"
@@ -44,6 +49,47 @@
 #include "rewrite/rewriteManip.h"
 #include "utils/rel.h"
 
+#include "cdb/cdbhash.h"
+#include "cdb/cdbvars.h"
+#include "cdb/cdbutil.h"
+#include "catalog/gp_policy.h"
+#include "commands/defrem.h"
+#include "access/htup_details.h"
+#include "optimizer/clauses.h"
+#include "optimizer/tlist.h"
+#include "parser/parse_func.h"
+#include "utils/lsyscache.h"
+
+
+/* Context for transformGroupedWindows() which mutates components
+ * of a query that mixes windowing and aggregation or grouping.  It
+ * accumulates context for eventual construction of a subquery (the
+ * grouping query) during mutation of components of the outer query
+ * (the windowing query).
+ */
+typedef struct
+{
+	List *subtlist; /* target list for subquery */
+	List *subgroupClause; /* group clause for subquery */
+	List *windowClause; /* window clause for outer query*/
+
+	/* Scratch area for init_grouped_window context and map_sgr_mutator.
+	 */
+	Index *sgr_map;
+
+	/* Scratch area for grouped_window_mutator and var_for_gw_expr.
+	 */
+	List *subrtable;
+	int call_depth;
+	TargetEntry *tle;
+} grouped_window_ctx;
+
+/* Working state for transformSetOperationTree_internal */
+typedef struct
+{
+	int			ncols;
+	List	  **leafinfos;
+} setop_types_ctx;
 
 /* Hook for plugins to get control at end of parse analysis */
 post_parse_analyze_hook_type post_parse_analyze_hook = NULL;
@@ -57,7 +103,13 @@ static Query *transformSelectStmt(ParseState *pstate, SelectStmt *stmt);
 static Query *transformValuesClause(ParseState *pstate, SelectStmt *stmt);
 static Query *transformSetOperationStmt(ParseState *pstate, SelectStmt *stmt);
 static Node *transformSetOperationTree(ParseState *pstate, SelectStmt *stmt,
-						  bool isTopLevel, List **targetlist);
+									   bool isTopLevel, List **targetlist);
+static Node *transformSetOperationTree_internal(ParseState *pstate, SelectStmt *stmt,
+												bool isTopLevel, setop_types_ctx *setop_types);
+static void coerceSetOpTypes(ParseState *pstate, Node *sop,
+							 List *preselected_coltypes, List *preselected_coltypmods,
+							 List **targetlist);
+static void select_setop_types(ParseState *pstate, setop_types_ctx *ctx, SetOperation op, List **selected_types, List **selected_typmods);
 static void determineRecursiveColTypes(ParseState *pstate,
 						   Node *larg, List *nrtargetlist);
 static Query *transformUpdateStmt(ParseState *pstate, UpdateStmt *stmt);
@@ -71,6 +123,18 @@ static Query *transformCreateTableAsStmt(ParseState *pstate,
 static void transformLockingClause(ParseState *pstate, Query *qry,
 					   LockingClause *lc, bool pushedDown);
 
+static int get_distkey_by_name(char *key, IntoClause *into, Query *qry, bool *found);
+static void setQryDistributionPolicy(IntoClause *into, Query *qry);
+
+static Query *transformGroupedWindows(ParseState *pstate, Query *qry);
+static void init_grouped_window_context(grouped_window_ctx *ctx, Query *qry);
+static Var *var_for_gw_expr(grouped_window_ctx *ctx, Node *expr, bool force);
+static void discard_grouped_window_context(grouped_window_ctx *ctx);
+static Node *map_sgr_mutator(Node *node, void *context);
+static Node *grouped_window_mutator(Node *node, void *context);
+static Alias *make_replacement_alias(Query *qry, const char *aname);
+static char *generate_positional_name(AttrNumber attrno);
+static List*generate_alternate_vars(Var *var, grouped_window_ctx *ctx);
 
 /*
  * parse_analyze
@@ -147,13 +211,13 @@ parse_analyze_varparams(Node *parseTree, const char *sourceText,
 Query *
 parse_sub_analyze(Node *parseTree, ParseState *parentParseState,
 				  CommonTableExpr *parentCTE,
-				  bool locked_from_parent)
+				  LockingClause *lockclause_from_parent)
 {
 	ParseState *pstate = make_parsestate(parentParseState);
 	Query	   *query;
 
 	pstate->p_parent_cte = parentCTE;
-	pstate->p_locked_from_parent = locked_from_parent;
+	pstate->p_lockclause_from_parent = lockclause_from_parent;
 
 	query = transformStmt(pstate, parseTree);
 
@@ -280,6 +344,9 @@ transformStmt(ParseState *pstate, Node *parseTree)
 	result->querySource = QSRC_ORIGINAL;
 	result->canSetTag = true;
 
+	if (pstate->p_hasDynamicFunction)
+		result->hasDynamicFunctions = true;
+
 	return result;
 }
 
@@ -349,6 +416,18 @@ transformDeleteStmt(ParseState *pstate, DeleteStmt *stmt)
 		qry->hasRecursive = stmt->withClause->recursive;
 		qry->cteList = transformWithClause(pstate, stmt->withClause);
 		qry->hasModifyingCTE = pstate->p_hasModifyingCTE;
+
+		/*
+		 * Since GPDB currently only support a single writer gang, only one
+		 * writable clause is permitted per CTE. Once we get flexible gangs
+		 * with more than one writer gang we can lift this restriction.
+		 */
+		if (pstate->p_hasModifyingCTE)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("writable CTE queries cannot be themselves writable"),
+					 errdetail("Greenplum Database currently only support CTEs with one writable clause, called in a non-writable context."),
+					 errhint("Rewrite the query to only include one writable clause.")));
 	}
 
 	/* set up range table with just the result rel */
@@ -391,6 +470,10 @@ transformDeleteStmt(ParseState *pstate, DeleteStmt *stmt)
 	qry->hasSubLinks = pstate->p_hasSubLinks;
 	qry->hasWindowFuncs = pstate->p_hasWindowFuncs;
 	qry->hasAggs = pstate->p_hasAggs;
+	qry->hasFuncsWithExecRestrictions = pstate->p_hasFuncsWithExecRestrictions;
+
+	if (pstate->p_hasTblValueExpr)
+		parseCheckTableFunctions(pstate, qry);
 
 	assign_query_collations(pstate, qry);
 
@@ -434,6 +517,18 @@ transformInsertStmt(ParseState *pstate, InsertStmt *stmt)
 		qry->hasRecursive = stmt->withClause->recursive;
 		qry->cteList = transformWithClause(pstate, stmt->withClause);
 		qry->hasModifyingCTE = pstate->p_hasModifyingCTE;
+
+		/*
+		 * Since GPDB currently only support a single writer gang, only one
+		 * writable clause is permitted per CTE. Once we get flexible gangs
+		 * with more than one writer gang we can lift this restriction.
+		 */
+		if (pstate->p_hasModifyingCTE)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("writable CTE queries cannot be themselves writable"),
+					 errdetail("Greenplum Database currently only support CTEs with one writable clause, called in a non-writable context."),
+					 errhint("Rewrite the query to only include one writable clause.")));
 	}
 
 	/*
@@ -554,35 +649,13 @@ transformInsertStmt(ParseState *pstate, InsertStmt *stmt)
 		 * separate from the subquery's tlist because we may add columns,
 		 * insert datatype coercions, etc.)
 		 *
-		 * HACK: unknown-type constants and params in the SELECT's targetlist
-		 * are copied up as-is rather than being referenced as subquery
-		 * outputs.  This is to ensure that when we try to coerce them to
-		 * the target column's datatype, the right things happen (see
-		 * special cases in coerce_type).  Otherwise, this fails:
-		 *		INSERT INTO foo SELECT 'bar', ... FROM baz
+		 * Const and Param nodes of type UNKNOWN in the SELECT's targetlist
+		 * no longer need special treatment here.  They'll be assigned proper
+         * types later by coerce_type() upon assignment to the target columns.
+		 * Otherwise this fails:  INSERT INTO foo SELECT 'bar', ... FROM baz
 		 *----------
 		 */
-		exprList = NIL;
-		foreach(lc, selectQuery->targetList)
-		{
-			TargetEntry *tle = (TargetEntry *) lfirst(lc);
-			Expr	   *expr;
-
-			if (tle->resjunk)
-				continue;
-			if (tle->expr &&
-				(IsA(tle->expr, Const) ||IsA(tle->expr, Param)) &&
-				exprType((Node *) tle->expr) == UNKNOWNOID)
-				expr = tle->expr;
-			else
-			{
-				Var		   *var = makeVarFromTargetEntry(rtr->rtindex, tle);
-
-				var->location = exprLocation((Node *) tle->expr);
-				expr = (Expr *) var;
-			}
-			exprList = lappend(exprList, expr);
-		}
+		expandRTE(rte, rtr->rtindex, 0, -1, false, NULL, &exprList);
 
 		/* Prepare row for assignment to target table */
 		exprList = transformInsertRow(pstate, exprList,
@@ -762,6 +835,7 @@ transformInsertStmt(ParseState *pstate, InsertStmt *stmt)
 	qry->jointree = makeFromExpr(pstate->p_joinlist, NULL);
 
 	qry->hasSubLinks = pstate->p_hasSubLinks;
+	qry->hasFuncsWithExecRestrictions = pstate->p_hasFuncsWithExecRestrictions;
 
 	assign_query_collations(pstate, qry);
 
@@ -852,6 +926,632 @@ transformInsertRow(ParseState *pstate, List *exprlist,
 }
 
 /*
+ * If an input query (Q) mixes window functions with aggregate
+ * functions or grouping, then (per SQL:2003) we need to divide
+ * it into an outer query, Q', that contains no aggregate calls
+ * or grouping and an inner query, Q'', that contains no window
+ * calls.
+ *
+ * Q' will have a 1-entry range table whose entry corresponds to
+ * the results of Q''.
+ *
+ * Q'' will have the same range as Q and will be pushed down into
+ * a subquery range table entry in Q'.
+ *
+ * As a result, the depth of outer references in Q'' and below
+ * will increase, so we need to adjust non-zero xxxlevelsup fields
+ * (Var, Aggref, and WindowFunc nodes) in Q'' and below.  At the end,
+ * there will be no levelsup items referring to Q'.  Prior references
+ * to Q will now refer to Q''; prior references to blocks above Q will
+ * refer to the same blocks above Q'.)
+ *
+ * We do all this by creating a new Query node, subq, for Q''.  We
+ * modify the input Query node, qry, in place for Q'.  (Since qry is
+ * also the input, Q, be careful not to destroy values before we're
+ * done with them.
+ */
+static Query *
+transformGroupedWindows(ParseState *pstate, Query *qry)
+{
+	Query *subq;
+	RangeTblEntry *rte;
+	RangeTblRef *ref;
+	Alias *alias;
+	bool hadSubLinks = qry->hasSubLinks;
+
+	grouped_window_ctx ctx;
+
+	Assert(qry->commandType == CMD_SELECT);
+	Assert(!PointerIsValid(qry->utilityStmt));
+	Assert(qry->returningList == NIL);
+
+	if ( !qry->hasWindowFuncs || !(qry->groupClause || qry->hasAggs) )
+		return qry;
+
+	/* Make the new subquery (Q'').  Note that (per SQL:2003) there
+	 * can't be any window functions called in the WHERE, GROUP BY,
+	 * or HAVING clauses.
+	 */
+	subq = makeNode(Query);
+	subq->commandType = CMD_SELECT;
+	subq->querySource = QSRC_PARSER;
+	subq->canSetTag = true;
+	subq->utilityStmt = NULL;
+	subq->resultRelation = 0;
+	subq->hasAggs = qry->hasAggs;
+	subq->hasWindowFuncs = false; /* reevaluate later */
+	subq->hasSubLinks = qry->hasSubLinks; /* reevaluate later */
+
+	/* Core of subquery input table expression: */
+	subq->rtable = qry->rtable; /* before windowing */
+	subq->jointree = qry->jointree; /* before windowing */
+	subq->targetList = NIL; /* fill in later */
+
+	subq->returningList = NIL;
+	subq->groupClause = qry->groupClause; /* before windowing */
+	subq->havingQual = qry->havingQual; /* before windowing */
+	subq->windowClause = NIL; /* by construction */
+	subq->distinctClause = NIL; /* after windowing */
+	subq->sortClause = NIL; /* after windowing */
+	subq->limitOffset = NULL; /* after windowing */
+	subq->limitCount = NULL; /* after windowing */
+	subq->rowMarks = NIL;
+	subq->setOperations = NULL;
+
+	/* Check if there is a window function in the join tree. If so
+	 * we must mark hasWindowFuncs in the sub query as well.
+	 */
+	if (contain_window_function((Node *)subq->jointree))
+		subq->hasWindowFuncs = true;
+
+	/* Make the single range table entry for the outer query Q' as
+	 * a wrapper for the subquery (Q'') currently under construction.
+	 */
+	rte = makeNode(RangeTblEntry);
+	rte->rtekind = RTE_SUBQUERY;
+	rte->subquery = subq;
+	rte->alias = NULL; /* fill in later */
+	rte->eref = NULL; /* fill in later */
+	rte->inFromCl = true;
+	rte->requiredPerms = ACL_SELECT;
+	/* Default?
+	 * rte->inh = 0;
+	 * rte->checkAsUser = 0;
+	 * rte->pseudocols = 0;
+	*/
+
+	/* Make a reference to the new range table entry .
+	 */
+	ref = makeNode(RangeTblRef);
+	ref->rtindex = 1;
+
+	/* Set up context for mutating the target list.  Careful.
+	 * This is trickier than it looks.  The context will be
+	 * "primed" with grouping targets.
+	 */
+	init_grouped_window_context(&ctx, qry);
+
+    /* Begin rewriting the outer query in place.
+     */
+	qry->hasAggs = false; /* by constuction */
+	/* qry->hasSubLinks -- reevaluate later. */
+
+	/* Core of outer query input table expression: */
+	qry->rtable = list_make1(rte);
+	qry->jointree = (FromExpr *)makeNode(FromExpr);
+	qry->jointree->fromlist = list_make1(ref);
+	qry->jointree->quals = NULL;
+	/* qry->targetList -- to be mutated from Q to Q' below */
+
+	qry->groupClause = NIL; /* by construction */
+	qry->havingQual = NULL; /* by construction */
+
+	/* Mutate the Q target list and windowClauses for use in Q' and, at the
+	 * same time, update state with info needed to assemble the target list
+	 * for the subquery (Q'').
+	 */
+	qry->targetList = (List*)grouped_window_mutator((Node*)qry->targetList, &ctx);
+	qry->windowClause = (List*)grouped_window_mutator((Node*)qry->windowClause, &ctx);
+	qry->hasSubLinks = checkExprHasSubLink((Node*)qry->targetList);
+
+	/* New subquery fields
+	 */
+	subq->targetList = ctx.subtlist;
+	subq->groupClause = ctx.subgroupClause;
+
+	/* We always need an eref, but we shouldn't really need a filled in alias.
+	 * However, view deparse (or at least the fix for MPP-2189) wants one.
+	 */
+	alias = make_replacement_alias(subq, "Window");
+	rte->eref = copyObject(alias);
+	rte->alias = alias;
+
+	/* Accomodate depth change in new subquery, Q''.
+	 */
+	IncrementVarSublevelsUpInTransformGroupedWindows((Node*)subq, 1, 1);
+
+	/* Might have changed. */
+	subq->hasSubLinks = checkExprHasSubLink((Node*)subq);
+
+	Assert(PointerIsValid(qry->targetList));
+	Assert(IsA(qry->targetList, List));
+	/* Use error instead of assertion to "use" hadSubLinks and keep compiler happy. */
+	if (hadSubLinks != (qry->hasSubLinks || subq->hasSubLinks))
+		elog(ERROR, "inconsistency detected in internal grouped windows transformation");
+
+	discard_grouped_window_context(&ctx);
+
+	assign_query_collations(pstate, subq);
+
+	return qry;
+}
+
+
+/* Helper for transformGroupedWindows:
+ *
+ * Prime the subquery target list in the context with the grouping
+ * and windowing attributes from the given query and adjust the
+ * subquery group clauses in the context to agree.
+ *
+ * Note that we arrange dense sortgroupref values and stash the
+ * referents on the front of the subquery target list.  This may
+ * be over-kill, but the grouping extension code seems to like it
+ * this way.
+ *
+ * Note that we only transfer sortgrpref values associated with
+ * grouping and windowing to the subquery context.  The subquery
+ * shouldn't care about ordering, etc. XXX
+ */
+static void
+init_grouped_window_context(grouped_window_ctx *ctx, Query *qry)
+{
+	List *grp_tles;
+	List *grp_sortops;
+	List *grp_eqops;
+	ListCell *lc = NULL;
+	Index maxsgr = 0;
+
+	get_sortgroupclauses_tles(qry->groupClause, qry->targetList,
+							  &grp_tles, &grp_sortops, &grp_eqops);
+	list_free(grp_sortops);
+	maxsgr = maxSortGroupRef(grp_tles, true);
+
+	ctx->subtlist = NIL;
+	ctx->subgroupClause = NIL;
+
+	/* Set up scratch space.
+	 */
+
+	ctx->subrtable = qry->rtable;
+
+	/* Map input = outer query sortgroupref values to subquery values while building the
+	 * subquery target list prefix. */
+	ctx->sgr_map = palloc0((maxsgr+1)*sizeof(ctx->sgr_map[0]));
+	foreach (lc, grp_tles)
+	{
+	    TargetEntry *tle;
+	    Index old_sgr;
+
+	    tle = (TargetEntry*)copyObject(lfirst(lc));
+	    old_sgr = tle->ressortgroupref;
+
+	    ctx->subtlist = lappend(ctx->subtlist, tle);
+		tle->resno = list_length(ctx->subtlist);
+		tle->ressortgroupref = tle->resno;
+		tle->resjunk = false;
+
+		ctx->sgr_map[old_sgr] = tle->ressortgroupref;
+	}
+
+	/* Miscellaneous scratch area. */
+	ctx->call_depth = 0;
+	ctx->tle = NULL;
+
+	/* Revise grouping into ctx->subgroupClause */
+	ctx->subgroupClause = (List*)map_sgr_mutator((Node*)qry->groupClause, ctx);
+}
+
+
+/* Helper for transformGroupedWindows */
+static void
+discard_grouped_window_context(grouped_window_ctx *ctx)
+{
+    ctx->subtlist = NIL;
+    ctx->subgroupClause = NIL;
+    ctx->tle = NULL;
+	if (ctx->sgr_map)
+		pfree(ctx->sgr_map);
+	ctx->sgr_map = NULL;
+	ctx->subrtable = NULL;
+}
+
+
+/* Helper for transformGroupedWindows:
+ *
+ * Look for the given expression in the context's subtlist.  If
+ * none is found and the force argument is true, add a target
+ * for it.  Make and return a variable referring to the target
+ * with the matching expression, or return NULL, if no target
+ * was found/added.
+ */
+static Var *
+var_for_gw_expr(grouped_window_ctx *ctx, Node *expr, bool force)
+{
+	Var *var = NULL;
+	TargetEntry *tle = tlist_member(expr, ctx->subtlist);
+
+	if ( tle == NULL && force )
+	{
+		tle = makeNode(TargetEntry);
+		ctx->subtlist = lappend(ctx->subtlist, tle);
+		tle->expr = (Expr*)expr;
+		tle->resno = list_length(ctx->subtlist);
+		/* See comment in grouped_window_mutator for why level 3 is appropriate. */
+		if ( ctx->call_depth == 3 && ctx->tle != NULL && ctx->tle->resname != NULL )
+		{
+			tle->resname = pstrdup(ctx->tle->resname);
+		}
+		else
+		{
+			tle->resname = generate_positional_name(tle->resno);
+		}
+		tle->ressortgroupref = 0;
+		tle->resorigtbl = 0;
+		tle->resorigcol = 0;
+		tle->resjunk = false;
+	}
+
+	if (tle != NULL)
+	{
+		var = makeNode(Var);
+		var->varno = 1; /* one and only */
+		var->varattno = tle->resno; /* by construction */
+		var->vartype = exprType((Node*)tle->expr);
+		var->vartypmod = exprTypmod((Node*)tle->expr);
+		var->varcollid = exprCollation((Node*)tle->expr);
+		var->varlevelsup = 0;
+		var->varnoold = 1;
+		var->varoattno = tle->resno;
+		var->location = 0;
+	}
+
+	return var;
+}
+
+
+/* Helper for transformGroupedWindows:
+ *
+ * Mutator for subquery groupingClause to adjust sortgrpref values
+ * based on map developed while priming context target list.
+ */
+static Node*
+map_sgr_mutator(Node *node, void *context)
+{
+	grouped_window_ctx *ctx = (grouped_window_ctx*)context;
+
+	if (!node)
+		return NULL;
+
+	if (IsA(node, List))
+	{
+		ListCell *lc;
+		List *new_lst = NIL;
+
+		foreach ( lc, (List *)node)
+		{
+			Node *newnode = lfirst(lc);
+			newnode = map_sgr_mutator(newnode, ctx);
+			new_lst = lappend(new_lst, newnode);
+		}
+		return (Node*)new_lst;
+	}
+	else if (IsA(node, SortGroupClause))
+	{
+		SortGroupClause *g = (SortGroupClause *) node;
+		SortGroupClause *new_g = makeNode(SortGroupClause);
+		memcpy(new_g, g, sizeof(SortGroupClause));
+		new_g->tleSortGroupRef = ctx->sgr_map[g->tleSortGroupRef];
+		return (Node*)new_g;
+	}
+	else if (IsA(node, GroupingClause))
+	{
+		GroupingClause *gc = (GroupingClause*)node;
+		GroupingClause *new_gc = makeNode(GroupingClause);
+		memcpy(new_gc, gc, sizeof(GroupingClause));
+		new_gc->groupsets = (List*)map_sgr_mutator((Node*)gc->groupsets, ctx);
+		return (Node*)new_gc;
+	}
+
+	return NULL; /* Never happens */
+}
+
+
+
+
+/*
+ * Helper for transformGroupedWindows:
+ *
+ * Transform targets from Q into targets for Q' and place information
+ * needed to eventually construct the target list for the subquery Q''
+ * in the context structure.
+ *
+ * The general idea is to add expressions that must be evaluated in the
+ * subquery to the subquery target list (in the context) and to replace
+ * them with Var nodes in the outer query.
+ *
+ * If there are any Agg nodes in the Q'' target list, arrange
+ * to set hasAggs to true in the subquery. (This should already be
+ * done, though).
+ *
+ * If we're pushing down an entire TLE that has a resname, use
+ * it as an alias in the upper TLE, too.  Facilitate this by copying
+ * down the resname from an immediately enclosing TargetEntry, if any.
+ *
+ * The algorithm repeatedly searches the subquery target list under
+ * construction (quadric), however we don't expect many targets so
+ * we don't optimize this.  (Could, for example, use a hash or divide
+ * the target list into var, expr, and group/aggregate function lists.)
+ */
+
+static Node* grouped_window_mutator(Node *node, void *context)
+{
+	Node *result = NULL;
+
+	grouped_window_ctx *ctx = (grouped_window_ctx*)context;
+
+	if (!node)
+		return result;
+
+	ctx->call_depth++;
+
+	if (IsA(node, TargetEntry))
+	{
+		TargetEntry *tle = (TargetEntry *)node;
+		TargetEntry *new_tle = makeNode(TargetEntry);
+
+		/* Copy the target entry. */
+		new_tle->resno = tle->resno;
+		if (tle->resname == NULL )
+		{
+			new_tle->resname = generate_positional_name(new_tle->resno);
+		}
+		else
+		{
+			new_tle->resname = pstrdup(tle->resname);
+		}
+		new_tle->ressortgroupref = tle->ressortgroupref;
+		new_tle->resorigtbl = InvalidOid;
+		new_tle->resorigcol = 0;
+		new_tle->resjunk = tle->resjunk;
+
+		/* This is pretty shady, but we know our call pattern.  The target
+		 * list is at level 1, so we're interested in target entries at level
+		 * 2.  We record them in context so var_for_gw_expr can maybe make a better
+		 * than default choice of alias.
+		 */
+		if (ctx->call_depth == 2 )
+		{
+			ctx->tle = tle;
+		}
+		else
+		{
+			ctx->tle = NULL;
+		}
+
+		new_tle->expr = (Expr*)grouped_window_mutator((Node*)tle->expr, ctx);
+
+		ctx->tle = NULL;
+		result = (Node*)new_tle;
+	}
+	else if (IsA(node, Aggref) ||
+			 IsA(node, GroupingFunc) ||
+			 IsA(node, GroupId) )
+	{
+		/* Aggregation expression */
+		result = (Node*) var_for_gw_expr(ctx, node, true);
+	}
+	else if (IsA(node, Var))
+	{
+		Var *var = (Var*)node;
+
+		/* Since this is a Var (leaf node), we must be able to mutate it,
+		 * else we can't finish the transformation and must give up.
+		 */
+		result = (Node*) var_for_gw_expr(ctx, node, false);
+
+		if ( !result )
+		{
+			List *altvars = generate_alternate_vars(var, ctx);
+			ListCell *lc;
+			foreach(lc, altvars)
+			{
+				result = (Node*) var_for_gw_expr(ctx, lfirst(lc), false);
+				if ( result )
+					break;
+			}
+		}
+
+		if ( ! result )
+			ereport(ERROR,
+					(errcode(ERRCODE_WINDOWING_ERROR),
+					 errmsg("unresolved grouping key in window query"),
+					 errhint("You might need to use explicit aliases and/or to refer to grouping keys in the same way throughout the query.")));
+	}
+	else if (IsA(node, SubLink))
+	{
+		/* put the subquery into Q'' */
+		result = (Node *) var_for_gw_expr(ctx, node, true /* force */);
+	}
+	else
+	{
+		/* Grouping expression; may not find one. */
+		result = (Node*) var_for_gw_expr(ctx, node, false /* force */);
+	}
+
+
+	if ( !result )
+	{
+		result = expression_tree_mutator(node, grouped_window_mutator, ctx);
+	}
+
+	ctx->call_depth--;
+	return result;
+}
+
+/*
+ * Helper for transformGroupedWindows:
+ *
+ * Build an Alias for a subquery RTE representing the given Query.
+ * The input string aname is the name for the overall Alias. The
+ * attribute names are all found or made up.
+ */
+static Alias *
+make_replacement_alias(Query *qry, const char *aname)
+{
+	ListCell *lc = NULL;
+	 char *name = NULL;
+	Alias *alias = makeNode(Alias);
+	AttrNumber attrno = 0;
+
+	alias->aliasname = pstrdup(aname);
+	alias->colnames = NIL;
+
+	foreach(lc, qry->targetList)
+	{
+		TargetEntry *tle = (TargetEntry*)lfirst(lc);
+		attrno++;
+
+		if (tle->resname)
+		{
+			/* Prefer the target's resname. */
+			name = pstrdup(tle->resname);
+		}
+		else if ( IsA(tle->expr, Var) )
+		{
+			/* If the target expression is a Var, use the name of the
+			 * attribute in the query's range table. */
+			Var *var = (Var*)tle->expr;
+			RangeTblEntry *rte = rt_fetch(var->varno, qry->rtable);
+			name = pstrdup(get_rte_attribute_name(rte, var->varattno));
+		}
+		else
+		{
+			/* If all else, fails, generate a name based on position. */
+			name = generate_positional_name(attrno);
+		}
+
+		alias->colnames = lappend(alias->colnames, makeString(name));
+	}
+	return alias;
+}
+
+/*
+ * Helper for transformGroupedWindows:
+ *
+ * Make a palloc'd C-string named for the input attribute number.
+ */
+static char *
+generate_positional_name(AttrNumber attrno)
+{
+	int rc = 0;
+	char buf[NAMEDATALEN];
+
+	rc = snprintf(buf, sizeof(buf),
+				  "att_%d", attrno );
+	if ( rc == EOF || rc < 0 || rc >=sizeof(buf) )
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("can't generate internal attribute name")));
+	}
+	return pstrdup(buf);
+}
+
+/*
+ * Helper for transformGroupedWindows:
+ *
+ * Find alternate Vars on the range of the input query that are aliases
+ * (modulo ANSI join) of the input Var on the range and that occur in the
+ * target list of the input query.
+ *
+ * If the input Var references a join result, there will be a single
+ * alias.  If not, we need to search the range table for occurrences
+ * of the input Var in some join result's RTE and add a Var referring
+ * to the appropriate attribute of the join RTE to the list.
+ *
+ * This is not efficient, but the need is rare (MPP-12082) so we don't
+ * bother to precompute this.
+ */
+static List*
+generate_alternate_vars(Var *invar, grouped_window_ctx *ctx)
+{
+	List *rtable = ctx->subrtable;
+	RangeTblEntry *inrte;
+	List *alternates = NIL;
+
+	Assert(IsA(invar, Var));
+
+	inrte = rt_fetch(invar->varno, rtable);
+
+	if ( inrte->rtekind == RTE_JOIN )
+	{
+		Node *ja = list_nth(inrte->joinaliasvars, invar->varattno-1);
+
+		/* Though Node types other than Var (e.g., CoalesceExpr or Const) may occur
+		 * as joinaliasvars, we ignore them.
+		 */
+		if ( IsA(ja, Var) )
+		{
+			alternates = lappend(alternates, copyObject(ja));
+		}
+	}
+	else
+	{
+		ListCell *jlc;
+		Index varno = 0;
+
+		foreach (jlc, rtable)
+		{
+			RangeTblEntry *rte = (RangeTblEntry*)lfirst(jlc);
+
+			varno++; /* This RTE's varno */
+
+			if ( rte->rtekind == RTE_JOIN )
+			{
+				ListCell *alc;
+				AttrNumber attno = 0;
+
+				foreach (alc, rte->joinaliasvars)
+				{
+					ListCell *tlc;
+					Node *altnode = lfirst(alc);
+					Var *altvar = (Var*)altnode;
+
+					attno++; /* This attribute's attno in its join RTE */
+
+					if ( !IsA(altvar, Var) || !equal(invar, altvar) )
+						continue;
+
+					/* Look for a matching Var in the target list. */
+
+					foreach(tlc, ctx->subtlist)
+					{
+						TargetEntry *tle = (TargetEntry*)lfirst(tlc);
+						Var *v = (Var*)tle->expr;
+
+						if ( IsA(v, Var) && v->varno == varno && v->varattno == attno )
+						{
+							alternates = lappend(alternates, tle->expr);
+						}
+					}
+				}
+			}
+		}
+	}
+	return alternates;
+}
+
+/*
  * count_rowexpr_columns -
  *	  get number of columns contained in a ROW() expression;
  *	  return -1 if expression isn't a RowExpr or a Var referencing one.
@@ -930,7 +1630,10 @@ transformSelectStmt(ParseState *pstate, SelectStmt *stmt)
 	/* make FOR UPDATE/FOR SHARE info available to addRangeTableEntry */
 	pstate->p_locking_clause = stmt->lockingClause;
 
-	/* make WINDOW info available for window functions, too */
+	/*
+	 * Put WINDOW clause data into pstate so that window references know
+	 * about them.
+	 */
 	pstate->p_windowdefs = stmt->windowClause;
 
 	/* process the FROM clause */
@@ -950,6 +1653,13 @@ transformSelectStmt(ParseState *pstate, SelectStmt *stmt)
 	/* initial processing of HAVING clause is much like WHERE clause */
 	qry->havingQual = transformWhereClause(pstate, stmt->havingClause,
 										   EXPR_KIND_HAVING, "HAVING");
+
+    /*
+     * CDB: Untyped Const or Param nodes in a subquery in the FROM clause
+     * might have been assigned proper types when we transformed the WHERE
+     * clause, targetlist, etc.  Bring targetlist Var types up to date.
+     */
+    fixup_unknown_vars_in_targetlist(pstate, qry->targetList);
 
 	/*
 	 * Transform sorting/grouping stuff.  Do ORDER BY first because both
@@ -971,6 +1681,19 @@ transformSelectStmt(ParseState *pstate, SelectStmt *stmt)
 											EXPR_KIND_GROUP_BY,
 											false /* allow SQL92 rules */ );
 
+	/*
+	 * SCATTER BY clause on a table function TableValueExpr subquery.
+	 *
+	 * Note: a given subquery cannot have both a SCATTER clause and an INTO
+	 * clause, because both of those control distribution.  This should not
+	 * possible due to grammar restrictions on where a SCATTER clause is
+	 * allowed.
+	 */
+	Insist(!(stmt->scatterClause && stmt->intoClause));
+	qry->scatterClause = transformScatterClause(pstate,
+												stmt->scatterClause,
+												&qry->targetList);
+
 	if (stmt->distinctClause == NIL)
 	{
 		qry->distinctClause = NIL;
@@ -979,10 +1702,26 @@ transformSelectStmt(ParseState *pstate, SelectStmt *stmt)
 	else if (linitial(stmt->distinctClause) == NULL)
 	{
 		/* We had SELECT DISTINCT */
-		qry->distinctClause = transformDistinctClause(pstate,
-													  &qry->targetList,
-													  qry->sortClause,
-													  false);
+		if (!pstate->p_hasAggs && !pstate->p_hasWindowFuncs && qry->groupClause == NIL &&
+			qry->targetList != NIL)
+		{
+			/*
+			 * MPP-15040
+			 * turn distinct clause into grouping clause to make both sort-based
+			 * and hash-based grouping implementations viable plan options
+			 */
+			qry->distinctClause = transformDistinctToGroupBy(pstate,
+															 &qry->targetList,
+															 &qry->sortClause,
+															 &qry->groupClause);
+		}
+		else
+		{
+			qry->distinctClause = transformDistinctClause(pstate,
+														  &qry->targetList,
+														  qry->sortClause,
+														  false);
+		}
 		qry->hasDistinctOn = false;
 	}
 	else
@@ -1006,12 +1745,18 @@ transformSelectStmt(ParseState *pstate, SelectStmt *stmt)
 												   pstate->p_windowdefs,
 												   &qry->targetList);
 
+	processExtendedGrouping(pstate, qry->havingQual, qry->windowClause, qry->targetList);
+
 	qry->rtable = pstate->p_rtable;
 	qry->jointree = makeFromExpr(pstate->p_joinlist, qual);
 
 	qry->hasSubLinks = pstate->p_hasSubLinks;
 	qry->hasWindowFuncs = pstate->p_hasWindowFuncs;
+	qry->hasFuncsWithExecRestrictions = pstate->p_hasFuncsWithExecRestrictions;
 	qry->hasAggs = pstate->p_hasAggs;
+
+	if (pstate->p_hasTblValueExpr)
+		parseCheckTableFunctions(pstate, qry);
 
 	foreach(l, stmt->lockingClause)
 	{
@@ -1024,6 +1769,20 @@ transformSelectStmt(ParseState *pstate, SelectStmt *stmt)
 	/* this must be done after collations, for reliable comparison of exprs */
 	if (pstate->p_hasAggs || qry->groupClause || qry->havingQual)
 		parseCheckAggregates(pstate, qry);
+
+	/*
+	 * If the query mixes window functions and aggregates, we need to
+	 * transform it such that the grouped query appears as a subquery
+	 *
+	 * This must be done after collations. Because it, specifically the
+	 * grouped_window_mutator() it called, will replace some expressions with
+	 * Var and set the varcollid with the replaced expressions' original
+	 * collations, which are from assign_query_collations().
+	 *
+	 * Note: assign_query_collations() doesn't handle Var's collation.
+	 */
+	if (qry->hasWindowFuncs && (qry->groupClause || qry->hasAggs))
+		transformGroupedWindows(pstate, qry);
 
 	return qry;
 }
@@ -1060,7 +1819,7 @@ transformValuesClause(ParseState *pstate, SelectStmt *stmt)
 	Assert(stmt->whereClause == NULL);
 	Assert(stmt->groupClause == NIL);
 	Assert(stmt->havingClause == NULL);
-	Assert(stmt->windowClause == NIL);
+	Assert(stmt->scatterClause == NIL);
 	Assert(stmt->op == SETOP_NONE);
 
 	/* process the WITH clause independently of all else */
@@ -1244,6 +2003,7 @@ transformValuesClause(ParseState *pstate, SelectStmt *stmt)
 	qry->jointree = makeFromExpr(pstate->p_joinlist, NULL);
 
 	qry->hasSubLinks = pstate->p_hasSubLinks;
+	qry->hasFuncsWithExecRestrictions = pstate->p_hasFuncsWithExecRestrictions;
 
 	assign_query_collations(pstate, qry);
 
@@ -1363,6 +2123,9 @@ transformSetOperationStmt(ParseState *pstate, SelectStmt *stmt)
 	leftmostQuery = rt_fetch(leftmostRTI, pstate->p_rtable)->subquery;
 	Assert(leftmostQuery != NULL);
 
+	/* Copy transformed distribution policy to query */
+	qry->intoPolicy = leftmostQuery->intoPolicy;
+
 	/*
 	 * Generate dummy targetlist for outer query using column names of
 	 * leftmost select and common datatypes/collations of topmost set
@@ -1409,6 +2172,12 @@ transformSetOperationStmt(ParseState *pstate, SelectStmt *stmt)
 		targetnames = lappend(targetnames, makeString(colName));
 		left_tlist = lnext(left_tlist);
 	}
+
+	/*
+	 * Greenplum specific behavior:
+	 * Coerce the UNKNOWN type for target entries to its right type here.
+	 */
+	fixup_unknown_vars_in_setop(pstate, sostmt);
 
 	/*
 	 * As a first step towards supporting sort clauses that are expressions
@@ -1473,7 +2242,11 @@ transformSetOperationStmt(ParseState *pstate, SelectStmt *stmt)
 
 	qry->hasSubLinks = pstate->p_hasSubLinks;
 	qry->hasWindowFuncs = pstate->p_hasWindowFuncs;
+	qry->hasFuncsWithExecRestrictions = pstate->p_hasFuncsWithExecRestrictions;
 	qry->hasAggs = pstate->p_hasAggs;
+
+	if (pstate->p_hasTblValueExpr)
+		parseCheckTableFunctions(pstate, qry);
 
 	foreach(l, lockingClause)
 	{
@@ -1507,6 +2280,156 @@ transformSetOperationStmt(ParseState *pstate, SelectStmt *stmt)
 static Node *
 transformSetOperationTree(ParseState *pstate, SelectStmt *stmt,
 						  bool isTopLevel, List **targetlist)
+{
+	setop_types_ctx ctx;
+	Node	   *top;
+	List	   *selected_types;
+	List	   *selected_typmods;
+
+	/*
+	 * Transform all the subtrees.
+	 */
+	ctx.ncols = -1;
+	ctx.leafinfos = NULL;
+	top = transformSetOperationTree_internal(pstate, stmt, isTopLevel, &ctx);
+	Assert(ctx.ncols >= 0);
+
+	/*
+	 * We have now transformed all the subtrees, and collected all the
+	 * data types and typmods of the columns from each leaf node.
+	 *
+	 * In PostgreSQL, we also choose the result type for each subtree as we
+	 * recurse, but in GPDB, we do that here as a separate pass. That way, we
+	 * have can make the decision globally based on every leaf, rather
+	 * separately for each subtree.
+	 *
+	 * There are also some hacks to more leniently coerce between types, to
+	 * make some cases not error out.
+	 */
+	select_setop_types(pstate, &ctx, stmt->op, &selected_types, &selected_typmods);
+
+	coerceSetOpTypes(pstate, top, selected_types, selected_typmods, targetlist);
+
+	return top;
+}
+
+static void
+select_setop_types(ParseState *pstate, setop_types_ctx *ctx, SetOperation op, List **selected_types, List **selected_typmods)
+{
+	int			i;
+
+	*selected_types = NIL;
+	*selected_typmods = NIL;
+	for (i = 0; i < ctx->ncols; i++)
+	{
+		List	   *typinfos = ctx->leafinfos[i];
+		ListCell   *lci2;
+		Oid			ptype;
+		int32		ptypmod;
+		Oid			restype;
+		int32		restypmod;
+		bool		allsame, hasnontext;
+		char	   *context;
+
+		context = (op == SETOP_UNION ? "UNION" :
+				   op == SETOP_INTERSECT ? "INTERSECT" :
+				   "EXCEPT");
+		allsame = true;
+		hasnontext = false;
+		ptype = exprType(linitial(typinfos));
+		ptypmod = exprTypmod(linitial(typinfos));
+		foreach (lci2, typinfos)
+		{
+			Oid			ntype = exprType(lfirst(lci2));
+			int32		ntypmod = exprTypmod(lfirst(lci2));
+
+			/*
+			 * In the first iteration, ntype and ptype is the same element,
+			 * but we ignore it as it's not a big problem here.
+			 */
+			if (!(ntype == ptype && ntypmod == ptypmod))
+			{
+				/* if any is different, false */
+				allsame = false;
+			}
+			/*
+			 * MPP-15619 - backwards compatibility with existing view definitions.
+			 *
+			 * Historically we would cast UNKNOWN to text for most union queries,
+			 * but there are many union cases where this historical behavior
+			 * resulted in unacceptable errors (MPP-11377).
+			 * To handle this we added additional code to resolve to a
+			 * consistent cast for unions, which is generally better and
+			 * handles more cases.  However, in order to deal with backwards
+			 * compatibility we have to deliberately hamstring this code and
+			 * cast UNKNOWN to text if the other columns are STRING_TYPE
+			 * even when some other datatype (such as name) might actually
+			 * be more natural.  This captures the set of views that
+			 * we previously supported prior to the fix for MPP-11377 and
+			 * thus is the set of views that we must not treat differently.
+			 * This might be removed when we are ready to change view definition.
+			 */
+			if (ntype != UNKNOWNOID &&
+				TYPCATEGORY_STRING != TypeCategory(getBaseType(ntype)))
+				hasnontext = true;
+		}
+
+		/*
+		 * Backward compatibility; Unfortunately, we cannot change
+		 * the old behavior of the part which was working without ERROR,
+		 * mostly for the view definition. See comments above for detail.
+		 * Setting InvalidOid for this column, the column type resolution
+		 * will be falling back to the old process.
+		 */
+		if (!hasnontext)
+		{
+			restype = InvalidOid;
+			restypmod = -1;
+		}
+		else
+		{
+			/*
+			 * Even if the types are all the same, we resolve the type
+			 * by select_common_type(), which casts domains to base types.
+			 * Ideally, the domain types should be preserved, but to keep
+			 * compatibility with older GPDB views, currently we don't change it.
+			 * This restriction will be solved once upgrade/view issues get clean.
+			 * See MPP-7509 for the issue.
+			 */
+			restype = select_common_type(pstate, typinfos, context, NULL);
+			/*
+			 * If there's no common type, the last resort is TEXT.
+			 * See also select_common_type().
+			 */
+			if (restype == UNKNOWNOID)
+			{
+				restype = TEXTOID;
+				restypmod = -1;
+			}
+			else
+			{
+				/*
+				 * Essentially we preserve typmod only when all elements
+				 * are identical, otherwise default (-1).
+				 */
+				if (allsame)
+					restypmod = ptypmod;
+				else
+					restypmod = -1;
+			}
+		}
+
+		*selected_types = lappend_oid(*selected_types, restype);
+		*selected_typmods = lappend_int(*selected_typmods, restypmod);
+	}
+}
+
+
+
+
+static Node *
+transformSetOperationTree_internal(ParseState *pstate, SelectStmt *stmt,
+								   bool isTopLevel, setop_types_ctx *setop_types)
 {
 	bool		isLeaf;
 
@@ -1564,6 +2487,7 @@ transformSetOperationTree(ParseState *pstate, SelectStmt *stmt,
 		RangeTblEntry *rte PG_USED_FOR_ASSERTS_ONLY;
 		RangeTblRef *rtr;
 		ListCell   *tl;
+		int			numCols;
 
 		/*
 		 * Transform SelectStmt into a Query.
@@ -1572,7 +2496,7 @@ transformSetOperationTree(ParseState *pstate, SelectStmt *stmt,
 		 * of this sub-query, because they are not in the toplevel pstate's
 		 * namespace list.
 		 */
-		selectQuery = parse_sub_analyze((Node *) stmt, pstate, NULL, false);
+		selectQuery = parse_sub_analyze((Node *) stmt, pstate, NULL, NULL);
 
 		/*
 		 * Check for bogus references to Vars on the current query level (but
@@ -1593,15 +2517,52 @@ transformSetOperationTree(ParseState *pstate, SelectStmt *stmt,
 		/*
 		 * Extract a list of the non-junk TLEs for upper-level processing.
 		 */
-		if (targetlist)
+		numCols = 0;
+		foreach(tl, selectQuery->targetList)
 		{
-			*targetlist = NIL;
-			foreach(tl, selectQuery->targetList)
-			{
-				TargetEntry *tle = (TargetEntry *) lfirst(tl);
+			TargetEntry *tle = (TargetEntry *) lfirst(tl);
 
-				if (!tle->resjunk)
-					*targetlist = lappend(*targetlist, tle);
+			if (!tle->resjunk)
+				numCols++;
+		}
+
+		/*
+		 * Also remember the datatype of each column to the lists in
+		 * 'setop_types'.
+		 */
+		{
+			int			i;
+
+			if (setop_types->ncols == -1)
+			{
+				setop_types->ncols = numCols;
+				setop_types->leafinfos = (List **) palloc0(setop_types->ncols * sizeof(List *));
+			}
+
+			/*
+			 * It's possible that this leaf query has a different number
+			 * of columns than the previous ones. That's an error, but
+			 * we don't throw it here because we don't have the context
+			 * needed for a good error message. We don't know which
+			 * operation of the setop tree is the one where the number
+			 * of columns between the left and right branches differ.
+			 * Therefore, just return here as if nothing happened, and
+			 * we'll catch that error in the parent instead.
+			 */
+			if (numCols == setop_types->ncols)
+			{
+				i = 0;
+				foreach(tl, selectQuery->targetList)
+				{
+					TargetEntry *tle = (TargetEntry *) lfirst(tl);
+
+					if (tle->resjunk)
+						continue;
+
+					setop_types->leafinfos[i] = lappend(setop_types->leafinfos[i],
+														(Node *) tle->expr);
+					i++;
+				}
 			}
 		}
 
@@ -1629,10 +2590,6 @@ transformSetOperationTree(ParseState *pstate, SelectStmt *stmt,
 	{
 		/* Process an internal node (set operation node) */
 		SetOperationStmt *op = makeNode(SetOperationStmt);
-		List	   *ltargetlist;
-		List	   *rtargetlist;
-		ListCell   *ltl;
-		ListCell   *rtl;
 		const char *context;
 
 		context = (stmt->op == SETOP_UNION ? "UNION" :
@@ -1645,27 +2602,116 @@ transformSetOperationTree(ParseState *pstate, SelectStmt *stmt,
 		/*
 		 * Recursively transform the left child node.
 		 */
-		op->larg = transformSetOperationTree(pstate, stmt->larg,
-											 false,
-											 &ltargetlist);
+		op->larg = transformSetOperationTree_internal(pstate, stmt->larg,
+													  false, setop_types);
 
 		/*
 		 * If we are processing a recursive union query, now is the time to
 		 * examine the non-recursive term's output columns and mark the
 		 * containing CTE as having those result columns.  We should do this
 		 * only at the topmost setop of the CTE, of course.
+		 *
+		 * In PostgreSQL, transformSetOperationTree() runs as a single pass,
+		 * and we coerce the column types as we go. In GPDB, it's a two-pass
+		 * process. This function is part of the first pass, where we just
+		 * collect datatype information, and in the second pass we coerce
+		 * the targetlist of each branch of the setop tree to have compatible
+		 * types. Unfortunately, WITH RECURSIVE puts a fly in the ointment.
+		 * In order to make the columns of the WITH RECURSIVE itself visible
+		 * to the second branch of the UNION, we must fully process the first
+		 * branch before the second branch. So if this is WITH RECURSIVE,
+		 * proceed with the type coercion after processing the first branch.
+		 * We will do another coercion at the top, after processing the second
+		 * branch.
 		 */
 		if (isTopLevel &&
 			pstate->p_parent_cte &&
 			pstate->p_parent_cte->cterecursive)
+		{
+			List *ltargetlist;
+			List *selected_types;
+			List *selected_typmods;
+
+			select_setop_types(pstate, setop_types, stmt->op, &selected_types, &selected_typmods);
+
+			coerceSetOpTypes(pstate, op->larg, selected_types, selected_typmods, &ltargetlist);
+
 			determineRecursiveColTypes(pstate, op->larg, ltargetlist);
+		}
 
 		/*
 		 * Recursively transform the right child node.
 		 */
-		op->rarg = transformSetOperationTree(pstate, stmt->rarg,
-											 false,
-											 &rtargetlist);
+		op->rarg = transformSetOperationTree_internal(pstate, stmt->rarg,
+													  false, setop_types);
+
+		/*
+		 * In PostgreSQL, we select the common type for each column here.
+		 * In GPDB, we do that as a separate pass, after we have collected
+		 * information on the types of each leaf node first.
+		 */
+
+		return (Node *) op;
+	}
+}
+
+/*
+ * Label every SetOperationStmt in the tree with the given datatypes.
+ */
+static void
+coerceSetOpTypes(ParseState *pstate, Node *sop,
+				 List *preselected_coltypes, List *preselected_coltypmods,
+				 List **targetlist)
+{
+	if (IsA(sop, RangeTblRef))
+	{
+		RangeTblEntry *rte = rt_fetch((((RangeTblRef *) sop)->rtindex), pstate->p_rtable);
+		Query	   *selectQuery = rte->subquery;
+		ListCell   *tl;
+
+		/*
+		 * Extract a list of the non-junk TLEs for upper-level processing.
+		 * This is the same we did in the first pass, in
+		 * transformSetOperationTree_internal().
+		 */
+		if (targetlist)
+		{
+			*targetlist = NIL;
+			foreach(tl, selectQuery->targetList)
+			{
+				TargetEntry *tle = (TargetEntry *) lfirst(tl);
+
+				if (!tle->resjunk)
+					*targetlist = lappend(*targetlist, tle);
+			}
+		}
+		return;
+	}
+	else
+	{
+		SetOperationStmt *op = (SetOperationStmt *) sop;
+		List	   *ltargetlist;
+		List	   *rtargetlist;
+		ListCell   *ltl;
+		ListCell   *rtl;
+		ListCell   *pct;
+		ListCell   *pcm;
+		const char *context;
+
+		Assert(IsA(op, SetOperationStmt));
+
+		context = (op->op == SETOP_UNION ? "UNION" :
+				   op->op == SETOP_INTERSECT ? "INTERSECT" :
+				   "EXCEPT");
+
+		/* Recurse to determine the children's types first */
+		coerceSetOpTypes(pstate, op->larg,
+						 preselected_coltypes, preselected_coltypmods,
+						 &ltargetlist);
+
+		coerceSetOpTypes(pstate, op->rarg,
+						 preselected_coltypes, preselected_coltypmods,
+						 &rtargetlist);
 
 		/*
 		 * Verify that the two children have the same number of non-junk
@@ -1679,12 +2725,16 @@ transformSetOperationTree(ParseState *pstate, SelectStmt *stmt,
 					 parser_errposition(pstate,
 										exprLocation((Node *) rtargetlist))));
 
+		Assert(list_length(preselected_coltypes) == list_length(preselected_coltypmods));
+
 		if (targetlist)
 			*targetlist = NIL;
 		op->colTypes = NIL;
 		op->colTypmods = NIL;
 		op->colCollations = NIL;
-		op->groupClauses = NIL;
+		/* don't have a "foreach5", so chase three of the lists by hand */
+		pct = list_head(preselected_coltypes);
+		pcm = list_head(preselected_coltypmods);
 		forboth(ltl, ltargetlist, rtl, rtargetlist)
 		{
 			TargetEntry *ltle = (TargetEntry *) lfirst(ltl);
@@ -1695,23 +2745,38 @@ transformSetOperationTree(ParseState *pstate, SelectStmt *stmt,
 			Oid			rcoltype = exprType(rcolnode);
 			int32		lcoltypmod = exprTypmod(lcolnode);
 			int32		rcoltypmod = exprTypmod(rcolnode);
-			Node	   *bestexpr;
+			Node       *bestexpr = NULL;
 			int			bestlocation;
-			Oid			rescoltype;
-			int32		rescoltypmod;
+			Oid			rescoltype = pct ? lfirst_oid(pct) : InvalidOid;
+			int32		rescoltypmod = pcm ? lfirst_int(pcm) : -1;
 			Oid			rescolcoll;
 
-			/* select common type, same as CASE et al */
-			rescoltype = select_common_type(pstate,
-											list_make2(lcolnode, rcolnode),
-											context,
-											&bestexpr);
-			bestlocation = exprLocation(bestexpr);
-			/* if same type and same typmod, use typmod; else default */
-			if (lcoltype == rcoltype && lcoltypmod == rcoltypmod)
-				rescoltypmod = lcoltypmod;
+			/*
+			 * If the preprocessed coltype is InvalidOid, we fall back
+			 * to the old style type resolution for backward
+			 * compatibility. See transformSetOperationStmt for the reason.
+			 */
+			if (!OidIsValid(rescoltype))
+			{
+				/* select common type, same as CASE et al */
+				rescoltype = select_common_type(pstate,
+												list_make2(lcolnode, rcolnode),
+												context,
+												&bestexpr);
+				bestlocation = exprLocation(bestexpr);
+				/* if same type and same typmod, use typmod; else default */
+				if (lcoltype == rcoltype && lcoltypmod == rcoltypmod)
+					rescoltypmod = lcoltypmod;
+			}
 			else
-				rescoltypmod = -1;
+			{
+				/*
+				 * If we used the preselected type, arbitrarily use the left
+				 * query's expression for error reporting purposes.
+				 */
+				bestexpr = lcolnode;
+				bestlocation = exprLocation(lcolnode);
+			}
 
 			/*
 			 * Verify the coercions are actually possible.  If not, we'd fail
@@ -1784,6 +2849,9 @@ transformSetOperationTree(ParseState *pstate, SelectStmt *stmt,
 			 * For all cases except UNION ALL, identify the grouping operators
 			 * (and, if available, sorting operators) that will be used to
 			 * eliminate duplicates.
+			 *
+			 * A more logical place for this would be in the first pass, but we
+			 * can't do this until we've decided the datatypes.
 			 */
 			if (op->op != SETOP_UNION || !op->all)
 			{
@@ -1834,9 +2902,10 @@ transformSetOperationTree(ParseState *pstate, SelectStmt *stmt,
 										 false);
 				*targetlist = lappend(*targetlist, restle);
 			}
-		}
 
-		return (Node *) op;
+			pct = pct ? lnext(pct) : NULL;
+			pcm = pcm ? lnext(pcm) : NULL;
+		}
 	}
 }
 
@@ -1919,6 +2988,18 @@ transformUpdateStmt(ParseState *pstate, UpdateStmt *stmt)
 		qry->hasRecursive = stmt->withClause->recursive;
 		qry->cteList = transformWithClause(pstate, stmt->withClause);
 		qry->hasModifyingCTE = pstate->p_hasModifyingCTE;
+
+		/*
+		 * Since GPDB currently only support a single writer gang, only one
+		 * writable clause is permitted per CTE. Once we get flexible gangs
+		 * with more than one writer gang we can lift this restriction.
+		 */
+		if (pstate->p_hasModifyingCTE)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("writable CTE queries cannot be themselves writable"),
+					 errdetail("Greenplum Database currently only support CTEs with one writable clause, called in a non-writable context."),
+					 errhint("Rewrite the query to only include one writable clause.")));
 	}
 
 	qry->resultRelation = setTargetTable(pstate, stmt->relation,
@@ -1951,10 +3032,22 @@ transformUpdateStmt(ParseState *pstate, UpdateStmt *stmt)
 
 	qry->returningList = transformReturningList(pstate, stmt->returningList);
 
+    /*
+     * CDB: Untyped Const or Param nodes in a subquery in the FROM clause
+     * could have been assigned proper types when we transformed the WHERE
+     * clause or targetlist above.  Bring targetlist Var types up to date.
+     */
+    if (stmt->fromClause)
+    {
+        fixup_unknown_vars_in_targetlist(pstate, qry->targetList);
+        fixup_unknown_vars_in_targetlist(pstate, qry->returningList);
+    }
+
 	qry->rtable = pstate->p_rtable;
 	qry->jointree = makeFromExpr(pstate->p_joinlist, qual);
 
 	qry->hasSubLinks = pstate->p_hasSubLinks;
+	qry->hasFuncsWithExecRestrictions = pstate->p_hasFuncsWithExecRestrictions;
 
 	/*
 	 * Now we are done with SELECT-like processing, and can get on with
@@ -2256,6 +3349,16 @@ transformCreateTableAsStmt(ParseState *pstate, CreateTableAsStmt *stmt)
 	result->commandType = CMD_UTILITY;
 	result->utilityStmt = (Node *) stmt;
 
+	/* GPDB: Set parentStmtType to PARENTSTMTTYPE_CTAS as we know this query is for CTAS */
+	((Query*)stmt->query)->parentStmtType = PARENTSTMTTYPE_CTAS;
+
+	/*
+	 * In binary upgrade mode, we need to create materialize view in utility mode. So we
+	 * should enable the setQryDistributionPolicy function in binary upgrade mode.
+	 */
+	if (stmt->into->distributedBy && (Gp_role == GP_ROLE_DISPATCH || IsBinaryUpgrade))
+		setQryDistributionPolicy(stmt->into, (Query *)stmt->query);
+
 	return result;
 }
 
@@ -2457,6 +3560,11 @@ transformLockingClause(ParseState *pstate, Query *qry, LockingClause *lc,
 										LCS_asString(lc->strength)),
 							 parser_errposition(pstate, thisrel->location)));
 							break;
+						case RTE_TABLEFUNCTION:
+							ereport(ERROR,
+									(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									 errmsg("SELECT FOR UPDATE/SHARE cannot be applied to a table function")));
+							break;
 						case RTE_VALUES:
 							ereport(ERROR,
 									(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -2538,4 +3646,132 @@ applyLockingClause(Query *qry, Index rtindex,
 	rc->noWait = noWait;
 	rc->pushedDown = pushedDown;
 	qry->rowMarks = lappend(qry->rowMarks, rc);
+}
+
+/*
+ * Get distribute key by name.
+ *
+ * Find the distribute key in into->colNames if it is not NULL, otherwise
+ * search qry->targetList.
+ */
+static int
+get_distkey_by_name(char *key, IntoClause *into, Query *qry, bool *found)
+{
+	ListCell   *lc;
+	if (into->colNames)
+	{
+		int colindex = 1;
+		foreach(lc, into->colNames)
+		{
+			if (strcmp(strVal(lfirst(lc)), key) == 0)
+			{
+				*found = true;
+				return colindex;
+			}
+
+			colindex++;
+		}
+	}
+	else
+	{
+		foreach(lc, qry->targetList)
+		{
+			TargetEntry *tle = (TargetEntry *) lfirst(lc);
+
+			if (tle->resname && strcmp(tle->resname, key) == 0)
+			{
+				*found = true;
+				return tle->resno;
+			}
+		}
+	}
+
+	*found = false;
+	return 0;
+}
+
+/*
+ * Set Query->intoPolicy based on the DISTRIBUTED BY clause, in a
+ * CREATE TABLE AS statement.
+ *
+ * This performs some of the same checks and processing that
+ * transformDistributedBy() does for a regular CREATE TABLE. There are some
+ * differences, however:
+ *
+ * 1. We form a GpPolicy to represent the DISTRIBUTED BY clause. In a regular
+ * CREATE TABLE, we must delay doing that until DefineRelation, after we have
+ * merged inherited columns into the table definition, but with CREATE TABLE
+ * AS, it's OK, because there is no inheritance.
+ *
+ * 2. If no DISTRIBUTED BY was given explicitly, we don't try to deduce a
+ * default here. We delay that into the planner because we'll have more
+ * information available at that point (see apply_motion()).
+ */
+static void
+setQryDistributionPolicy(IntoClause *into, Query *qry)
+{
+	ListCell   *lc;
+	DistributedBy *dist;
+
+	/*
+	 * In binary upgrade mode, we need to create materialize view in utility mode. So we
+	 * should enable the setQryDistributionPolicy function in binary upgrade mode.
+	 */
+	Assert(Gp_role == GP_ROLE_DISPATCH || Gp_role == GP_ROLE_UTILITY);
+	Assert(into != NULL);
+	Assert(into->distributedBy != NULL);
+
+	dist = (DistributedBy *)into->distributedBy;
+
+	if (dist->numsegments < 0)
+		dist->numsegments = GP_POLICY_DEFAULT_NUMSEGMENTS();
+
+	/*
+	 * We have a DISTRIBUTED BY column list specified by the user
+	 * Process it now and set the distribution policy.
+	 */
+	if (list_length(dist->keyCols) > MaxPolicyAttributeNumber)
+		ereport(ERROR,
+				(errcode(ERRCODE_TOO_MANY_COLUMNS),
+				 errmsg("number of distributed by columns exceeds limit (%d)",
+						MaxPolicyAttributeNumber)));
+
+	if (dist->ptype == POLICYTYPE_REPLICATED)
+		qry->intoPolicy = createReplicatedGpPolicy(dist->numsegments);
+	else
+	{
+		List	*policykeys = NIL;
+		List	*policyopclasses = NIL;
+
+		foreach(lc, dist->keyCols)
+		{
+			IndexElem  *ielem = (IndexElem *) lfirst(lc);
+			bool		found = false;
+			int			keyindex;
+			Oid			keytype;
+			Oid			keyopclass;
+			TargetEntry *tle;
+
+			keyindex = get_distkey_by_name(ielem->name, into, qry, &found);
+			if (!found)
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_COLUMN),
+						 errmsg("column \"%s\" named in DISTRIBUTED BY "
+								"clause does not exist",
+								ielem->name)));
+
+			tle = list_nth(qry->targetList, keyindex - 1);
+
+			keytype = exprType((Node *) tle->expr);
+			keyopclass = cdb_get_opclass_for_column_def(ielem->opclass,
+														keytype);
+
+			policykeys = lappend_int(policykeys, keyindex);
+			policyopclasses = lappend_oid(policyopclasses, keyopclass);
+		}
+
+		qry->intoPolicy = createHashPartitionedPolicy(policykeys,
+													  policyopclasses,
+													  dist->numsegments);
+	}
 }

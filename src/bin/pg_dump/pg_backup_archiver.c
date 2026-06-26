@@ -311,7 +311,8 @@ RestoreArchive(Archive *AHX)
 
 		ConnectDatabase(AHX, ropt->dbname,
 						ropt->pghost, ropt->pgport, ropt->username,
-						ropt->promptPassword);
+						ropt->promptPassword,
+						false);
 
 		/*
 		 * If we're talking to the DB directly, don't send comments since they
@@ -355,7 +356,7 @@ RestoreArchive(Archive *AHX)
 	if (ropt->filename || ropt->compression)
 		SetOutput(AH, ropt->filename, ropt->compression);
 
-	ahprintf(AH, "--\n-- PostgreSQL database dump\n--\n\n");
+	ahprintf(AH, "--\n-- Greenplum Database database dump\n--\n\n");
 
 	if (AH->public.verbose)
 	{
@@ -386,11 +387,21 @@ RestoreArchive(Archive *AHX)
 	/*
 	 * Drop the items at the start, in reverse order
 	 */
-	if (ropt->dropSchema)
+	if (ropt->dropSchema || ropt->binary_upgrade)
 	{
 		for (te = AH->toc->prev; te != AH->toc; te = te->prev)
 		{
 			AH->currentTE = te;
+
+			/*
+			 * GPDB: In order to maintain the OID of the public schema during
+			 * binary upgrade, we have to drop (and recreate) it even if the
+			 * user doesn't specify --clean.
+			 */
+			if (ropt->binary_upgrade && !ropt->dropSchema &&
+				!(strcmp(te->desc, "SCHEMA") == 0 &&
+				  strcmp(te->tag, "public") == 0))
+				continue;
 
 			/*
 			 * In createDB mode, issue a DROP *only* for the database as a
@@ -623,7 +634,7 @@ RestoreArchive(Archive *AHX)
 	if (AH->public.verbose)
 		dumpTimestamp(AH, "Completed on", time(NULL));
 
-	ahprintf(AH, "--\n-- PostgreSQL database dump complete\n--\n\n");
+	ahprintf(AH, "--\n-- Greenplum Database database dump complete\n--\n\n");
 
 	/*
 	 * Clean up & we're done.
@@ -686,7 +697,8 @@ restore_toc_entry(ArchiveHandle *AH, TocEntry *te,
 		_printTocEntry(AH, te, ropt, false);
 		defnDumped = true;
 
-		if (strcmp(te->desc, "TABLE") == 0)
+		if (strcmp(te->desc, "TABLE") == 0 ||
+			strcmp(te->desc, "FOREIGN TABLE") == 0)
 		{
 			if (AH->lastErrorTE == te)
 			{
@@ -871,6 +883,10 @@ NewRestoreOptions(void)
 	opts->promptPassword = TRI_DEFAULT;
 	opts->dumpSections = DUMP_UNSECTIONED;
 
+	/* GPDB_92_MERGE_FIXEME: do we need the following two lines? */
+	opts->suppressDumpWarnings = false;
+	opts->exit_on_error = false;
+
 	return opts;
 }
 
@@ -945,6 +961,37 @@ WriteData(Archive *AHX, const void *data, size_t dLen)
 
 	return;
 }
+
+/*
+ * Amend an existing TOC entry by changing its definition. This can be used
+ * in situations where the TOC entry must be restored first, but dumped last.
+ * By first issuing the ArchiveEntry() to create a TOC with a placeholder
+ * defn, the defn can be updated with the actual contents later using this.
+ * The current usecase is binary upgrade Oid preassignment where we need to
+ * restore the preassignments before any object that allocate Oids has been
+ * created, but the definition of the preassignments can only be dumped last
+ * when we've seen all the relevant Oids.
+ */
+void
+AmendArchiveEntry(Archive *AHX, DumpId dumpId, const char *defn)
+{
+	ArchiveHandle *AH = (ArchiveHandle *) AHX;
+
+	TocEntry *toc = AH->toc;
+
+	while (toc)
+	{
+		if (toc->dumpId == dumpId)
+		{
+			if (toc->defn)
+				pg_free(toc->defn);
+			toc->defn = pg_strdup(defn);
+			return;
+		}
+		toc = toc->next;
+	}
+}
+
 
 /*
  * Create a new TOC entry. The TOC was designed as a TOC, but is now the
@@ -1703,7 +1750,7 @@ warn_or_exit_horribly(ArchiveHandle *AH,
 #ifdef NOT_USED
 
 static void
-_moveAfter(ArchiveHandle *AH, TocEntry *pos, TocEntry *te)
+			_moveAfter(ArchiveHandle *AH __attribute__((unused)), TocEntry *pos, TocEntry *te)
 {
 	/* Unlink te from list */
 	te->prev->next = te->next;
@@ -2697,6 +2744,7 @@ _tocEntryRequired(TocEntry *te, teSection curSection, RestoreOptions *ropt)
 	if (ropt->selTypes)
 	{
 		if (strcmp(te->desc, "TABLE") == 0 ||
+			strcmp(te->desc, "FOREIGN TABLE") == 0 ||
 			strcmp(te->desc, "TABLE DATA") == 0)
 		{
 			if (!ropt->selTable)
@@ -2839,6 +2887,16 @@ _tocEntryIsACL(TocEntry *te)
 static void
 _doSetFixedOutputState(ArchiveHandle *AH)
 {
+	/*
+	 * SET gp_default_storage_options GUC to built-in default values (similar
+	 * to resetAOStorageOpts function) to prevent restoring a table into a
+	 * different storage format. Note that this works assuming the built-in
+	 * default values dictated by resetAOStorageOpts function are the same
+	 * between database versions that the data is being dumped from and
+	 * restored to.
+	 */
+	ahprintf(AH, "SET gp_default_storage_options = '';\n");
+
 	/* Disable statement_timeout since restore is probably slow */
 	ahprintf(AH, "SET statement_timeout = 0;\n");
 
@@ -3184,6 +3242,7 @@ _getObjectDescription(PQExpBuffer buf, TocEntry *te, ArchiveHandle *AH)
 		strcmp(type, "CONVERSION") == 0 ||
 		strcmp(type, "DOMAIN") == 0 ||
 		strcmp(type, "TABLE") == 0 ||
+		strcmp(type, "FOREIGN TABLE") == 0 ||
 		strcmp(type, "TYPE") == 0 ||
 		strcmp(type, "FOREIGN TABLE") == 0 ||
 		strcmp(type, "TEXT SEARCH DICTIONARY") == 0 ||
@@ -3219,7 +3278,8 @@ _getObjectDescription(PQExpBuffer buf, TocEntry *te, ArchiveHandle *AH)
 		strcmp(type, "FUNCTION") == 0 ||
 		strcmp(type, "OPERATOR") == 0 ||
 		strcmp(type, "OPERATOR CLASS") == 0 ||
-		strcmp(type, "OPERATOR FAMILY") == 0)
+		strcmp(type, "OPERATOR FAMILY") == 0 ||
+		strcmp(type, "PROTOCOL") == 0)
 	{
 		/* Chop "DROP " off the front and make a modifiable copy */
 		char	   *first = pg_strdup(te->dropStmt + 5);
@@ -3255,18 +3315,13 @@ _printTocEntry(ArchiveHandle *AH, TocEntry *te, RestoreOptions *ropt, bool isDat
 {
 	/*
 	 * Avoid dumping the public schema, as it will already be created ...
-	 * unless we are using --clean mode (and *not* --create mode), in which
-	 * case we've previously issued a DROP for it so we'd better recreate it.
+	 * unless we are using --clean mode, in which case it's been deleted and
+	 * we'd better recreate it.  Likewise for its comment, if any.
 	 *
-	 * Likewise for its comment, if any.  (We could try issuing the COMMENT
-	 * command anyway; but it'd fail if the restore is done as non-super-user,
-	 * so let's not.)
-	 *
-	 * XXX it looks pretty ugly to hard-wire the public schema like this, but
-	 * it sits in a sort of no-mans-land between being a system object and a
-	 * user object, so it really is special in a way.
+	 * GPDB: we have to recreate the public schema during binary upgrade so
+	 * that we can maintain its OID from the old cluster
 	 */
-	if (!(ropt->dropSchema && !ropt->createDB))
+	if (!ropt->dropSchema && !ropt->binary_upgrade)
 	{
 		if (strcmp(te->desc, "SCHEMA") == 0 &&
 			strcmp(te->tag, "public") == 0)
@@ -3276,13 +3331,55 @@ _printTocEntry(ArchiveHandle *AH, TocEntry *te, RestoreOptions *ropt, bool isDat
 			return;
 	}
 
+#if 0
+	/*
+	 * Some items, including
+	 * CONSTRAINT, INDEX , RULE, TRIGGER, FK_CONSTRAINT
+	 * and any check constraints (if dumped separately)
+	 * must be created AFTER the data is loaded, and are in that order
+	 *
+	 * if fSpec is null, we are outputting to stdout, so we don't have the ability
+	 * to switch files
+	 */
+	if (AH->fSpec != NULL)
+	{
+		static int	secondfile = 0;
+
+		if ((!secondfile) &&
+		   (strcmp(te->desc, "CONSTRAINT") == 0 ||
+			strcmp(te->desc, "INDEX") == 0 ||
+			strcmp(te->desc, "RULE") == 0 ||
+			strcmp(te->desc, "TRIGGER") == 0 ||
+			strcmp(te->desc, "FK_CONSTRAINT") == 0))
+		{
+			OutputContext dummy =
+			{
+				NULL,			/* OF */
+				0,				/* gzOut */
+			};
+			char *secondfilename = (char *)malloc(strlen(AH->fSpec) + strlen("_after_data"));
+
+			strcpy(secondfilename,AH->fSpec);
+			strcat(secondfilename,"_after_data");
+
+			ResetOutput(AH, dummy);
+			AH->currSchema[0] = '\0';
+			/* Switch to second output file */
+			SetOutput(AH, secondfilename, false);
+			_selectTablespace(AH, "");
+			secondfile = true;
+		}
+	}
+#endif
+
 	/* Select owner, schema, and tablespace as necessary */
 	_becomeOwner(AH, te);
 	_selectOutputSchema(AH, te->namespace);
 	_selectTablespace(AH, te->tablespace);
 
 	/* Set up OID mode too */
-	if (strcmp(te->desc, "TABLE") == 0)
+	if (strcmp(te->desc, "TABLE") == 0 ||
+		strcmp(te->desc, "FOREIGN TABLE") == 0)
 		_setWithOids(AH, te);
 
 	/* Emit header comment for item */
@@ -3393,6 +3490,7 @@ _printTocEntry(ArchiveHandle *AH, TocEntry *te, RestoreOptions *ropt, bool isDat
 			strcmp(te->desc, "SCHEMA") == 0 ||
 			strcmp(te->desc, "EVENT TRIGGER") == 0 ||
 			strcmp(te->desc, "TABLE") == 0 ||
+			strcmp(te->desc, "FOREIGN TABLE") == 0 ||
 			strcmp(te->desc, "TYPE") == 0 ||
 			strcmp(te->desc, "VIEW") == 0 ||
 			strcmp(te->desc, "MATERIALIZED VIEW") == 0 ||
@@ -3401,7 +3499,8 @@ _printTocEntry(ArchiveHandle *AH, TocEntry *te, RestoreOptions *ropt, bool isDat
 			strcmp(te->desc, "TEXT SEARCH DICTIONARY") == 0 ||
 			strcmp(te->desc, "TEXT SEARCH CONFIGURATION") == 0 ||
 			strcmp(te->desc, "FOREIGN DATA WRAPPER") == 0 ||
-			strcmp(te->desc, "SERVER") == 0)
+			strcmp(te->desc, "SERVER") == 0 ||
+			strcmp(te->desc, "PROTOCOL") == 0)
 		{
 			PQExpBuffer temp = createPQExpBuffer();
 
@@ -3419,7 +3518,8 @@ _printTocEntry(ArchiveHandle *AH, TocEntry *te, RestoreOptions *ropt, bool isDat
 				 strcmp(te->desc, "INDEX") == 0 ||
 				 strcmp(te->desc, "RULE") == 0 ||
 				 strcmp(te->desc, "TRIGGER") == 0 ||
-				 strcmp(te->desc, "USER MAPPING") == 0)
+				 strcmp(te->desc, "USER MAPPING") == 0 ||
+				 strcmp(te->desc, "BINARY UPGRADE"))
 		{
 			/* these object types don't have separate owners */
 		}
@@ -3929,7 +4029,8 @@ restore_toc_entries_postfork(ArchiveHandle *AH, TocEntry *pending_list)
 	 */
 	ConnectDatabase((Archive *) AH, ropt->dbname,
 					ropt->pghost, ropt->pgport, ropt->username,
-					ropt->promptPassword);
+					ropt->promptPassword,
+					false);
 
 	/* re-establish fixed state */
 	_doSetFixedOutputState(AH);
@@ -4529,7 +4630,7 @@ CloneArchive(ArchiveHandle *AH)
 		/* this also sets clone->connection */
 		ConnectDatabase((Archive *) clone, ropt->dbname,
 						ropt->pghost, ropt->pgport, ropt->username,
-						ropt->promptPassword);
+						ropt->promptPassword, false);
 
 		/* re-establish fixed state */
 		_doSetFixedOutputState(clone);
@@ -4537,6 +4638,7 @@ CloneArchive(ArchiveHandle *AH)
 	else
 	{
 		PQExpBufferData connstr;
+		char	   *dbname;
 		char	   *pghost;
 		char	   *pgport;
 		char	   *username;
@@ -4552,13 +4654,13 @@ CloneArchive(ArchiveHandle *AH)
 		initPQExpBuffer(&connstr);
 		appendPQExpBuffer(&connstr, "dbname=");
 		appendConnStrVal(&connstr, PQdb(AH->connection));
+		dbname = PQdb(AH->connection);
 		pghost = PQhost(AH->connection);
 		pgport = PQport(AH->connection);
 		username = PQuser(AH->connection);
 
 		/* this also sets clone->connection */
-		ConnectDatabase((Archive *) clone, connstr.data,
-						pghost, pgport, username, TRI_NO);
+		ConnectDatabase((Archive *) clone, dbname, pghost, pgport, username, TRI_NO, false);
 
 		termPQExpBuffer(&connstr);
 		/* setupDumpWorker will fix up connection state */

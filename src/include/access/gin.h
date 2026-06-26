@@ -10,6 +10,14 @@
 #ifndef GIN_H
 #define GIN_H
 
+#include "access/relscan.h"
+#include "access/sdir.h"
+#include "access/xlogdefs.h"
+#include "storage/bufpage.h"
+#include "storage/off.h"
+#include "utils/rel.h"
+#include "access/genam.h"
+#include "access/itup.h"
 #include "access/xlog.h"
 #include "storage/block.h"
 #include "utils/relcache.h"
@@ -72,9 +80,11 @@ extern void ginGetStats(Relation index, GinStatsData *stats);
 extern void ginUpdateStats(Relation index, const GinStatsData *stats);
 
 /* ginxlog.c */
-extern void gin_redo(XLogRecPtr lsn, XLogRecord *record);
-extern void gin_desc(StringInfo buf, uint8 xl_info, char *rec);
+extern void gin_redo(XLogRecPtr beginLoc, XLogRecPtr lsn, XLogRecord *record);
+extern void gin_desc(StringInfo buf, XLogRecord *record);
 extern void gin_xlog_startup(void);
 extern void gin_xlog_cleanup(void);
+
+extern void gin_mask(char *pagedata, BlockNumber blkno);
 
 #endif   /* GIN_H */

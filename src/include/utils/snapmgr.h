@@ -16,7 +16,7 @@
 #include "fmgr.h"
 #include "utils/resowner.h"
 #include "utils/snapshot.h"
-
+#include "cdb/cdbtm.h"
 
 extern bool FirstSnapshotSet;
 
@@ -30,7 +30,7 @@ extern Snapshot GetLatestSnapshot(void);
 extern void SnapshotSetCommandId(CommandId curcid);
 
 extern Snapshot GetCatalogSnapshot(Oid relid);
-extern Snapshot GetNonHistoricCatalogSnapshot(Oid relid);
+extern Snapshot GetNonHistoricCatalogSnapshot(Oid relid, DtxContext distributedTransactionContext);
 extern void InvalidateCatalogSnapshot(void);
 extern void InvalidateCatalogSnapshotConditionally(void);
 
@@ -49,6 +49,9 @@ extern void UnregisterSnapshotFromOwner(Snapshot snapshot, ResourceOwner owner);
 extern void AtSubCommit_Snapshot(int level);
 extern void AtSubAbort_Snapshot(int level);
 extern void AtEOXact_Snapshot(bool isCommit);
+
+extern void LogDistributedSnapshotInfo(Snapshot snapshot, const char *prefix);
+extern DistributedSnapshotWithLocalMapping *GetCurrentDistributedSnapshotWithLocalMapping(void);
 
 extern Datum pg_export_snapshot(PG_FUNCTION_ARGS);
 extern void ImportSnapshot(const char *idstr);

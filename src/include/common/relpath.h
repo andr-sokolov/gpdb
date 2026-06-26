@@ -27,6 +27,13 @@ typedef enum ForkNumber
 	MAIN_FORKNUM = 0,
 	FSM_FORKNUM,
 	VISIBILITYMAP_FORKNUM,
+
+	/*
+	 * Init forks are used to create an initial state that can be used to
+	 * quickly revert an object back to its empty state. This is useful for
+	 * reverting unlogged tables and indexes back to their initial state during
+	 * recovery.
+	 */
 	INIT_FORKNUM
 
 	/*
@@ -70,5 +77,8 @@ extern char *GetRelationPath(Oid dbNode, Oid spcNode, Oid relNode,
 /* First argument is a RelFileNodeBackend */
 #define relpath(rnode, forknum) \
 	relpathbackend((rnode).node, (rnode).backend, forknum)
+
+#define aorelpath(rnode, segno) \
+		aorelpathbackend((rnode).node, (rnode).backend, (segno))
 
 #endif   /* RELPATH_H */

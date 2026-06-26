@@ -15,6 +15,8 @@
 
 #include "postgres.h"
 
+#include "access/genam.h"
+#include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/sysattr.h"
 #include "catalog/catalog.h"
@@ -43,6 +45,8 @@
 #include "catalog/pg_operator.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_rewrite.h"
+#include "catalog/pg_resgroup.h"
+#include "catalog/pg_resqueue.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_ts_config.h"
@@ -56,6 +60,8 @@
 #include "commands/event_trigger.h"
 #include "commands/extension.h"
 #include "commands/proclang.h"
+#include "commands/queue.h"
+#include "commands/resgroupcmds.h"
 #include "commands/tablespace.h"
 #include "commands/trigger.h"
 #include "foreign/foreign.h"
@@ -622,6 +628,16 @@ get_object_address(ObjectType objtype, List *objname, List *objargs,
 				address.objectId = get_ts_config_oid(objname, missing_ok);
 				address.objectSubId = 0;
 				break;
+		   case OBJECT_RESQUEUE:
+				address.classId = ResQueueRelationId;
+				address.objectId = get_resqueue_oid(NameListToString(objname), false);
+				address.objectSubId = 0;
+				break;
+			case OBJECT_RESGROUP:
+				address.classId = ResGroupRelationId;
+				address.objectId = GetResGroupIdForName(NameListToString(objname));
+				address.objectSubId = 0;
+				break;
 			default:
 				elog(ERROR, "unrecognized objtype: %d", (int) objtype);
 				/* placate compiler, in case it thinks elog might return */
@@ -842,7 +858,8 @@ get_relation_by_qualified_name(ObjectType objtype, List *objname,
 	address.objectSubId = 0;
 
 	relation = relation_openrv_extended(makeRangeVarFromNameList(objname),
-										lockmode, missing_ok);
+										lockmode, missing_ok,
+										false);
 	if (!relation)
 		return address;
 
@@ -1295,6 +1312,8 @@ check_object_ownership(Oid roleid, ObjectType objtype, ObjectAddress address,
 			break;
 		case OBJECT_TSPARSER:
 		case OBJECT_TSTEMPLATE:
+		case OBJECT_RESQUEUE:
+		case OBJECT_RESGROUP:
 			/* We treat these object types as being owned by superusers */
 			if (!superuser_arg(roleid))
 				ereport(ERROR,
@@ -2234,6 +2253,12 @@ getObjectDescription(const ObjectAddress *object)
 				break;
 			}
 
+		case OCLASS_COMPRESSION:
+			{
+				elog(NOTICE, "NOT YET IMPLEMENTED");
+				break;
+			}
+
 		default:
 			appendStringInfo(&buffer, "unrecognized object %u %u %d",
 							 object->classId,
@@ -2288,8 +2313,12 @@ getRelationDescription(StringInfo buffer, Oid relid)
 	switch (relForm->relkind)
 	{
 		case RELKIND_RELATION:
-			appendStringInfo(buffer, _("table %s"),
-							 relname);
+			if (relForm->relstorage == RELSTORAGE_AOROWS)
+				appendStringInfo(buffer, _("append only table %s"), relname);
+			else if (relForm->relstorage == RELSTORAGE_AOCOLS)
+				appendStringInfo(buffer, _("append only columnar table %s"), relname);
+			else
+				appendStringInfo(buffer, _("table %s"), relname);
 			break;
 		case RELKIND_INDEX:
 			appendStringInfo(buffer, _("index %s"),
@@ -2301,6 +2330,18 @@ getRelationDescription(StringInfo buffer, Oid relid)
 			break;
 		case RELKIND_TOASTVALUE:
 			appendStringInfo(buffer, _("toast table %s"),
+							 relname);
+			break;
+		case RELKIND_AOSEGMENTS:
+			appendStringInfo(buffer, _("append only file segment listing %s"),
+							 relname);
+			break;
+		case RELKIND_AOBLOCKDIR:
+			appendStringInfo(buffer, _("append only file block directory %s"),
+							 relname);
+			break;
+		case RELKIND_AOVISIMAP:
+			appendStringInfo(buffer, _("append only file visibility map %s"),
 							 relname);
 			break;
 		case RELKIND_VIEW:
