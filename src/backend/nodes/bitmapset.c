@@ -171,6 +171,69 @@ bms_equal(const Bitmapset *a, const Bitmapset *b)
 	return true;
 }
 
+
+/*
+ * bms_compare -- for sort to find groups of equal bitmapsets.
+ *
+ * See bms_equal for note on logical vs physical.  Note that the
+ * arguments are pointers to Bitmapset -- a variable length structure,
+ * thus this function is not directly usable by, e.g, qsort.
+ */
+int
+bms_compare(const Bitmapset *a, const Bitmapset *b)
+{
+	const Bitmapset *longer;
+	int			shortlen;
+	int			longlen;
+	int			sign;
+	int			i;
+
+	/* Handle cases where either input is NULL */
+	if (a == NULL)
+	{
+		if (b == NULL || bms_is_empty(b))
+			return 0;
+		return -1;
+	}
+	else if (b == NULL)
+	{
+		if (bms_is_empty(a))
+			return 0;
+		else
+			return 1;
+	}
+
+	/* Identify shorter and longer input */
+	if (a->nwords <= b->nwords)
+	{
+		shortlen = a->nwords;
+		longlen = b->nwords;
+		longer = b;
+		sign = -1;
+	}
+	else
+	{
+		shortlen = b->nwords;
+		longlen = a->nwords;
+		longer = a;
+		sign = 1;
+	}
+	/* And process */
+	for (i = 0; i < shortlen; i++)
+	{
+		if (a->words[i] < b->words[i])
+			return -1;
+		else if (a->words[i] > b->words[i])
+			return 1;
+	}
+	for (; i < longlen; i++)
+	{
+		if (longer->words[i] != 0)
+			return sign;
+	}
+	return 0;
+}
+
 /*
  * bms_make_singleton - build a bitmapset containing a single member
  */
@@ -648,6 +711,43 @@ bms_add_member(Bitmapset *a, int x)
 
 	a->words[wordnum] |= ((bitmapword) 1 << bitnum);
 	return a;
+}
+
+bool
+bms_covers_member(const Bitmapset *a, int x)
+{
+	int			wordnum;
+
+	if (x < 0)
+		elog(ERROR, "negative bitmapset member not allowed");
+	if (a == NULL)
+		return false;
+	wordnum = WORDNUM(x);
+	return (wordnum < a->nwords);
+}
+
+Bitmapset *
+bms_resize(Bitmapset *a, int wc)
+{
+	Bitmapset  *result;
+
+	if (a && a->nwords >= wc)
+		return a;
+
+	if (a)
+	{
+		result = (Bitmapset *) repalloc(a, BITMAPSET_SIZE(wc));
+		/* do not access a again */
+		MemSet(result->words + result->nwords, 0,
+			   (wc - result->nwords) * sizeof(bitmapword));
+		result->nwords = wc;
+	}
+	else
+	{
+		result = palloc0(BITMAPSET_SIZE(wc));
+		result->nwords = wc;
+	}
+	return result;
 }
 
 /*

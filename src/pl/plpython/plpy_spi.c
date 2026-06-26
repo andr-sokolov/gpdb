@@ -14,7 +14,6 @@
 #include "parser/parse_type.h"
 #include "utils/memutils.h"
 #include "utils/syscache.h"
-
 #include "plpython.h"
 
 #include "plpy_spi.h"
@@ -27,9 +26,9 @@
 #include "plpy_resultobject.h"
 
 
-static PyObject *PLy_spi_execute_query(char *query, long limit);
-static PyObject *PLy_spi_execute_plan(PyObject *ob, PyObject *list, long limit);
-static PyObject *PLy_spi_execute_fetch_result(SPITupleTable *tuptable, int rows, int status);
+static PyObject *PLy_spi_execute_query(char *query, int64 limit);
+static PyObject *PLy_spi_execute_plan(PyObject *ob, PyObject *list, int64 limit);
+static PyObject *PLy_spi_execute_fetch_result(SPITupleTable *tuptable, int64 rows, int status);
 static void PLy_spi_exception_set(PyObject *excclass, ErrorData *edata);
 
 
@@ -48,6 +47,8 @@ PLy_spi_prepare(PyObject *self, PyObject *args)
 	volatile ResourceOwner oldowner;
 	volatile int nargs;
 
+	PLy_enter_python_intepreter = false;
+
 	if (!PyArg_ParseTuple(args, "s|O", &query, &list))
 		return NULL;
 
@@ -55,11 +56,15 @@ PLy_spi_prepare(PyObject *self, PyObject *args)
 	{
 		PLy_exception_set(PyExc_TypeError,
 					   "second argument of plpy.prepare must be a sequence");
+		PLy_enter_python_intepreter = true;
 		return NULL;
 	}
 
 	if ((plan = (PLyPlanObject *) PLy_plan_new()) == NULL)
+	{
+		PLy_enter_python_intepreter = true;
 		return NULL;
+	}
 
 	nargs = list ? PySequence_Length(list) : 0;
 
@@ -162,6 +167,7 @@ PLy_spi_prepare(PyObject *self, PyObject *args)
 	PG_END_TRY();
 
 	Assert(plan->plan != NULL);
+	PLy_enter_python_intepreter = true;
 	return (PyObject *) plan;
 }
 
@@ -175,22 +181,33 @@ PLy_spi_execute(PyObject *self, PyObject *args)
 	PyObject   *plan;
 	PyObject   *list = NULL;
 	long		limit = 0;
+	PyObject   *ret;
+	PLy_enter_python_intepreter = false;
 
 	if (PyArg_ParseTuple(args, "s|l", &query, &limit))
-		return PLy_spi_execute_query(query, limit);
+	{
+		ret = PLy_spi_execute_query(query, (int64)limit);
+		PLy_enter_python_intepreter = true;
+		return ret;
+	}
 
 	PyErr_Clear();
 
 	if (PyArg_ParseTuple(args, "O|Ol", &plan, &list, &limit) &&
 		is_PLyPlanObject(plan))
-		return PLy_spi_execute_plan(plan, list, limit);
+	{
+		ret = PLy_spi_execute_plan(plan, list, (int64)limit);
+		PLy_enter_python_intepreter = true;
+		return ret;
+	}
 
 	PLy_exception_set(PLy_exc_error, "plpy.execute expected a query or a plan");
+	PLy_enter_python_intepreter = true;
 	return NULL;
 }
 
 static PyObject *
-PLy_spi_execute_plan(PyObject *ob, PyObject *list, long limit)
+PLy_spi_execute_plan(PyObject *ob, PyObject *list, int64 limit)
 {
 	volatile int nargs;
 	int			i,
@@ -260,7 +277,8 @@ PLy_spi_execute_plan(PyObject *ob, PyObject *list, long limit)
 					plan->values[j] =
 						plan->args[j].out.d.func(&(plan->args[j].out.d),
 												 -1,
-												 elem);
+												 elem,
+												 false);
 				}
 				PG_CATCH();
 				{
@@ -337,7 +355,7 @@ PLy_spi_execute_plan(PyObject *ob, PyObject *list, long limit)
 }
 
 static PyObject *
-PLy_spi_execute_query(char *query, long limit)
+PLy_spi_execute_query(char *query, int64 limit)
 {
 	int			rv;
 	volatile MemoryContext oldcontext;
@@ -379,7 +397,7 @@ PLy_spi_execute_query(char *query, long limit)
 }
 
 static PyObject *
-PLy_spi_execute_fetch_result(SPITupleTable *tuptable, int rows, int status)
+PLy_spi_execute_fetch_result(SPITupleTable *tuptable, int64 rows, int status)
 {
 	PLyResultObject *result;
 	volatile MemoryContext oldcontext;
@@ -391,15 +409,16 @@ PLy_spi_execute_fetch_result(SPITupleTable *tuptable, int rows, int status)
 	if (status > 0 && tuptable == NULL)
 	{
 		Py_DECREF(result->nrows);
-		result->nrows = PyInt_FromLong(rows);
+		/* rows is 64 bit, Python Integer holds sys.maxint = 2^63 - 1 */
+		result->nrows = PyInt_FromLong((long) rows);
 	}
 	else if (status > 0 && tuptable != NULL)
 	{
 		PLyTypeInfo args;
-		int			i;
+		int64			i;
 
 		Py_DECREF(result->nrows);
-		result->nrows = PyInt_FromLong(rows);
+		result->nrows = PyInt_FromLong((long) rows);
 		PLy_typeinfo_init(&args);
 
 		oldcontext = CurrentMemoryContext;
@@ -410,7 +429,7 @@ PLy_spi_execute_fetch_result(SPITupleTable *tuptable, int rows, int status)
 			if (rows)
 			{
 				Py_DECREF(result->rows);
-				result->rows = PyList_New(rows);
+				result->rows = PyList_New((Py_ssize_t)rows);
 
 				PLy_input_tuple_funcs(&args, tuptable->tupdesc);
 				for (i = 0; i < rows; i++)
@@ -419,7 +438,7 @@ PLy_spi_execute_fetch_result(SPITupleTable *tuptable, int rows, int status)
 														tuptable->vals[i],
 														tuptable->tupdesc);
 
-					PyList_SetItem(result->rows, i, row);
+					PyList_SetItem(result->rows, (Py_ssize_t)i, row);
 				}
 			}
 

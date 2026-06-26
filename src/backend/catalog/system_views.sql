@@ -20,7 +20,12 @@ CREATE VIEW pg_roles AS
         '********'::text as rolpassword,
         rolvaliduntil,
         setconfig as rolconfig,
-        pg_authid.oid
+		rolresqueue,
+        pg_authid.oid,
+        rolcreaterextgpfd,
+        rolcreaterexthttp,
+        rolcreatewextgpfd,
+        rolresgroup
     FROM pg_authid LEFT JOIN pg_db_role_setting s
     ON (pg_authid.oid = setrole AND setdatabase = 0);
 
@@ -574,6 +579,7 @@ CREATE VIEW pg_stat_activity AS
             S.datid AS datid,
             D.datname AS datname,
             S.pid,
+            S.sess_id,
             S.usesysid,
             U.rolname AS usename,
             S.application_name,
@@ -588,7 +594,12 @@ CREATE VIEW pg_stat_activity AS
             S.state,
             S.backend_xid,
             s.backend_xmin,
-            S.query
+            S.query,
+
+            S.waiting_reason,
+            S.rsgid,
+            S.rsgname,
+            S.rsgqueueduration
     FROM pg_database D, pg_stat_get_activity(NULL) AS S, pg_authid U
     WHERE S.datid = D.oid AND
             S.usesysid = U.oid;
@@ -615,6 +626,59 @@ CREATE VIEW pg_stat_replication AS
             pg_stat_get_wal_senders() AS W
     WHERE S.usesysid = U.oid AND
             S.pid = W.pid;
+
+CREATE FUNCTION gp_stat_get_master_replication() RETURNS SETOF RECORD AS
+$$
+    SELECT pg_catalog.gp_execution_segment() AS gp_segment_id, *
+    FROM pg_catalog.pg_stat_replication
+$$
+LANGUAGE SQL EXECUTE ON MASTER;
+
+CREATE FUNCTION gp_stat_get_segment_replication() RETURNS SETOF RECORD AS
+$$
+    SELECT pg_catalog.gp_execution_segment() AS gp_segment_id, *
+    FROM pg_catalog.pg_stat_replication
+$$
+LANGUAGE SQL EXECUTE ON ALL SEGMENTS;
+
+CREATE FUNCTION gp_stat_get_segment_replication_error() RETURNS SETOF RECORD AS
+$$
+    SELECT pg_catalog.gp_execution_segment() AS gp_segment_id, pg_catalog.gp_replication_error() as sync_error
+$$
+LANGUAGE SQL EXECUTE ON ALL SEGMENTS;
+
+CREATE VIEW gp_stat_replication AS
+    SELECT *, pg_catalog.gp_replication_error() AS sync_error
+    FROM pg_catalog.gp_stat_get_master_replication() AS R
+    (gp_segment_id integer, pid integer, usesysid oid,
+     usename name, application_name text, client_addr inet, client_hostname text,
+     client_port integer, backend_start timestamptz, backend_xmin xid, state text,
+     sent_location pg_lsn, write_location pg_lsn, flush_location pg_lsn,
+     replay_location pg_lsn, sync_priority integer, sync_state text)
+    UNION ALL
+    (
+        SELECT G.gp_segment_id
+            , R.pid, R.usesysid, R.usename, R.application_name, R.client_addr
+            , R.client_hostname, R.client_port, R.backend_start, R.backend_xmin, R.state
+	    , R.sent_location, R.write_location, R.flush_location
+	    , R.replay_location, R.sync_priority, R.sync_state, G.sync_error
+        FROM (
+            SELECT E.*
+            FROM pg_catalog.gp_segment_configuration C
+            JOIN pg_catalog.gp_stat_get_segment_replication_error()
+	    AS E (gp_segment_id integer, sync_error text)
+            ON c.content = E.gp_segment_id
+            WHERE C.role = 'm'
+        ) G
+        LEFT OUTER JOIN pg_catalog.gp_stat_get_segment_replication() AS R
+        (gp_segment_id integer, pid integer, usesysid oid,
+         usename name, application_name text, client_addr inet,
+	 client_hostname text, client_port integer, backend_start timestamptz,
+	 backend_xmin xid, state text, sent_location pg_lsn,
+	 write_location pg_lsn, flush_location pg_lsn,
+         replay_location pg_lsn, sync_priority integer, sync_state text)
+         ON G.gp_segment_id = R.gp_segment_id
+    );
 
 CREATE VIEW pg_replication_slots AS
     SELECT
@@ -653,6 +717,434 @@ CREATE VIEW pg_stat_database AS
             pg_stat_get_db_blk_write_time(D.oid) AS blk_write_time,
             pg_stat_get_db_stat_reset_time(D.oid) AS stats_reset
     FROM pg_database D;
+
+CREATE VIEW pg_stat_resqueues AS
+	SELECT
+		Q.oid AS queueid,
+		Q.rsqname AS queuename,
+		pg_stat_get_queue_num_exec(Q.oid) AS n_queries_exec,
+		pg_stat_get_queue_num_wait(Q.oid) AS n_queries_wait,
+		pg_stat_get_queue_elapsed_exec(Q.oid) AS elapsed_exec,
+		pg_stat_get_queue_elapsed_wait(Q.oid) AS elapsed_wait
+	FROM pg_resqueue AS Q;
+
+-- Resource queue views
+
+CREATE VIEW pg_resqueue_status AS
+	SELECT 
+			q.rsqname, 
+			q.rsqcountlimit, 
+			s.queuecountvalue AS rsqcountvalue,
+			q.rsqcostlimit, 
+			s.queuecostvalue AS rsqcostvalue,
+			s.queuewaiters AS rsqwaiters,
+			s.queueholders AS rsqholders
+	FROM pg_resqueue AS q 
+			INNER JOIN pg_resqueue_status() AS s 
+			(	queueid oid, 
+	 			queuecountvalue float4, 
+				queuecostvalue float4,
+				queuewaiters int4,
+				queueholders int4)
+			ON (s.queueid = q.oid);
+			
+-- External table views
+
+CREATE VIEW pg_max_external_files AS
+    SELECT   address::name as hostname, count(*) as maxfiles
+    FROM     gp_segment_configuration
+    WHERE    content >= 0 
+    AND      role='p'
+    GROUP BY address;
+
+-- partitioning
+create view pg_partitions as
+  select 
+      schemaname, 
+      tablename, 
+      partitionschemaname, 
+      partitiontablename, 
+      partitionname, 
+      parentpartitiontablename, 
+      parentpartitionname, 
+      partitiontype, 
+      partitionlevel, 
+      -- Only the non-default parts of range partitions have 
+      -- a non-null partition rank.  For these the rank is
+      -- from (1, 2, ...) in keeping with the use of RANK(n)
+      -- to identify the parts of a range partition in the 
+      -- ALTER statement.
+      case
+          when partitiontype <> 'range'::text then null::bigint
+          when partitionnodefault > 0 then partitionrank
+          when partitionrank = 0 then null::bigint
+          else partitionrank
+          end as partitionrank, 
+      partitionposition, 
+      partitionlistvalues, 
+      partitionrangestart, 
+      case
+          when partitiontype = 'range'::text then partitionstartinclusive
+          else null::boolean
+          end as partitionstartinclusive, partitionrangeend, 
+      case
+          when partitiontype = 'range'::text then partitionendinclusive
+          else null::boolean
+          end as partitionendinclusive, 
+      partitioneveryclause, 
+      parisdefault as partitionisdefault, 
+      partitionboundary,
+      parentspace as parenttablespace,
+      partspace as partitiontablespace
+  from 
+      ( 
+          select 
+              n.nspname as schemaname, 
+              cl.relname as tablename, 
+              n2.nspname as partitionschemaname, 
+              cl2.relname as partitiontablename, 
+              pr1.parname as partitionname, 
+              cl3.relname as parentpartitiontablename, 
+              pr2.parname as parentpartitionname, 
+              case
+                  when pp.parkind = 'h'::"char" then 'hash'::text
+                  when pp.parkind = 'r'::"char" then 'range'::text
+                  when pp.parkind = 'l'::"char" then 'list'::text
+                  else null::text
+                  end as partitiontype, 
+              pp.parlevel as partitionlevel, 
+              pr1.parruleord as partitionposition, 
+              case
+                  when pp.parkind != 'r'::"char" or pr1.parisdefault then null::bigint
+                  else
+                      rank() over(
+                      partition by pp.oid, cl.relname, pp.parlevel, cl3.relname
+                      order by pr1.parisdefault, pr1.parruleord) 
+                  end as partitionrank, 
+              pg_get_expr(pr1.parlistvalues, pr1.parchildrelid) as partitionlistvalues, 
+              pg_get_expr(pr1.parrangestart, pr1.parchildrelid) as partitionrangestart, 
+              pr1.parrangestartincl as partitionstartinclusive, 
+              pg_get_expr(pr1.parrangeend, pr1.parchildrelid) as partitionrangeend, 
+              pr1.parrangeendincl as partitionendinclusive, 
+              pg_get_expr(pr1.parrangeevery, pr1.parchildrelid) as partitioneveryclause, 
+              min(pr1.parruleord) over(
+                  partition by pp.oid, cl.relname, pp.parlevel, cl3.relname
+                  order by pr1.parruleord) as partitionnodefault, 
+              pr1.parisdefault, 
+              pg_get_partition_rule_def(pr1.oid, true) as partitionboundary,
+              coalesce(sp.spcname, dfltspcname) as parentspace,
+              coalesce(sp3.spcname, dfltspcname) as partspace
+          from 
+              pg_namespace n, 
+              pg_namespace n2, 
+              pg_class cl
+                  left join
+              pg_tablespace sp on cl.reltablespace = sp.oid, 
+              pg_class cl2
+                  left join
+              pg_tablespace sp3 on cl2.reltablespace = sp3.oid,
+              pg_partition pp, 
+              pg_partition_rule pr1
+                  left join 
+              pg_partition_rule pr2 on pr1.parparentrule = pr2.oid
+                  left join 
+              pg_class cl3 on pr2.parchildrelid = cl3.oid,
+              (select s.spcname
+               from pg_database, pg_tablespace s
+               where datname = current_database()
+                 and dattablespace = s.oid) d(dfltspcname)
+      where 
+          pp.paristemplate = false and 
+          pp.parrelid = cl.oid and 
+          pr1.paroid = pp.oid and 
+          cl2.oid = pr1.parchildrelid and 
+          cl.relnamespace = n.oid and 
+          cl2.relnamespace = n2.oid) p1;
+
+create view pg_partition_columns as											 
+select																		  
+n.nspname as schemaname,														
+c.relname as tablename,														 
+a.attname as columnname,														
+p.parlevel as partitionlevel,												   
+p.i + 1 as position_in_partition_key											
+from pg_namespace n,															
+pg_class c,																	 
+pg_attribute a,																 
+(select p.parrelid, p.parlevel, p.paratts[i] as attnum, i from pg_partition p,  
+ generate_series(0,															 
+				 (select max(array_upper(paratts, 1)) from pg_partition)																   
+				) i
+		where paratts[i] is not null
+) p
+where p.parrelid = c.oid and c.relnamespace = n.oid and
+   p.attnum = a.attnum and a.attrelid = c.oid;
+
+create view pg_partition_templates as
+select
+schemaname,
+tablename, 
+partitionname,
+partitiontype, 
+partitionlevel,
+-- if not a range partition, no partition rank
+-- for range partitions, the parruleord of the default partition is zero,
+-- so if no_default (min of parruleord) > 0 then there is no default partition
+-- so return the normal rank.  However, if there is a default partition, it
+-- is rank 1, so skip it, and decrement remaining ranks by 1 so the first
+-- non-default partition starts at 1
+--
+case when (partitiontype != 'range') then NULL
+	 when (partitionnodefault > 0) then partitionrank
+	 when (partitionrank = 1) then NULL
+	 else  partitionrank - 1
+end as partitionrank,
+partitionposition,
+partitionlistvalues,
+partitionrangestart,
+case when (partitiontype = 'range') then partitionstartinclusive
+	 else NULL
+end as partitionstartinclusive,
+partitionrangeend,
+case when (partitiontype = 'range') then partitionendinclusive
+	else NULL
+end as partitionendinclusive,
+partitioneveryclause,
+parisdefault as partitionisdefault,
+partitionboundary
+from (
+select
+n.nspname as schemaname,
+cl.relname as tablename,
+pr1.parname as partitionname,
+p.parlevel as partitionlevel,
+pr1.parruleord as partitionposition,
+rank() over (partition by p.oid, cl.relname, p.parlevel 
+			 order by pr1.parruleord) as partitionrank,
+pg_get_expr(pr1.parlistvalues, p.parrelid) as partitionlistvalues,
+pg_get_expr(pr1.parrangestart, p.parrelid) as partitionrangestart,
+pr1.parrangestartincl as partitionstartinclusive,
+pg_get_expr(pr1.parrangeend, p.parrelid) as partitionrangeend,
+pr1.parrangeendincl as partitionendinclusive,
+pg_get_expr(pr1.parrangeevery, p.parrelid) as partitioneveryclause,
+
+min(pr1.parruleord) over (partition by p.oid, cl.relname, p.parlevel
+	order by pr1.parruleord) as partitionnodefault,
+pr1.parisdefault,
+case when p.parkind = 'h' then 'hash' when p.parkind = 'r' then 'range'
+	 when p.parkind = 'l' then 'list' else null end as partitiontype, 
+pg_get_partition_rule_def(pr1.oid, true) as partitionboundary
+from pg_namespace n, pg_class cl, pg_partition p, pg_partition_rule pr1
+where 
+ p.parrelid = cl.oid and 
+ pr1.paroid = p.oid and
+ cl.relnamespace = n.oid and
+ p.paristemplate = 't'
+ ) p1;
+
+-- metadata tracking
+CREATE VIEW pg_stat_operations
+AS
+SELECT 
+'pg_authid' AS classname, 
+a.rolname AS objname, 
+c.objid, NULL AS schemaname,
+CASE WHEN 
+((b.oid = c.stasysid) AND (b.rolname = c.stausename) )
+THEN 'CURRENT'
+ WHEN 
+(b.rolname != c.stausename)
+THEN 'CHANGED'
+ELSE 'DROPPED' END AS usestatus, 
+CASE WHEN b.rolname IS NULL THEN c.stausename
+ELSE b.rolname END AS usename, 
+c.staactionname AS actionname, 
+c.stasubtype AS subtype,
+--
+c.statime 
+FROM 
+pg_authid a, 
+(pg_authid b FULL JOIN
+pg_stat_last_shoperation c ON ((b.oid = c.stasysid))) WHERE ((a.oid
+= c.objid) AND (c.classid = (SELECT pg_class.oid FROM pg_class WHERE
+(pg_class.relname = 'pg_authid'::name))))
+UNION 
+SELECT 
+'pg_class' AS classname, 
+a.relname AS objname, 
+c.objid,  N.nspname AS schemaname,
+CASE WHEN 
+((b.oid = c.stasysid) AND (b.rolname = c.stausename) )
+THEN 'CURRENT'
+ WHEN 
+(b.rolname != c.stausename) 
+THEN 'CHANGED'
+ELSE 'DROPPED' END AS usestatus, 
+CASE WHEN b.rolname IS NULL THEN c.stausename
+ELSE b.rolname END AS usename, 
+c.staactionname AS actionname, 
+c.stasubtype AS subtype,
+--
+c.statime 
+FROM pg_class
+a, pg_namespace n, (pg_authid b FULL JOIN 
+pg_stat_last_operation c ON ((b.oid =
+c.stasysid))) WHERE 
+a.relnamespace = n.oid AND
+((a.oid = c.objid) AND (c.classid = (SELECT
+pg_class.oid FROM pg_class WHERE ((pg_class.relname =
+'pg_class'::name) AND (pg_class.relnamespace = (SELECT
+pg_namespace.oid FROM pg_namespace WHERE (pg_namespace.nspname =
+'pg_catalog'::name)))))))
+UNION
+SELECT
+'pg_namespace' AS classname, a.nspname AS objname, 
+c.objid,  NULL AS schemaname,
+CASE WHEN 
+((b.oid = c.stasysid) AND (b.rolname = c.stausename) )
+THEN 'CURRENT'
+ WHEN 
+(b.rolname != c.stausename)
+THEN 'CHANGED'
+ELSE 'DROPPED' END AS usestatus, 
+CASE WHEN b.rolname IS NULL THEN c.stausename
+ELSE b.rolname END AS usename, 
+c.staactionname AS actionname, 
+c.stasubtype AS subtype,
+--
+c.statime
+FROM pg_namespace a, (pg_authid b FULL JOIN pg_stat_last_operation c ON
+((b.oid = c.stasysid))) WHERE ((a.oid = c.objid) AND (c.classid =
+(SELECT pg_class.oid FROM pg_class WHERE ((pg_class.relname =
+'pg_namespace'::name) AND (pg_class.relnamespace = (SELECT
+pg_namespace.oid FROM pg_namespace WHERE (pg_namespace.nspname =
+'pg_catalog'::name)))))))
+UNION
+SELECT
+'pg_database' AS classname, a.datname AS objname, 
+c.objid,  NULL AS schemaname,
+CASE WHEN 
+((b.oid = c.stasysid) AND (b.rolname = c.stausename) )
+THEN 'CURRENT'
+ WHEN 
+(b.rolname != c.stausename)
+THEN 'CHANGED'
+ELSE 'DROPPED' END AS usestatus, 
+CASE WHEN b.rolname IS NULL THEN c.stausename
+ELSE b.rolname END AS usename, 
+c.staactionname AS actionname, 
+c.stasubtype AS subtype,
+--
+c.statime
+FROM pg_database a, (pg_authid b FULL JOIN pg_stat_last_shoperation c ON
+((b.oid = c.stasysid))) WHERE ((a.oid = c.objid) AND (c.classid =
+(SELECT pg_class.oid FROM pg_class WHERE ((pg_class.relname =
+'pg_database'::name) AND (pg_class.relnamespace = (SELECT
+pg_namespace.oid FROM pg_namespace WHERE (pg_namespace.nspname =
+'pg_catalog'::name)))))))
+UNION 
+SELECT
+'pg_tablespace' AS classname, a.spcname AS objname, 
+c.objid,  NULL AS schemaname,
+CASE WHEN 
+((b.oid = c.stasysid) AND (b.rolname = c.stausename) )
+THEN 'CURRENT'
+ WHEN 
+(b.rolname != c.stausename)
+THEN 'CHANGED'
+ELSE 'DROPPED' END AS usestatus, 
+CASE WHEN b.rolname IS NULL THEN c.stausename
+ELSE b.rolname END AS usename, 
+c.staactionname AS actionname, 
+c.stasubtype AS subtype,
+--
+c.statime
+FROM pg_tablespace a, (pg_authid b FULL JOIN pg_stat_last_shoperation c ON
+((b.oid = c.stasysid))) WHERE ((a.oid = c.objid) AND (c.classid =
+(SELECT pg_class.oid FROM pg_class WHERE ((pg_class.relname =
+'pg_tablespace'::name) AND (pg_class.relnamespace = (SELECT
+pg_namespace.oid FROM pg_namespace WHERE (pg_namespace.nspname =
+'pg_catalog'::name)))))))
+UNION
+SELECT 'pg_resqueue' AS classname,
+a.rsqname as objname,
+c.objid, NULL AS schemaname,
+CASE WHEN 
+((b.oid = c.stasysid) AND (b.rolname = c.stausename) )
+THEN 'CURRENT'
+ WHEN 
+(b.rolname != c.stausename)
+THEN 'CHANGED'
+ELSE 'DROPPED' END AS usestatus, 
+CASE WHEN b.rolname IS NULL THEN c.stausename
+ELSE b.rolname END AS usename, 
+c.staactionname AS actionname, 
+c.stasubtype AS subtype,
+--
+c.statime 
+FROM pg_resqueue a, (pg_authid
+b FULL JOIN pg_stat_last_shoperation c ON ((b.oid = c.stasysid)))
+WHERE ((a.oid = c.objid) AND (c.classid = (SELECT pg_class.oid FROM
+pg_class WHERE ((pg_class.relname = 'pg_resqueue'::name) AND
+(pg_class.relnamespace = (SELECT pg_namespace.oid FROM pg_namespace
+WHERE (pg_namespace.nspname = 'pg_catalog'::name))))))) ORDER BY 9;
+
+CREATE VIEW
+pg_stat_partition_operations
+AS
+SELECT pso.*,
+CASE WHEN  pr.parlevel IS NOT NULL 
+THEN pr.parlevel 
+ELSE pr2.parlevel END AS partitionlevel,
+pcns.relname AS parenttablename,
+pcns.nspname AS parentschemaname,
+pr.parrelid AS parent_relid
+FROM
+(pg_stat_operations pso
+LEFT OUTER JOIN
+pg_partition_rule ppr
+ON pso.objid=ppr.parchildrelid
+LEFT OUTER JOIN
+pg_partition pr
+ON pr.oid = ppr.paroid) LEFT OUTER JOIN 
+--
+-- only want lowest parlevel for parenttable
+--
+(SELECT MIN(parlevel) AS parlevel, parrelid FROM 
+pg_partition prx GROUP BY parrelid ) AS pr2
+ON pr2.parrelid = pso.objid
+LEFT OUTER JOIN 
+( SELECT pc.oid, * FROM pg_class AS pc FULL JOIN pg_namespace AS ns 
+ON ns.oid = pc.relnamespace) AS pcns
+ON pcns.oid = pr.parrelid
+;
+
+-- MPP-7807: show all resqueue attributes
+CREATE VIEW pg_resqueue_attributes AS
+SELECT rsqname, 'active_statements' AS resname,
+rsqcountlimit::text AS ressetting,
+1 AS restypid FROM pg_resqueue
+UNION
+SELECT rsqname, 'max_cost' AS resname,
+rsqcostlimit::text AS ressetting,
+2 AS restypid FROM pg_resqueue
+UNION
+SELECT rsqname, 'cost_overcommit' AS resname,
+case when rsqovercommit then '1'
+else '0' end AS ressetting,
+4 AS restypid FROM pg_resqueue
+UNION
+SELECT rsqname, 'min_cost' AS resname,
+rsqignorecostlimit::text AS ressetting,
+3 AS restypid FROM pg_resqueue
+UNION
+SELECT rq.rsqname , rt.resname, rc.ressetting,
+rt.restypid AS restypid FROM
+pg_resqueue rq, pg_resourcetype rt,
+pg_resqueuecapability rc WHERE
+rq.oid=rc.resqueueid AND rc.restypid = rt.restypid
+ORDER BY rsqname, restypid
+;
 
 CREATE VIEW pg_stat_database_conflicts AS
     SELECT
@@ -861,6 +1353,13 @@ LANGUAGE INTERNAL
 VOLATILE ROWS 1000 COST 1000
 AS 'pg_logical_slot_peek_binary_changes';
 
+CREATE OR REPLACE FUNCTION pg_create_physical_replication_slot(
+    IN slot_name name, IN immediately_reserve boolean DEFAULT false,
+    OUT slot_name name, OUT xlog_position pg_lsn)
+RETURNS RECORD
+LANGUAGE INTERNAL
+AS 'pg_create_physical_replication_slot';
+
 CREATE OR REPLACE FUNCTION
   make_interval(years int4 DEFAULT 0, months int4 DEFAULT 0, weeks int4 DEFAULT 0,
                 days int4 DEFAULT 0, hours int4 DEFAULT 0, mins int4 DEFAULT 0,
@@ -869,3 +1368,16 @@ RETURNS interval
 LANGUAGE INTERNAL
 STRICT IMMUTABLE
 AS 'make_interval';
+
+-- pg_tablespace_location wrapper functions to see Greenplum cluster-wide tablespace locations
+CREATE FUNCTION gp_tablespace_segment_location (IN tblspc_oid oid, OUT gp_segment_id int, OUT tblspc_loc text)
+AS 'SELECT pg_catalog.gp_execution_segment() as gp_segment_id, * FROM pg_catalog.pg_tablespace_location($1)'
+LANGUAGE SQL EXECUTE ON ALL SEGMENTS;
+
+CREATE FUNCTION gp_tablespace_location (IN tblspc_oid oid, OUT gp_segment_id int, OUT tblspc_loc text)
+RETURNS SETOF RECORD
+AS
+  'SELECT * FROM pg_catalog.gp_tablespace_segment_location($1)
+   UNION ALL
+   SELECT pg_catalog.gp_execution_segment() as gp_segment_id, * FROM pg_catalog.pg_tablespace_location($1)'
+LANGUAGE SQL EXECUTE ON MASTER;

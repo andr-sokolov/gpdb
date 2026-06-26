@@ -20,6 +20,7 @@
 
 #include "postgres.h"
 
+#include "access/heapam.h"
 #include "access/tuptoaster.h"
 #include "executor/tstoreReceiver.h"
 
@@ -124,11 +125,11 @@ tstoreReceiveSlot_detoast(TupleTableSlot *slot, DestReceiver *self)
 	nfree = 0;
 	for (i = 0; i < natts; i++)
 	{
-		Datum		val = slot->tts_values[i];
+		Datum		val = slot_get_values(slot)[i];
 
 		if (!attrs[i]->attisdropped &&
 			attrs[i]->attlen == -1 &&
-			!slot->tts_isnull[i])
+			!slot_get_isnull(slot)[i])
 		{
 			if (VARATT_IS_EXTERNAL(DatumGetPointer(val)))
 			{
@@ -146,7 +147,7 @@ tstoreReceiveSlot_detoast(TupleTableSlot *slot, DestReceiver *self)
 	 */
 	oldcxt = MemoryContextSwitchTo(myState->cxt);
 	tuplestore_putvalues(myState->tstore, typeinfo,
-						 myState->outvalues, slot->tts_isnull);
+						 myState->outvalues, slot_get_isnull(slot));
 	MemoryContextSwitchTo(oldcxt);
 
 	/* And release any temporary detoasted values */

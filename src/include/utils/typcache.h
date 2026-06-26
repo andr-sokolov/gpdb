@@ -108,6 +108,8 @@ typedef struct TypeCacheEntry
 #define TYPECACHE_HASH_OPFAMILY		0x0400
 #define TYPECACHE_RANGE_INFO		0x0800
 
+extern int32 NextRecordTypmod;
+
 extern TypeCacheEntry *lookup_type_cache(Oid type_id, int flags);
 
 extern TupleDesc lookup_rowtype_tupdesc(Oid type_id, int32 typmod);
@@ -120,5 +122,7 @@ extern TupleDesc lookup_rowtype_tupdesc_copy(Oid type_id, int32 typmod);
 extern void assign_record_type_typmod(TupleDesc tupDesc);
 
 extern int	compare_values_of_enum(TypeCacheEntry *tcache, Oid arg1, Oid arg2);
+
+extern List *build_tuple_node_list(int start);
 
 #endif   /* TYPCACHE_H */

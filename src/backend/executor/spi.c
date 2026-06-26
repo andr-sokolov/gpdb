@@ -33,7 +33,16 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
-
+#include "utils/resource_manager.h"
+#include "utils/resscheduler.h"
+#include "cdb/cdbvars.h"
+#include "miscadmin.h"
+#include "postmaster/autostats.h" /* auto_stats() */
+#include "catalog/namespace.h"
+#include "catalog/pg_namespace.h"
+#include "executor/functions.h"
+#include "cdb/memquota.h"
+#include "parser/analyze.h"
 
 /*
  * These global variables are part of the API for various SPI functions
@@ -41,7 +50,7 @@
  * interference between different SPI callers, we save and restore them
  * when entering/exiting a SPI nesting level.
  */
-uint32		SPI_processed = 0;
+uint64		SPI_processed = 0;
 Oid			SPI_lastoid = InvalidOid;
 SPITupleTable *SPI_tuptable = NULL;
 int			SPI_result = 0;
@@ -61,17 +70,19 @@ static void _SPI_prepare_oneshot_plan(const char *src, SPIPlanPtr plan);
 
 static int _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI,
 				  Snapshot snapshot, Snapshot crosscheck_snapshot,
-				  bool read_only, bool fire_triggers, long tcount);
+				  bool read_only, bool fire_triggers, int64 tcount);
 
 static ParamListInfo _SPI_convert_params(int nargs, Oid *argtypes,
 					Datum *Values, const char *Nulls);
 
-static int	_SPI_pquery(QueryDesc *queryDesc, bool fire_triggers, long tcount);
+static void _SPI_assign_query_mem(QueryDesc *queryDesc);
+
+static int	_SPI_pquery(QueryDesc *queryDesc, bool fire_triggers, int64 tcount);
 
 static void _SPI_error_callback(void *arg);
 
 static void _SPI_cursor_operation(Portal portal,
-					  FetchDirection direction, long count,
+					  FetchDirection direction, int64 count,
 					  DestReceiver *dest);
 
 static SPIPlanPtr _SPI_make_plan_non_temp(SPIPlanPtr plan);
@@ -395,7 +406,7 @@ SPI_restore_connection(void)
 
 /* Parse, plan, and execute a query string */
 int
-SPI_execute(const char *src, bool read_only, long tcount)
+SPI_execute(const char *src, bool read_only, int64 tcount)
 {
 	_SPI_plan	plan;
 	int			res;
@@ -423,7 +434,7 @@ SPI_execute(const char *src, bool read_only, long tcount)
 
 /* Obsolete version of SPI_execute */
 int
-SPI_exec(const char *src, long tcount)
+SPI_exec(const char *src, int64 tcount)
 {
 	return SPI_execute(src, false, tcount);
 }
@@ -431,7 +442,7 @@ SPI_exec(const char *src, long tcount)
 /* Execute a previously prepared plan */
 int
 SPI_execute_plan(SPIPlanPtr plan, Datum *Values, const char *Nulls,
-				 bool read_only, long tcount)
+				 bool read_only, int64 tcount)
 {
 	int			res;
 
@@ -457,7 +468,7 @@ SPI_execute_plan(SPIPlanPtr plan, Datum *Values, const char *Nulls,
 
 /* Obsolete version of SPI_execute_plan */
 int
-SPI_execp(SPIPlanPtr plan, Datum *Values, const char *Nulls, long tcount)
+SPI_execp(SPIPlanPtr plan, Datum *Values, const char *Nulls, int64 tcount)
 {
 	return SPI_execute_plan(plan, Values, Nulls, false, tcount);
 }
@@ -501,7 +512,7 @@ int
 SPI_execute_snapshot(SPIPlanPtr plan,
 					 Datum *Values, const char *Nulls,
 					 Snapshot snapshot, Snapshot crosscheck_snapshot,
-					 bool read_only, bool fire_triggers, long tcount)
+					 bool read_only, bool fire_triggers, int64 tcount)
 {
 	int			res;
 
@@ -535,7 +546,7 @@ int
 SPI_execute_with_args(const char *src,
 					  int nargs, Oid *argtypes,
 					  Datum *Values, const char *Nulls,
-					  bool read_only, long tcount)
+					  bool read_only, int64 tcount)
 {
 	int			res;
 	_SPI_plan	plan;
@@ -558,6 +569,15 @@ SPI_execute_with_args(const char *src,
 	plan.argtypes = argtypes;
 	plan.parserSetup = NULL;
 	plan.parserSetupArg = NULL;
+
+	/*
+	 * Add this to be compatible with current version of GPDB
+	 *
+	 * TODO: Remove it after the related codes are backported
+	 *		 from upstream, e.g. plan.query is to be assigned
+	 *		 in _SPI_prepare_plan
+	 */
+	plan.plancxt = NULL;
 
 	paramLI = _SPI_convert_params(nargs, argtypes,
 								  Values, Nulls);
@@ -830,7 +850,6 @@ SPI_modifytuple(Relation rel, HeapTuple tuple, int natts, int *attnum,
 		 */
 		mtuple->t_data->t_ctid = tuple->t_data->t_ctid;
 		mtuple->t_self = tuple->t_self;
-		mtuple->t_tableOid = tuple->t_tableOid;
 		if (rel->rd_att->tdhasoid)
 			HeapTupleSetOid(mtuple, HeapTupleGetOid(tuple));
 	}
@@ -933,7 +952,7 @@ SPI_getbinval(HeapTuple tuple, TupleDesc tupdesc, int fnumber, bool *isnull)
 	{
 		SPI_result = SPI_ERROR_NOATTRIBUTE;
 		*isnull = true;
-		return (Datum) NULL;
+		return (Datum) 0;
 	}
 
 	return heap_getattr(tuple, fnumber, tupdesc, isnull);
@@ -1171,6 +1190,15 @@ SPI_cursor_open_with_args(const char *name,
 	plan.parserSetup = NULL;
 	plan.parserSetupArg = NULL;
 
+	/*
+	 * Add this to be compatible with current version of GPDB
+	 *
+	 * TODO: Remove it after the related codes are backported
+	 *		 from upstream, e.g. plan.query is to be assigned
+	 *		 in _SPI_prepare_plan
+	 */
+	plan.plancxt = NULL;
+
 	/* build transient ParamListInfo in executor context */
 	paramLI = _SPI_convert_params(nargs, argtypes,
 								  Values, Nulls);
@@ -1219,6 +1247,7 @@ SPI_cursor_open_internal(const char *name, SPIPlanPtr plan,
 	CachedPlan *cplan;
 	List	   *stmt_list;
 	char	   *query_string;
+	ListCell   *lc;
 	Snapshot	snapshot;
 	MemoryContext oldcontext;
 	Portal		portal;
@@ -1288,8 +1317,16 @@ SPI_cursor_open_internal(const char *name, SPIPlanPtr plan,
 	 */
 
 	/* Replan if needed, and increment plan refcount for portal */
-	cplan = GetCachedPlan(plansource, paramLI, false);
+	cplan = GetCachedPlan(plansource, paramLI, false, NULL);
 	stmt_list = cplan->stmt_list;
+
+	/* GPDB: Mark all queries as SPI inner queries for extension usage */
+	foreach(lc, stmt_list)
+	{
+		Node *stmt = (Node *) lfirst(lc);
+		if (IsA(stmt, PlannedStmt))
+			((PlannedStmt*)stmt)->metricsQueryType = SPI_INNER_QUERY;
+	}
 
 	/* Pop the error context stack */
 	error_context_stack = spierrcontext.previous;
@@ -1315,6 +1352,7 @@ SPI_cursor_open_internal(const char *name, SPIPlanPtr plan,
 	PortalDefineQuery(portal,
 					  NULL,		/* no statement name */
 					  query_string,
+					  T_SelectStmt,
 					  plansource->commandTag,
 					  stmt_list,
 					  cplan);
@@ -1334,6 +1372,11 @@ SPI_cursor_open_internal(const char *name, SPIPlanPtr plan,
 		else
 			portal->cursorOptions |= CURSOR_OPT_NO_SCROLL;
 	}
+
+	/*
+	 * Greenplum Database needs this
+	 */
+	portal->is_extended_query = true;
 
 	/*
 	 * Disallow SCROLL with SELECT FOR UPDATE.  This is not redundant with the
@@ -1399,7 +1442,7 @@ SPI_cursor_open_internal(const char *name, SPIPlanPtr plan,
 	/*
 	 * Start portal execution.
 	 */
-	PortalStart(portal, paramLI, 0, snapshot);
+	PortalStart(portal, paramLI, 0, snapshot, NULL);
 
 	Assert(portal->strategy != PORTAL_MULTI_QUERY);
 
@@ -1432,7 +1475,7 @@ void
 SPI_cursor_fetch(Portal portal, bool forward, long count)
 {
 	_SPI_cursor_operation(portal,
-						  forward ? FETCH_FORWARD : FETCH_BACKWARD, count,
+						  forward ? FETCH_FORWARD : FETCH_BACKWARD, (int64) count,
 						  CreateDestReceiver(DestSPI));
 	/* we know that the DestSPI receiver doesn't need a destroy call */
 }
@@ -1447,7 +1490,7 @@ void
 SPI_cursor_move(Portal portal, bool forward, long count)
 {
 	_SPI_cursor_operation(portal,
-						  forward ? FETCH_FORWARD : FETCH_BACKWARD, count,
+						  forward ? FETCH_FORWARD : FETCH_BACKWARD, (int64) count,
 						  None_Receiver);
 }
 
@@ -1461,7 +1504,7 @@ void
 SPI_scroll_cursor_fetch(Portal portal, FetchDirection direction, long count)
 {
 	_SPI_cursor_operation(portal,
-						  direction, count,
+						  direction, (int64) count,
 						  CreateDestReceiver(DestSPI));
 	/* we know that the DestSPI receiver doesn't need a destroy call */
 }
@@ -1475,7 +1518,7 @@ SPI_scroll_cursor_fetch(Portal portal, FetchDirection direction, long count)
 void
 SPI_scroll_cursor_move(Portal portal, FetchDirection direction, long count)
 {
-	_SPI_cursor_operation(portal, direction, count, None_Receiver);
+	_SPI_cursor_operation(portal, direction, (int64) count, None_Receiver);
 }
 
 
@@ -1704,7 +1747,7 @@ SPI_plan_get_cached_plan(SPIPlanPtr plan)
 	error_context_stack = &spierrcontext;
 
 	/* Get the generic plan for the query */
-	cplan = GetCachedPlan(plansource, NULL, plan->saved);
+	cplan = GetCachedPlan(plansource, NULL, plan->saved, NULL);
 	Assert(cplan == plansource->gplan);
 
 	/* Pop the error context stack */
@@ -1807,7 +1850,7 @@ spi_printtup(TupleTableSlot *slot, DestReceiver *self)
 	}
 
 	tuptable->vals[tuptable->alloced - tuptable->free] =
-		ExecCopySlotTuple(slot);
+		ExecCopySlotHeapTuple(slot);
 	(tuptable->free)--;
 
 	MemoryContextSwitchTo(oldcxt);
@@ -1874,7 +1917,9 @@ _SPI_prepare_plan(const char *src, SPIPlanPtr plan)
 		 * Parameter datatypes are driven by parserSetup hook if provided,
 		 * otherwise we use the fixed parameter list.
 		 */
-		if (plan->parserSetup != NULL)
+		if (parsetree == NULL)
+			stmt_list = NIL;
+		else if (plan->parserSetup != NULL)
 		{
 			Assert(plan->nargs == 0);
 			stmt_list = pg_analyze_and_rewrite_params(parsetree,
@@ -1890,10 +1935,24 @@ _SPI_prepare_plan(const char *src, SPIPlanPtr plan)
 											   plan->nargs);
 		}
 
+		/* Check that all the queries are safe to execute on QE. */
+		if (Gp_role == GP_ROLE_EXECUTE)
+		{
+			ListCell *lc;
+
+			foreach (lc, stmt_list)
+			{
+				Query *query = (Query *) lfirst(lc);
+
+				querytree_safe_for_qe((Node *) query);
+			}
+		}
+
 		/* Finish filling in the CachedPlanSource */
 		CompleteCachedPlan(plansource,
 						   stmt_list,
 						   NULL,
+						   nodeTag(parsetree),
 						   plan->argtypes,
 						   plan->nargs,
 						   plan->parserSetup,
@@ -1993,10 +2052,10 @@ _SPI_prepare_oneshot_plan(const char *src, SPIPlanPtr plan)
 static int
 _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI,
 				  Snapshot snapshot, Snapshot crosscheck_snapshot,
-				  bool read_only, bool fire_triggers, long tcount)
+				  bool read_only, bool fire_triggers, int64 tcount)
 {
 	int			my_res = 0;
-	uint32		my_processed = 0;
+	uint64		my_processed = 0;
 	Oid			my_lastoid = InvalidOid;
 	SPITupleTable *my_tuptable = NULL;
 	int			res = 0;
@@ -2086,10 +2145,24 @@ _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI,
 												   plan->nargs);
 			}
 
+			/* Check that all the queries are safe to execute on QE. */
+			if (Gp_role == GP_ROLE_EXECUTE)
+			{
+				ListCell *lc;
+
+				foreach (lc, stmt_list)
+				{
+					Query *query = (Query *) lfirst(lc);
+
+					querytree_safe_for_qe((Node *) query);
+				}
+			}
+
 			/* Finish filling in the CachedPlanSource */
 			CompleteCachedPlan(plansource,
 							   stmt_list,
 							   NULL,
+							   nodeTag(parsetree),
 							   plan->argtypes,
 							   plan->nargs,
 							   plan->parserSetup,
@@ -2102,7 +2175,7 @@ _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI,
 		 * Replan if needed, and increment plan refcount.  If it's a saved
 		 * plan, the refcount must be backed by the CurrentResourceOwner.
 		 */
-		cplan = GetCachedPlan(plansource, paramLI, plan->saved);
+		cplan = GetCachedPlan(plansource, paramLI, plan->saved, NULL);
 		stmt_list = cplan->stmt_list;
 
 		/*
@@ -2129,7 +2202,10 @@ _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI,
 
 			if (IsA(stmt, PlannedStmt))
 			{
-				canSetTag = ((PlannedStmt *) stmt)->canSetTag;
+				PlannedStmt* pstmt = (PlannedStmt *) stmt;
+				canSetTag = pstmt->canSetTag;
+				/* GPDB: Mark all queries as SPI inner query for extension usage */
+				((PlannedStmt*)pstmt)->metricsQueryType = SPI_INNER_QUERY;
 			}
 			else
 			{
@@ -2354,12 +2430,46 @@ _SPI_convert_params(int nargs, Oid *argtypes,
 	return paramLI;
 }
 
+/*
+ * Assign memory for a query before executing through SPI.
+ * There are two possibilities:
+ *   1. We're not in a function scan. We calculate the
+ * 	    query's limit using the queue.
+ *   2. We're inside a function scan. We use the memory
+ *      allocated to the function scan operator.
+ *
+ */
+static void
+_SPI_assign_query_mem(QueryDesc * queryDesc)
+{
+	if (Gp_role == GP_ROLE_DISPATCH
+		&& ActivePortal
+		&& !IsResManagerMemoryPolicyNone())
+	{
+		if (!SPI_IsMemoryReserved())
+		{
+			queryDesc->plannedstmt->query_mem =
+				ResourceManagerGetQueryMemoryLimit(queryDesc->plannedstmt);
+		}
+		else
+		{
+			queryDesc->plannedstmt->query_mem = SPI_GetMemoryReservation();
+		}
+		/*
+		 * queryDesc->plannedstmt->query_mem(uint64) can be 0 here.
+		 * And in such cases it will use work_mem to run the query.
+		 * */
+	}
+}
+
 static int
-_SPI_pquery(QueryDesc *queryDesc, bool fire_triggers, long tcount)
+_SPI_pquery(QueryDesc *queryDesc, bool fire_triggers, int64 tcount)
 {
 	int			operation = queryDesc->operation;
 	int			eflags;
 	int			res;
+
+	_SPI_assign_query_mem(queryDesc);
 
 	switch (operation)
 	{
@@ -2372,6 +2482,40 @@ _SPI_pquery(QueryDesc *queryDesc, bool fire_triggers, long tcount)
 			}
 			else
 				res = SPI_OK_SELECT;
+
+			/* 
+			 * Checking if we need to put this through resource queue.
+			 * If the Active portal already hold a lock on the queue, we cannot
+			 * acquire it again.
+			 */
+			if (Gp_role == GP_ROLE_DISPATCH && IsResQueueEnabled() && !superuser())
+			{
+				/*
+				 * This is SELECT, so we should have planTree anyway.
+				 */
+				Assert(queryDesc->plannedstmt->planTree);
+
+				/* 
+				 * MPP-6421 - An active portal may not yet be defined if we're
+				 * constant folding a stable or volatile function marked as
+				 * immutable -- a hack some customers use for partition pruning.
+				 *
+				 * MPP-16571 - Don't warn about such an event because there are
+				 * legitimate parts of the code where we evaluate stable and
+				 * volatile functions without an active portal -- describe
+				 * functions for table functions, for example.
+				 */
+				if (ActivePortal)
+				{
+					if (!IsResQueueLockedForPortal(ActivePortal))
+					{
+						/** TODO: siva - can we ever reach this point? */
+						ResLockPortal(ActivePortal, queryDesc);
+						ActivePortal->status = PORTAL_ACTIVE;
+					} 
+				}
+			}
+
 			break;
 		case CMD_INSERT:
 			if (queryDesc->plannedstmt->hasReturning)
@@ -2406,23 +2550,70 @@ _SPI_pquery(QueryDesc *queryDesc, bool fire_triggers, long tcount)
 	else
 		eflags = EXEC_FLAG_SKIP_TRIGGERS;
 
-	ExecutorStart(queryDesc, eflags);
-
-	ExecutorRun(queryDesc, ForwardScanDirection, tcount);
-
-	_SPI_current->processed = queryDesc->estate->es_processed;
-	_SPI_current->lastoid = queryDesc->estate->es_lastoid;
-
-	if ((res == SPI_OK_SELECT || queryDesc->plannedstmt->hasReturning) &&
-		queryDesc->dest->mydest == DestSPI)
+	PG_TRY();
 	{
-		if (_SPI_checktuples())
-			elog(ERROR, "consistency check on SPI tuple count failed");
-	}
+		Oid			relationOid = InvalidOid; 	/* relation that is modified */
+		AutoStatsCmdType cmdType = AUTOSTATS_CMDTYPE_SENTINEL; 	/* command type */
+		bool		checkTuples;
 
-	ExecutorFinish(queryDesc);
-	ExecutorEnd(queryDesc);
-	/* FreeQueryDesc is done by the caller */
+		/*
+		 * most cases, except when the debugging level is set to DEBUG4 or DEBUG5.
+		 */
+		if (log_min_messages > DEBUG4)
+		{
+		}
+
+		ExecutorStart(queryDesc, 0);
+
+		ExecutorRun(queryDesc, ForwardScanDirection, tcount);
+
+		/*
+		 * In GPDB, in a INSERT/UPDATE/DELETE ... RETURNING statement, the
+		 * es_processed counter is only updated in ExecutorEnd, when we
+		 * collect the results from each segment. Therefore, we cannot
+		 * call _SPI_checktuples() just yet.
+		 */
+		if ((res == SPI_OK_SELECT || queryDesc->plannedstmt->hasReturning) &&
+			queryDesc->dest->mydest == DestSPI)
+		{
+			checkTuples = true;
+		}
+		else
+			checkTuples = false;
+
+		if (Gp_role == GP_ROLE_DISPATCH)
+			autostats_get_cmdtype(queryDesc, &cmdType, &relationOid);
+
+		ExecutorFinish(queryDesc);
+		ExecutorEnd(queryDesc);
+		/* FreeQueryDesc is done by the caller */
+
+		/*
+		 * Now that ExecutorEnd() has run, set # of rows processed (see comment
+		 * above) and call _SPI_checktuples()
+		 */
+		_SPI_current->processed = queryDesc->es_processed;
+		_SPI_current->lastoid = queryDesc->es_lastoid;
+		if (checkTuples)
+		{
+				if (_SPI_checktuples())
+					elog(ERROR, "consistency check on SPI tuple count failed");
+		}
+
+		/* MPP-14001: Running auto_stats */
+		if (Gp_role == GP_ROLE_DISPATCH)
+			auto_stats(cmdType, relationOid, queryDesc->es_processed, true /* inFunction */);
+	}
+	PG_CATCH();
+	{
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	_SPI_current->processed = queryDesc->es_processed;	/* Mpp: Dispatched
+														 * queries fill in this
+														 * at Executor End */
+	_SPI_current->lastoid = queryDesc->es_lastoid;
 
 #ifdef SPI_EXECUTOR_STATS
 	if (ShowExecutorStats)
@@ -2467,10 +2658,10 @@ _SPI_error_callback(void *arg)
  *	Do a FETCH or MOVE in a cursor
  */
 static void
-_SPI_cursor_operation(Portal portal, FetchDirection direction, long count,
+_SPI_cursor_operation(Portal portal, FetchDirection direction, int64 count,
 					  DestReceiver *dest)
 {
-	long		nfetched;
+	uint64		nfetched;
 
 	/* Check that the portal is valid */
 	if (!PortalIsValid(portal))
@@ -2587,7 +2778,7 @@ _SPI_end_call(bool use_exec)
 static bool
 _SPI_checktuples(void)
 {
-	uint32		processed = _SPI_current->processed;
+	uint64		processed = _SPI_current->processed;
 	SPITupleTable *tuptable = _SPI_current->tuptable;
 	bool		failed = false;
 
@@ -2751,4 +2942,76 @@ _SPI_save_plan(SPIPlanPtr plan)
 	}
 
 	return newplan;
+}
+
+/**
+ * Memory reserved for SPI cals
+ */
+static uint64 SPIMemReserved = 0;
+
+/**
+ * Initialize the SPI memory reservation stack. See SPI_ReserveMemory() for detailed comments on how this stack
+ * is used.
+ */
+void SPI_InitMemoryReservation(void)
+{
+	Assert(!IsResManagerMemoryPolicyNone());
+
+	if (IsResGroupEnabled())
+	{
+		SPIMemReserved = 0;
+	}
+	else
+	{
+		SPIMemReserved = (uint64) statement_mem * 1024L;;
+	}
+}
+
+/**
+ * Push memory reserved for next SPI call. It is possible for an operator to (after several levels of nesting),
+ * result in execution of SQL statements via SPI e.g. a pl/pgsql function that issues queries. These queries must be sandboxed into
+ * the memory limits of the operator. This stack represents the nesting of these operators and each
+ * operator will push its own limit.
+ */
+void SPI_ReserveMemory(uint64 mem_reserved)
+{
+	Assert(!IsResManagerMemoryPolicyNone());
+	if (mem_reserved > 0
+			&& (SPIMemReserved == 0 || mem_reserved < SPIMemReserved))
+	{
+		SPIMemReserved = mem_reserved;
+	}
+
+	if (LogResManagerMemory())
+	{
+		elog(GP_RESMANAGER_MEMORY_LOG_LEVEL, "SPI memory reservation %d", (int) SPIMemReserved);
+	}
+}
+
+/**
+ * What was the amount of memory reserved for the last operator? See SPI_ReserveMemory()
+ * for details.
+ */
+uint64 SPI_GetMemoryReservation(void)
+{
+	Assert(!IsResManagerMemoryPolicyNone());
+	return SPIMemReserved;
+}
+
+/**
+ * Is memory reserved stack empty?
+ */
+bool SPI_IsMemoryReserved(void)
+{
+	Assert(!IsResManagerMemoryPolicyNone());
+	return (SPIMemReserved == 0);
+}
+
+/**
+  * Are we in SPI context 
+  */
+bool
+SPI_context(void)
+{ 
+	return (_SPI_connected != -1); 
 }

@@ -1045,7 +1045,8 @@ parseAclItem(const char *item, const char *type,
 		slpos = copyAclUserName(grantor, slpos);
 		if (*slpos != '\0')
 		{
-			free(buf);
+			if (buf)
+				free(buf);
 			return false;
 		}
 	}
@@ -1104,13 +1105,7 @@ do { \
 		}
 
 		/* UPDATE */
-		if (remoteVersion >= 70200 ||
-			strcmp(type, "SEQUENCE") == 0 ||
-			strcmp(type, "SEQUENCES") == 0)
-			CONVERT_PRIV('w', "UPDATE");
-		else
-			/* 7.0 and 7.1 have a simpler worldview */
-			CONVERT_PRIV('w', "UPDATE,DELETE");
+		CONVERT_PRIV('w', "UPDATE");
 	}
 	else if (strcmp(type, "FUNCTION") == 0 ||
 			 strcmp(type, "FUNCTIONS") == 0)
@@ -1438,6 +1433,27 @@ processSQLNamePattern(PGconn *conn, PQExpBuffer buf, const char *pattern,
 
 	return added_clause;
 #undef WHEREAND
+}
+
+/*
+ * Escape any backslashes in given string (from initdb.c)
+ */
+char *
+escape_backslashes(const char *src, bool quotes_too)
+{
+	int			len = strlen(src),
+				i,
+				j;
+	char	   *result = malloc(len * 2 + 1);
+
+	for (i = 0, j = 0; i < len; i++)
+	{
+		if ((src[i]) == '\\' || ((src[i]) == '\'' && quotes_too))
+			result[j++] = '\\';
+		result[j++] = src[i];
+	}
+	result[j] = '\0';
+	return result;
 }
 
 /*

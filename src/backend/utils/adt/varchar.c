@@ -649,7 +649,7 @@ varchartypmodout(PG_FUNCTION_ARGS)
  *****************************************************************************/
 
 /* "True" length (not counting trailing blanks) of a BpChar */
-static int
+static inline int
 bcTruelen(BpChar *arg)
 {
 	char	   *s = VARDATA_ANY(arg);
@@ -697,8 +697,8 @@ bpcharoctetlen(PG_FUNCTION_ARGS)
  * Note: btree indexes need these routines not to leak memory; therefore,
  * be careful to free working copies of toasted datums.  Most places don't
  * need to be so careful.
- *****************************************************************************/
 
+ *****************************************************************************/
 Datum
 bpchareq(PG_FUNCTION_ARGS)
 {

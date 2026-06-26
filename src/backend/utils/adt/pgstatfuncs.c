@@ -15,13 +15,19 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "storage/lock.h"
+#include "commands/resgroupcmds.h"
 #include "catalog/pg_type.h"
 #include "funcapi.h"
 #include "libpq/ip.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
+#include "utils/guc.h"
 #include "utils/inet.h"
+#include "utils/lsyscache.h"
+#include "utils/syscache.h"
 #include "utils/timestamp.h"
 
 /* bogus ... these externs should be in a header file */
@@ -54,6 +60,7 @@ extern Datum pg_stat_get_backend_idset(PG_FUNCTION_ARGS);
 extern Datum pg_stat_get_activity(PG_FUNCTION_ARGS);
 extern Datum pg_backend_pid(PG_FUNCTION_ARGS);
 extern Datum pg_stat_get_backend_pid(PG_FUNCTION_ARGS);
+extern Datum pg_stat_get_backend_session_id(PG_FUNCTION_ARGS);
 extern Datum pg_stat_get_backend_dbid(PG_FUNCTION_ARGS);
 extern Datum pg_stat_get_backend_userid(PG_FUNCTION_ARGS);
 extern Datum pg_stat_get_backend_activity(PG_FUNCTION_ARGS);
@@ -63,6 +70,7 @@ extern Datum pg_stat_get_backend_xact_start(PG_FUNCTION_ARGS);
 extern Datum pg_stat_get_backend_start(PG_FUNCTION_ARGS);
 extern Datum pg_stat_get_backend_client_addr(PG_FUNCTION_ARGS);
 extern Datum pg_stat_get_backend_client_port(PG_FUNCTION_ARGS);
+extern Datum pg_stat_get_backend_waiting_reason(PG_FUNCTION_ARGS);
 
 extern Datum pg_stat_get_db_numbackends(PG_FUNCTION_ARGS);
 extern Datum pg_stat_get_db_xact_commit(PG_FUNCTION_ARGS);
@@ -115,6 +123,13 @@ extern Datum pg_stat_get_xact_function_calls(PG_FUNCTION_ARGS);
 extern Datum pg_stat_get_xact_function_total_time(PG_FUNCTION_ARGS);
 extern Datum pg_stat_get_xact_function_self_time(PG_FUNCTION_ARGS);
 
+extern Datum pg_stat_get_queue_num_exec(PG_FUNCTION_ARGS);
+extern Datum pg_stat_get_queue_num_wait(PG_FUNCTION_ARGS);
+extern Datum pg_stat_get_queue_elapsed_exec(PG_FUNCTION_ARGS);
+extern Datum pg_stat_get_queue_elapsed_wait(PG_FUNCTION_ARGS);
+
+extern Datum pg_renice_session(PG_FUNCTION_ARGS);
+
 extern Datum pg_stat_clear_snapshot(PG_FUNCTION_ARGS);
 extern Datum pg_stat_reset(PG_FUNCTION_ARGS);
 extern Datum pg_stat_reset_shared(PG_FUNCTION_ARGS);
@@ -123,6 +138,22 @@ extern Datum pg_stat_reset_single_function_counters(PG_FUNCTION_ARGS);
 
 /* Global bgwriter statistics, from bgwriter.c */
 extern PgStat_MsgBgWriter bgwriterStats;
+
+static char *
+pgstat_waiting_string(char reason)
+{
+	switch(reason)
+	{
+		case PGBE_WAITING_LOCK:
+			return "lock";
+		case PGBE_WAITING_REPLICATION:
+			return "replication";
+		case PGBE_WAITING_RESGROUP:
+			return "resgroup";
+		default:
+			return NULL;
+	}
+}
 
 Datum
 pg_stat_get_numscans(PG_FUNCTION_ARGS)
@@ -531,12 +562,13 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 	{
 		MemoryContext oldcontext;
 		TupleDesc	tupdesc;
+		int			nattr = 21;
 
 		funcctx = SRF_FIRSTCALL_INIT();
 
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
-		tupdesc = CreateTemplateTupleDesc(16, false);
+		tupdesc = CreateTemplateTupleDesc(nattr, false);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "datid",
 						   OIDOID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 2, "pid",
@@ -569,6 +601,19 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 						   XIDOID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 16, "backend_xmin",
 						   XIDOID, -1, 0);
+
+		TupleDescInitEntry(tupdesc, (AttrNumber) 17, "sess_id",
+						   INT4OID, -1, 0);  /* GPDB */
+
+		TupleDescInitEntry(tupdesc, (AttrNumber) 18, "waiting_reason",
+						   TEXTOID, -1, 0);
+
+		TupleDescInitEntry(tupdesc, (AttrNumber) 19, "rsgid",
+						   OIDOID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) 20, "rsgname",
+						   TEXTOID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) 21, "rsgqueueduration",
+						   INTERVALOID, -1, 0);
 
 		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
 
@@ -620,8 +665,8 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 	if (funcctx->call_cntr < funcctx->max_calls)
 	{
 		/* for each row */
-		Datum		values[16];
-		bool		nulls[16];
+		Datum		values[21];
+		bool		nulls[21];
 		HeapTuple	tuple;
 		LocalPgBackendStatus *local_beentry;
 		PgBackendStatus *beentry;
@@ -794,6 +839,40 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 					nulls[13] = true;
 				}
 			}
+
+			values[16] = Int32GetDatum(beentry->st_session_id);  /* GPDB */
+
+			if (funcctx->tuple_desc->natts > 17)
+			{
+				char	st_waiting = beentry->st_waiting;
+				char   *reason;
+
+				reason = pgstat_waiting_string(st_waiting);
+
+				if (reason != NULL)
+					values[17] = CStringGetTextDatum(reason);
+				else
+					nulls[17] = true;
+			}
+
+			if (funcctx->tuple_desc->natts > 18)
+			{
+				Datum now = TimestampTzGetDatum(GetCurrentTimestamp());
+				char *groupName = GetResGroupNameForId(beentry->st_rsgid);
+
+				values[18] = ObjectIdGetDatum(beentry->st_rsgid);
+
+				if (groupName != NULL)
+					values[19] = CStringGetTextDatum(groupName);
+				else
+					nulls[19] = true;
+
+				if (beentry->st_waiting == PGBE_WAITING_RESGROUP)
+					values[20] = DirectFunctionCall2(timestamptz_age, now,
+													 TimestampTzGetDatum(beentry->st_resgroup_queue_start_timestamp));
+				else
+					nulls[20] = true;
+			}
 		}
 		else
 		{
@@ -808,6 +887,18 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 			nulls[11] = true;
 			nulls[12] = true;
 			nulls[13] = true;
+			nulls[14] = true;
+			nulls[15] = true;
+
+			values[16] = Int32GetDatum(beentry->st_session_id);
+			if (funcctx->tuple_desc->natts > 17)
+				nulls[17] = true;
+			if (funcctx->tuple_desc->natts > 18)
+			{
+				nulls[18] = true;
+				nulls[19] = true;
+				nulls[20] = true;
+			}
 		}
 
 		tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
@@ -839,6 +930,19 @@ pg_stat_get_backend_pid(PG_FUNCTION_ARGS)
 		PG_RETURN_NULL();
 
 	PG_RETURN_INT32(beentry->st_procpid);
+}
+
+
+Datum
+pg_stat_get_backend_session_id(PG_FUNCTION_ARGS)
+{
+	int32		beid = PG_GETARG_INT32(0);
+	PgBackendStatus *beentry;
+
+	if ((beentry = pgstat_fetch_stat_beentry(beid)) == NULL)
+		PG_RETURN_NULL();
+
+	PG_RETURN_INT32(beentry->st_session_id);
 }
 
 
@@ -901,7 +1005,7 @@ pg_stat_get_backend_waiting(PG_FUNCTION_ARGS)
 	if (!superuser() && beentry->st_userid != GetUserId())
 		PG_RETURN_NULL();
 
-	result = beentry->st_waiting;
+	result = beentry->st_waiting != PGBE_WAITING_NONE;
 
 	PG_RETURN_BOOL(result);
 }
@@ -1020,8 +1124,7 @@ pg_stat_get_backend_client_addr(PG_FUNCTION_ARGS)
 
 	clean_ipv6_addr(beentry->st_clientaddr.addr.ss_family, remote_host);
 
-	PG_RETURN_INET_P(DirectFunctionCall1(inet_in,
-										 CStringGetDatum(remote_host)));
+	return DirectFunctionCall1(inet_in, CStringGetDatum(remote_host));
 }
 
 Datum
@@ -1071,6 +1174,27 @@ pg_stat_get_backend_client_port(PG_FUNCTION_ARGS)
 										CStringGetDatum(remote_port)));
 }
 
+Datum
+pg_stat_get_backend_waiting_reason(PG_FUNCTION_ARGS)
+{
+	int32		beid = PG_GETARG_INT32(0);
+	PgBackendStatus *beentry;
+	char	   *result;
+
+	if ((beentry = pgstat_fetch_stat_beentry(beid)) == NULL)
+		PG_RETURN_NULL();
+
+	if (!superuser() && beentry->st_userid != GetUserId())
+		PG_RETURN_NULL();
+
+	result = pgstat_waiting_string(beentry->st_waiting);
+
+	/* waiting for nothing */
+	if (result == NULL)
+		PG_RETURN_NULL();
+
+	PG_RETURN_DATUM(CStringGetTextDatum(result));
+}
 
 Datum
 pg_stat_get_db_numbackends(PG_FUNCTION_ARGS)
@@ -1691,6 +1815,94 @@ pg_stat_clear_snapshot(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
+
+Datum
+pg_stat_get_queue_num_exec(PG_FUNCTION_ARGS)
+{
+	Oid			queueid = PG_GETARG_OID(0);
+	int64		result;
+	PgStat_StatQueueEntry *queueentry;
+
+	if ((queueentry = pgstat_fetch_stat_queueentry(queueid)) == NULL)
+		result = 0;
+	else
+		result = (int64) (queueentry->n_queries_exec);
+
+	PG_RETURN_INT64(result);
+}
+
+
+Datum
+pg_stat_get_queue_num_wait(PG_FUNCTION_ARGS)
+{
+	Oid			queueid = PG_GETARG_OID(0);
+	int64		result;
+	PgStat_StatQueueEntry *queueentry;
+
+	if ((queueentry = pgstat_fetch_stat_queueentry(queueid)) == NULL)
+		result = 0;
+	else
+		result = (int64) (queueentry->n_queries_wait);
+
+	PG_RETURN_INT64(result);
+}
+
+
+Datum
+pg_stat_get_queue_elapsed_exec(PG_FUNCTION_ARGS)
+{
+	Oid			queueid = PG_GETARG_OID(0);
+	int64		result;
+	PgStat_StatQueueEntry *queueentry;
+
+	if ((queueentry = pgstat_fetch_stat_queueentry(queueid)) == NULL)
+		result = 0;
+	else
+		result = (int64) (queueentry->elapsed_exec);
+
+	PG_RETURN_INT64(result);
+}
+
+
+Datum
+pg_stat_get_queue_elapsed_wait(PG_FUNCTION_ARGS)
+{
+	Oid			queueid = PG_GETARG_OID(0);
+	int64		result;
+	PgStat_StatQueueEntry *queueentry;
+
+	if ((queueentry = pgstat_fetch_stat_queueentry(queueid)) == NULL)
+		result = 0;
+	else
+		result = (int64) (queueentry->elapsed_wait);
+
+	PG_RETURN_INT64(result);
+}
+
+
+/*
+ * This should probably be moved to it's own file, or at least some better place.
+ * I put it here because it uses pgstat_fetch_stat_beentry
+ */
+
+#include <sys/time.h>
+#ifndef WIN32
+#include <sys/resource.h>
+#endif
+#include "lib/stringinfo.h"
+#include "cdb/cdbvars.h"
+#include "cdb/cdbdisp_query.h"
+
+/**
+ * We no longer support pg_renice_session. For the time being issue an error.
+ */
+Datum
+pg_renice_session(PG_FUNCTION_ARGS)
+{
+	int prio_out = -1;  
+	elog(NOTICE, "Renicing a session is not longer supported. Please use the Query Prioritization feature.");
+	PG_RETURN_INT32(prio_out);
+}
 
 /* Reset all counters for the current database */
 Datum

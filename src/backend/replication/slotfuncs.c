@@ -40,6 +40,7 @@ Datum
 pg_create_physical_replication_slot(PG_FUNCTION_ARGS)
 {
 	Name		name = PG_GETARG_NAME(0);
+	bool 		immediately_reserve = PG_GETARG_BOOL(1);
 	Datum		values[2];
 	bool		nulls[2];
 	TupleDesc	tupdesc;
@@ -58,10 +59,27 @@ pg_create_physical_replication_slot(PG_FUNCTION_ARGS)
 	/* acquire replication slot, this will check for conflicting names */
 	ReplicationSlotCreate(NameStr(*name), false, RS_PERSISTENT);
 
-	values[0] = NameGetDatum(&MyReplicationSlot->data.name);
 
+	values[0] = NameGetDatum(&MyReplicationSlot->data.name);
 	nulls[0] = false;
-	nulls[1] = true;
+
+	if (immediately_reserve)
+	{
+		/* Reserve WAL as the user asked for it */
+		ReplicationSlotReserveWal();
+
+		/* Write this slot to disk */
+		ReplicationSlotMarkDirty();
+		ReplicationSlotSave();
+
+		values[1] = LSNGetDatum(MyReplicationSlot->data.restart_lsn);
+		nulls[1] = false;
+	}
+	else
+	{
+		values[0] = NameGetDatum(&MyReplicationSlot->data.name);
+		nulls[1] = true;
+	}
 
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 	result = HeapTupleGetDatum(tuple);

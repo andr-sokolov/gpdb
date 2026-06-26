@@ -26,6 +26,7 @@
 #include "commands/trigger.h"
 #include "executor/spi.h"
 #include "funcapi.h"
+#include "libpq/pqsignal.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"

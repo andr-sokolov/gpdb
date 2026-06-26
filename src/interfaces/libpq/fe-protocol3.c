@@ -12,7 +12,15 @@
  *
  *-------------------------------------------------------------------------
  */
-#include "postgres_fe.h"
+
+/*
+ * This file is compiled with both frontend and backend codes, symlinked by
+ * src/backend/Makefile, and use macro FRONTEND to switch.
+ *
+ * Include "c.h" to adopt Greenplum C types. Don't include "postgres_fe.h",
+ * which only defines FRONTEND besides including "c.h"
+ */
+#include "c.h"
 
 #include <ctype.h>
 #include <fcntl.h>
@@ -40,7 +48,8 @@
  */
 #define VALID_LONG_MESSAGE_TYPE(id) \
 	((id) == 'T' || (id) == 'D' || (id) == 'd' || (id) == 'V' || \
-	 (id) == 'E' || (id) == 'N' || (id) == 'A')
+	 (id) == 'E' || (id) == 'N' || (id) == 'A' || (id) == 'Y' || \
+	 (id) == 'y' || (id) == 'o')
 
 
 static void handleSyncLoss(PGconn *conn, char id, int msgLength);
@@ -51,6 +60,7 @@ static int	getParameterStatus(PGconn *conn);
 static int	getNotify(PGconn *conn);
 static int	getCopyStart(PGconn *conn, ExecStatusType copytype);
 static int	getReadyForQuery(PGconn *conn);
+static void saveCdbStatMsg(PGresult *result, char *data, int len);
 static void reportErrorPosition(PQExpBuffer msg, const char *query,
 					int loc, int encoding);
 static int build_startup_packet(const PGconn *conn, char *packet,
@@ -68,6 +78,12 @@ pqParseInput3(PGconn *conn)
 	char		id;
 	int			msgLength;
 	int			avail;
+#ifndef FRONTEND
+	int			numRejected  = 0;
+	int			i;
+	int64		numCompleted = 0;
+#endif
+
 
 	/*
 	 * Loop to parse successive complete messages available in the buffer.
@@ -155,6 +171,18 @@ pqParseInput3(PGconn *conn)
 			if (pqGetErrorNotice3(conn, false))
 				return;
 		}
+#ifndef FRONTEND
+		else if (id == 'k')
+		{
+			if (pqGetInt64(&(conn->mop_high_watermark), conn))
+				return;
+		}
+		else if (id == 'x')
+		{
+			if (pqGetc(&conn->wrote_xlog, conn))
+				return;
+		}
+#endif
 		else if (conn->asyncStatus != PGASYNC_BUSY)
 		{
 			/* If not IDLE state, just wait ... */
@@ -215,6 +243,39 @@ pqParseInput3(PGconn *conn)
 								CMDSTATUS_LEN);
 					conn->asyncStatus = PGASYNC_READY;
 					break;
+#ifndef FRONTEND
+				case 'o':
+				{
+					int i;
+					PQaoRelTupCount *ao;
+
+					/* row count for AO partitioned tables */
+					if (conn->result == NULL)
+					{
+						conn->result = PQmakeEmptyPGresult(conn, PGRES_COMMAND_OK);
+						if (!conn->result)
+							return;
+					}
+
+					if (pqGetInt(&(conn->result->naotupcounts), 4, conn))
+						return;
+
+					/* now just loop through */
+					conn->result->aotupcounts =
+						malloc(sizeof(PQaoRelTupCount) * conn->result->naotupcounts);
+					ao = conn->result->aotupcounts;
+					for (i = 0; i < conn->result->naotupcounts; i++)
+					{
+						if (pqGetInt((int *)&(ao->aorelid), 4, conn))
+							return;
+						if (pqGetInt64(&(ao->tupcount), conn))
+							return;
+
+						ao++;
+					}
+				}
+				break;
+#endif
 				case 'E':		/* error return */
 					if (pqGetErrorNotice3(conn, true))
 						return;
@@ -406,6 +467,100 @@ pqParseInput3(PGconn *conn)
 					 * the COPY command.
 					 */
 					break;
+#ifndef FRONTEND
+				case 'j':
+					/*
+					 * QE COPY reports number of rejected rows to the QD COPY
+					 * in single row error handling mode.
+					 */
+					if (conn->result == NULL)
+					{
+						conn->result = PQmakeEmptyPGresult(conn, PGRES_COMMAND_OK);
+						if (!conn->result)
+							return;
+					}
+
+					if (pqGetInt(&numRejected, 4, conn))
+						return;
+
+					conn->result->numRejected += numRejected;
+
+					/* Optionally receive completed number when COPY FROM ON SEGMENT */
+					if (msgLength >= 8 && !pqGetInt64(&numCompleted, conn))
+					{
+						conn->result->numCompleted += numCompleted;
+					}
+
+					break;
+				case 'Y':       /* CDB: statistical response from QE to QD */
+					/* for certain queries, the stats may arrive
+					 * before the completion status -- for this case
+					 * we're responsible for allocating the result
+					 * struct */
+					if (conn->result == NULL)
+						conn->result = PQmakeEmptyPGresult(conn, PGRES_COMMAND_OK);
+					if (conn->result)
+						saveCdbStatMsg(conn->result,
+									   conn->inBuffer + conn->inCursor,
+									   msgLength);
+					conn->inCursor += msgLength;
+					break;
+				case 'y':
+					/*
+					 * CDB: for gang management and stats collection for Vacuum/Analyze
+					 * commands.
+					 */
+					if (pqGets(&conn->workBuffer, conn))
+						return;
+					if (conn->result == NULL)
+					{
+						conn->result = PQmakeEmptyPGresult(conn,
+														   PGRES_COMMAND_OK);
+						if (!conn->result)
+							return;
+					}
+					strlcpy(conn->result->cmdStatus, conn->workBuffer.data,
+							CMDSTATUS_LEN);
+
+					if (pqGetInt(&conn->result->extraslen, 4, conn))
+						return;
+					conn->result->extras = malloc(conn->result->extraslen);
+					if (pqGetnchar((char *)conn->result->extras, conn->result->extraslen, conn))
+						return;
+					conn->asyncStatus = PGASYNC_READY;
+
+					break;
+
+				case 'w':
+					/*
+					 * 'commit prepared' and 'one-phase commit' reports a list of gxids
+					 * that the transaction has waited.
+					 */
+					if (conn->result == NULL)
+					{
+						conn->result = PQmakeEmptyPGresult(conn, PGRES_COMMAND_OK);
+						if (!conn->result)
+							return;
+					}
+
+					if (pqGetInt(&conn->result->nWaits, 4, conn))
+						return;
+
+					if (conn->result->nWaits > 0)
+					{
+						if (conn->result->waitGxids == NULL)
+							conn->result->waitGxids =
+								malloc(sizeof(int) * conn->result->nWaits);
+						for (i = 0; i < conn->result->nWaits; i++)
+						{
+							int gxid;
+							if (pqGetInt(&gxid, 4, conn))
+								return;
+							conn->result->waitGxids[i] = gxid;
+						}
+					}
+					break;
+#endif
 				default:
 					printfPQExpBuffer(&conn->errorMessage,
 									  libpq_gettext(
@@ -1038,7 +1193,30 @@ pqGetErrorNotice3(PGconn *conn, bool isError)
 	{
 		if (res)
 			res->errMsg = pqResultStrdup(res, workBuf.data);
-		pqClearAsyncResult(conn);	/* redundant, but be safe */
+
+        /* CDB: Transfer statistical messages on to the new result. */
+        if (conn->result &&
+            conn->result->cdbstats)
+        {
+            pgCdbStatCell  *cell;
+            pgCdbStatCell  *next;
+            pgCdbStatCell  *prev = NULL;
+
+            /* Copy messages (incidentally reversing the list). */
+            for (cell = conn->result->cdbstats; cell; cell = cell->next)
+                saveCdbStatMsg(res, cell->data, cell->len);
+
+            /* Reverse the list again to restore newest-first ordering. */
+            for (cell = res->cdbstats; cell; cell = next)
+            {
+                next = cell->next;
+                cell->next = prev;
+                prev = cell;
+            }
+            res->cdbstats = prev;
+        }
+
+        pqClearAsyncResult(conn);	/* redundant, but be safe */
 		conn->result = res;
 		if (PQExpBufferDataBroken(workBuf))
 			printfPQExpBuffer(&conn->errorMessage,
@@ -1468,6 +1646,35 @@ getReadyForQuery(PGconn *conn)
 
 	return 0;
 }
+
+/*
+ * saveCdbStatMsg - attach qExec statistics message to PGresult
+ */
+void
+saveCdbStatMsg(PGresult *result, char *data, int len)
+{
+    pgCdbStatCell  *cell;
+
+    /* Allocate list element. */
+    cell = pqResultAlloc(result, sizeof(*cell), true);
+    if (!cell)
+        return;
+
+    /* Allocate an aligned buffer from the PGresult's memory pool. */
+    cell->data = (char *)pqResultAlloc(result, len, true);
+    if (!cell->data)
+        return;
+
+    /* Copy the message data. */
+    cell->len = len;
+	memcpy(cell->data, data, len);
+
+    /* Add to head of list. */
+    cell->next = result->cdbstats;
+    result->cdbstats = cell;
+    return;
+}                               /* saveCdbStatMsg */
+
 
 /*
  * getCopyDataMessage - fetch next CopyData message, process async messages
@@ -2115,8 +2322,12 @@ build_startup_packet(const PGconn *conn, char *packet,
 		ADD_STARTUP_OPTION("database", conn->dbName);
 	if (conn->replication && conn->replication[0])
 		ADD_STARTUP_OPTION("replication", conn->replication);
+	if (conn->gpconntype && conn->gpconntype[0])
+		ADD_STARTUP_OPTION(GPCONN_TYPE, conn->gpconntype);
 	if (conn->pgoptions && conn->pgoptions[0])
 		ADD_STARTUP_OPTION("options", conn->pgoptions);
+	if (conn->diffoptions && conn->diffoptions[0])
+		ADD_STARTUP_OPTION("diff_options", conn->diffoptions);
 	if (conn->send_appname)
 	{
 		/* Use appname if present, otherwise use fallback */
@@ -2127,6 +2338,10 @@ build_startup_packet(const PGconn *conn, char *packet,
 
 	if (conn->client_encoding_initial && conn->client_encoding_initial[0])
 		ADD_STARTUP_OPTION("client_encoding", conn->client_encoding_initial);
+
+	/* CDB: Add qExec startup data */
+	if (conn->gpqeid && conn->gpqeid[0])
+		ADD_STARTUP_OPTION("gpqeid", conn->gpqeid);
 
 	/* Add any environment-driven GUC settings needed */
 	for (next_eo = options; next_eo->envName; next_eo++)

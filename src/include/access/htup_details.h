@@ -31,6 +31,7 @@
  * supported max number of columns.
  */
 #define MaxTupleAttributeNumber 1664	/* 8 * 208 */
+#define MaxPolicyAttributeNumber MaxHeapAttributeNumber
 
 /*
  * MaxHeapAttributeNumber limits the number of (user) columns in a table.
@@ -81,20 +82,25 @@
  * FULL never try to move a tuple whose Cmin or Cmax is still interesting,
  * ie, an insert-in-progress or delete-in-progress tuple.)
  *
- * A word about t_ctid: whenever a new tuple is stored on disk, its t_ctid
- * is initialized with its own TID (location).  If the tuple is ever updated,
- * its t_ctid is changed to point to the replacement version of the tuple.
+ * A word about t_ctid: whenever a new tuple is stored on disk, its t_ctid is
+ * initialized with its own TID (location).  If the tuple is ever updated, its
+ * t_ctid is changed to point to the replacement version of the tuple.  Or if
+ * the tuple is moved from one Greenplum segment to another, due to an update
+ * of the distribution key, t_ctid is set to a special value to indicate that
+ * (see ItemPointerSetMovedPartitions).  Note that ORCA generates a
+ * split-update plan for any update, not necessarily distribution key update.
  * Thus, a tuple is the latest version of its row iff XMAX is invalid or
  * t_ctid points to itself (in which case, if XMAX is valid, the tuple is
- * either locked or deleted).  One can follow the chain of t_ctid links
- * to find the newest version of the row.  Beware however that VACUUM might
- * erase the pointed-to (newer) tuple before erasing the pointing (older)
- * tuple.  Hence, when following a t_ctid link, it is necessary to check
- * to see if the referenced slot is empty or contains an unrelated tuple.
- * Check that the referenced tuple has XMIN equal to the referencing tuple's
- * XMAX to verify that it is actually the descendant version and not an
- * unrelated tuple stored into a slot recently freed by VACUUM.  If either
- * check fails, one may assume that there is no live descendant version.
+ * either locked or deleted).  One can follow the chain of t_ctid links to
+ * find the newest version of the row, unless it was moved to a different
+ * Greenplum segment.  Beware however that VACUUM might erase the pointed-to
+ * (newer) tuple before erasing the pointing (older) tuple.  Hence, when
+ * following a t_ctid link, it is necessary to check to see if the referenced
+ * slot is empty or contains an unrelated tuple.  Check that the referenced
+ * tuple has XMIN equal to the referencing tuple's XMAX to verify that it is
+ * actually the descendant version and not an unrelated tuple stored into a
+ * slot recently freed by VACUUM.  If either check fails, one may assume that
+ * there is no live descendant version.
  *
  * Following the fixed header fields, the nulls bitmap is stored (beginning
  * at t_bits).  The bitmap is *not* stored if t_infomask shows that there
@@ -248,13 +254,23 @@ struct HeapTupleHeaderData
  * information stored in t_infomask2:
  */
 #define HEAP_NATTS_MASK			0x07FF	/* 11 bits for number of attributes */
-/* bits 0x1800 are available */
+#define HEAP_XMIN_DISTRIBUTED_SNAPSHOT_IGNORE		0x0800
+										/* t_xmin is either an old committed
+										 * distributed transaction or local.
+										 * They can be ignored for distributed
+										 * snapshots.
+										 */
+#define HEAP_XMAX_DISTRIBUTED_SNAPSHOT_IGNORE		0x1000
+										/* t_xmax same as above. */
 #define HEAP_KEYS_UPDATED		0x2000	/* tuple was updated and key cols
 										 * modified, or tuple deleted */
 #define HEAP_HOT_UPDATED		0x4000	/* tuple was HOT-updated */
 #define HEAP_ONLY_TUPLE			0x8000	/* this is heap-only tuple */
 
-#define HEAP2_XACT_MASK			0xE000	/* visibility-related bits */
+#define HEAP2_XACT_MASK			0xF800	/* visibility-related bits
+										 * GPDB: include HEAP_XMIN_DISTRIBUTED_SNAPSHOT_IGNORE
+										 * and HEAP_XMAX_DISTRIBUTED_SNAPSHOT_IGNORE
+										 */
 
 /*
  * HEAP_TUPLE_HAS_MATCH is a temporary flag used during hash joins.  It is
@@ -400,7 +416,21 @@ do { \
 	(tup)->t_choice.t_heap.t_field3.t_xvac = (xid); \
 } while (0)
 
-#define HeapTupleHeaderGetDatumLength(tup) \
+/*
+ * Greenplum: The following two macros HeapTupleHeaderSetMovedPartitions and
+ * HeapTupleHeaderIndicatesMovedPartitions are from upstream, in upstream they
+ * are used when updating partition key that might lead to tuple moving from
+ * one partition to another partition.  In Greenplum 6X, these two macros are
+ * only used for encoding split-update info into tuple.
+ */
+#define HeapTupleHeaderSetMovedPartitions(tup) \
+	ItemPointerSet(&(tup)->t_ctid, MovedPartitionsBlockNumber, MovedPartitionsOffsetNumber)
+
+#define HeapTupleHeaderIndicatesMovedPartitions(tup) \
+	(ItemPointerGetOffsetNumber(&(tup)->t_ctid) == MovedPartitionsOffsetNumber && \
+	 ItemPointerGetBlockNumberNoCheck(&(tup)->t_ctid) == MovedPartitionsBlockNumber)
+
+#define HeapTupleHeaderGetDatumLength(tup)		\
 	VARSIZE(tup)
 
 #define HeapTupleHeaderSetDatumLength(tup, len) \
@@ -660,6 +690,11 @@ struct MinimalTupleData
 		HeapTupleHeaderSetOid((tuple)->t_data, (oid))
 
 
+extern Datum nocachegetattr(HeapTuple tup, int attnum,
+			   TupleDesc att);
+extern Datum heap_getsysattr(HeapTuple tup, int attnum, TupleDesc tupleDesc,
+				bool *isnull);
+
 /* ----------------
  *		fastgetattr
  *
@@ -674,42 +709,35 @@ struct MinimalTupleData
  *		lookups, and call nocachegetattr() for the rest.
  * ----------------
  */
+static inline Datum
+fastgetattr(HeapTuple tup, int attnum, TupleDesc tupleDesc, bool *isnull)
+{
+    Datum               result;
+    Form_pg_attribute   att = tupleDesc->attrs[attnum-1];
 
-#if !defined(DISABLE_COMPLEX_MACRO)
+    Assert(attnum > 0);
 
-#define fastgetattr(tup, attnum, tupleDesc, isnull)					\
-(																	\
-	AssertMacro((attnum) > 0),										\
-	(*(isnull) = false),											\
-	HeapTupleNoNulls(tup) ?											\
-	(																\
-		(tupleDesc)->attrs[(attnum)-1]->attcacheoff >= 0 ?			\
-		(															\
-			fetchatt((tupleDesc)->attrs[(attnum)-1],				\
-				(char *) (tup)->t_data + (tup)->t_data->t_hoff +	\
-					(tupleDesc)->attrs[(attnum)-1]->attcacheoff)	\
-		)															\
-		:															\
-			nocachegetattr((tup), (attnum), (tupleDesc))			\
-	)																\
-	:																\
-	(																\
-		att_isnull((attnum)-1, (tup)->t_data->t_bits) ?				\
-		(															\
-			(*(isnull) = true),										\
-			(Datum)NULL												\
-		)															\
-		:															\
-		(															\
-			nocachegetattr((tup), (attnum), (tupleDesc))			\
-		)															\
-	)																\
-)
-#else							/* defined(DISABLE_COMPLEX_MACRO) */
+	*isnull = false;
 
-extern Datum fastgetattr(HeapTuple tup, int attnum, TupleDesc tupleDesc,
-			bool *isnull);
-#endif   /* defined(DISABLE_COMPLEX_MACRO) */
+    if (HeapTupleNoNulls(tup))
+    {
+        if (att->attcacheoff >= 0)
+			result = fetchatt(att,
+				              (char *)tup->t_data + tup->t_data->t_hoff +
+					            att->attcacheoff);
+        else
+            result = nocachegetattr(tup, attnum, tupleDesc);
+    }
+    else if (att_isnull(attnum-1, tup->t_data->t_bits))
+    {
+        result = Int32GetDatum(0);
+		*isnull = true;
+    }
+    else
+        result = nocachegetattr(tup, attnum, tupleDesc);
+
+    return result;
+}                               /* fastgetattr */
 
 
 /* ----------------
@@ -727,40 +755,52 @@ extern Datum fastgetattr(HeapTuple tup, int attnum, TupleDesc tupleDesc,
  *		pointer to the structure describing the row and all its fields.
  * ----------------
  */
-#define heap_getattr(tup, attnum, tupleDesc, isnull) \
-	( \
-		((attnum) > 0) ? \
-		( \
-			((attnum) > (int) HeapTupleHeaderGetNatts((tup)->t_data)) ? \
-			( \
-				(*(isnull) = true), \
-				(Datum)NULL \
-			) \
-			: \
-				fastgetattr((tup), (attnum), (tupleDesc), (isnull)) \
-		) \
-		: \
-			heap_getsysattr((tup), (attnum), (tupleDesc), (isnull)) \
-	)
+static inline Datum
+heap_getattr(HeapTuple tup, int attnum, TupleDesc tupleDesc, bool *isnull)
+{
+    Datum       result;
 
+    Assert(tup != NULL);
+
+    if (attnum > (int)HeapTupleHeaderGetNatts(tup->t_data))
+    {
+        result = DatumGetInt32(0);
+		*isnull = true;
+    }
+    else if (attnum > 0)
+        result = fastgetattr(tup, attnum, tupleDesc, isnull);
+    else
+        result = heap_getsysattr(tup, attnum, tupleDesc, isnull);
+
+    return result;
+}                               /* heap_getattr */
 
 /* prototypes for functions in common/heaptuple.c */
 extern Size heap_compute_data_size(TupleDesc tupleDesc,
 					   Datum *values, bool *isnull);
-extern void heap_fill_tuple(TupleDesc tupleDesc,
+extern Size heap_fill_tuple(TupleDesc tupleDesc,
 				Datum *values, bool *isnull,
 				char *data, Size data_size,
 				uint16 *infomask, bits8 *bit);
 extern bool heap_attisnull(HeapTuple tup, int attnum);
-extern Datum nocachegetattr(HeapTuple tup, int attnum,
-			   TupleDesc att);
-extern Datum heap_getsysattr(HeapTuple tup, int attnum, TupleDesc tupleDesc,
-				bool *isnull);
-extern HeapTuple heap_copytuple(HeapTuple tuple);
+extern bool heap_attisnull_normalattr(HeapTuple tup, int attnum);
+
+extern HeapTuple heaptuple_copy_to(HeapTuple tup, HeapTuple result, uint32 *len);
+
+static inline HeapTuple heap_copytuple(HeapTuple tuple)
+{
+	return heaptuple_copy_to(tuple, NULL, NULL);
+}
 extern void heap_copytuple_with_tuple(HeapTuple src, HeapTuple dest);
 extern Datum heap_copy_tuple_as_datum(HeapTuple tuple, TupleDesc tupleDesc);
-extern HeapTuple heap_form_tuple(TupleDesc tupleDescriptor,
-				Datum *values, bool *isnull);
+
+extern HeapTuple heaptuple_form_to(TupleDesc tupdesc, Datum* values,
+								   bool *isnull, HeapTuple tup, uint32 *len);
+static inline HeapTuple heap_form_tuple(TupleDesc tupleDescriptor,
+				Datum *values, bool *isnull)
+{
+	return heaptuple_form_to(tupleDescriptor, values, isnull, NULL, NULL);
+}
 extern HeapTuple heap_modify_tuple(HeapTuple tuple,
 				  TupleDesc tupleDesc,
 				  Datum *replValues,

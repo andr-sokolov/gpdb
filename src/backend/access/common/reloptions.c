@@ -22,6 +22,7 @@
 #include "access/reloptions.h"
 #include "access/spgist.h"
 #include "catalog/pg_type.h"
+#include "cdb/cdbvars.h"
 #include "commands/defrem.h"
 #include "commands/tablespace.h"
 #include "commands/view.h"
@@ -29,9 +30,12 @@
 #include "utils/array.h"
 #include "utils/attoptcache.h"
 #include "utils/builtins.h"
+#include "utils/formatting.h"
 #include "utils/guc.h"
+#include "utils/guc_tables.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "miscadmin.h"
 
 /*
  * Contents of pg_class.reloptions
@@ -996,7 +1000,8 @@ parse_one_reloption(relopt_value *option, char *text_str, int text_len,
 				parsed = parse_bool(value, &option->values.bool_val);
 				if (validate && !parsed)
 					ereport(ERROR,
-					   (errmsg("invalid value for boolean option \"%s\": %s",
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("invalid value for boolean option \"%s\": %s",
 							   option->gen->name, value)));
 			}
 			break;
@@ -1007,15 +1012,17 @@ parse_one_reloption(relopt_value *option, char *text_str, int text_len,
 				parsed = parse_int(value, &option->values.int_val, 0, NULL);
 				if (validate && !parsed)
 					ereport(ERROR,
-					   (errmsg("invalid value for integer option \"%s\": %s",
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("invalid value for integer option \"%s\": %s",
 							   option->gen->name, value)));
 				if (validate && (option->values.int_val < optint->min ||
 								 option->values.int_val > optint->max))
 					ereport(ERROR,
-						  (errmsg("value %s out of bounds for option \"%s\"",
-								  value, option->gen->name),
-					 errdetail("Valid values are between \"%d\" and \"%d\".",
-							   optint->min, optint->max)));
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("value %s out of bounds for option \"%s\"",
+									value, option->gen->name),
+							 errdetail("Valid values are between \"%d\" and \"%d\".",
+									   optint->min, optint->max)));
 			}
 			break;
 		case RELOPT_TYPE_REAL:
@@ -1025,12 +1032,14 @@ parse_one_reloption(relopt_value *option, char *text_str, int text_len,
 				parsed = parse_real(value, &option->values.real_val);
 				if (validate && !parsed)
 					ereport(ERROR,
-							(errmsg("invalid value for floating point option \"%s\": %s",
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("invalid value for floating point option \"%s\": %s",
 									option->gen->name, value)));
 				if (validate && (option->values.real_val < optreal->min ||
 								 option->values.real_val > optreal->max))
 					ereport(ERROR,
-						  (errmsg("value %s out of bounds for option \"%s\"",
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("invalid value for floating point option \"%s\": %s",
 								  value, option->gen->name),
 					 errdetail("Valid values are between \"%f\" and \"%f\".",
 							   optreal->min, optreal->max)));

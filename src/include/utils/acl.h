@@ -237,6 +237,9 @@ extern void select_best_grantor(Oid roleId, AclMode privileges,
 
 extern void initialize_acl(void);
 
+extern bool revoked_something;
+
+
 /*
  * SQL functions (from acl.c)
  */
@@ -259,6 +262,8 @@ extern void ExecAlterDefaultPrivilegesStmt(AlterDefaultPrivilegesStmt *stmt);
 
 extern void RemoveRoleFromObjectACL(Oid roleid, Oid classid, Oid objid);
 extern void RemoveDefaultACLById(Oid defaclOid);
+
+extern void CopyRelationAcls(Oid src, Oid dest);
 
 extern AclMode pg_attribute_aclmask(Oid table_oid, AttrNumber attnum,
 					 Oid roleid, AclMode mask, AclMaskHow how);
@@ -308,6 +313,7 @@ extern void aclcheck_error_col(AclResult aclerr, AclObjectKind objectkind,
 extern void aclcheck_error_type(AclResult aclerr, Oid typeOid);
 
 /* ownercheck routines just return true (owner) or false (not) */
+extern bool pg_extension_ownercheck(Oid ext_oid, Oid roleid);
 extern bool pg_class_ownercheck(Oid class_oid, Oid roleid);
 extern bool pg_type_ownercheck(Oid type_oid, Oid roleid);
 extern bool pg_oper_ownercheck(Oid oper_oid, Oid roleid);

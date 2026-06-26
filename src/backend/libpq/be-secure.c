@@ -18,12 +18,8 @@
  *	  backend can restart automatically, it is important that
  *	  we select an algorithm that continues to provide confidentiality
  *	  even if the attacker has the server's private key.  Ephemeral
- *	  DH (EDH) keys provide this, and in fact provide Perfect Forward
- *	  Secrecy (PFS) except for situations where the session can
- *	  be hijacked during a periodic handshake/renegotiation.
- *	  Even that backdoor can be closed if client certificates
- *	  are used (since the imposter will be unable to successfully
- *	  complete renegotiation).
+ *	  DH (EDH) keys provide this and more (Perfect Forward Secrecy
+ *	  aka PFS).
  *
  *	  N.B., the static private key should still be protected to
  *	  the largest extent possible, to minimize the risk of
@@ -38,12 +34,12 @@
  *	  use ssldump(1) if there's a problem establishing an SSL
  *	  session.  In this case you'll need to temporarily disable
  *	  EDH by commenting out the callback.
- *
  *	  ...
  *
  *	  Because the risk of cryptanalysis increases as large
  *	  amounts of data are sent with the same session key, the
  *	  session keys are periodically renegotiated.
+ *
  *
  *-------------------------------------------------------------------------
  */
@@ -63,6 +59,8 @@
 #include <arpa/inet.h>
 #endif
 
+#include "miscadmin.h"
+
 #ifdef USE_SSL
 #include <openssl/ssl.h>
 #include <openssl/dh.h>
@@ -78,6 +76,7 @@
 #include "tcop/tcopprot.h"
 #include "utils/memutils.h"
 
+#define ERROR_BUF_SIZE 32
 
 #ifdef USE_SSL
 
@@ -98,17 +97,7 @@ char	   *ssl_key_file;
 char	   *ssl_ca_file;
 char	   *ssl_crl_file;
 
-/*
- *	How much data can be sent across a secure connection
- *	(total in both directions) before we require renegotiation.
- *	Set to 0 to disable renegotiation completely.
- */
-int			ssl_renegotiation_limit;
-
 #ifdef USE_SSL
-/* are we in the middle of a renegotiation? */
-static bool in_ssl_renegotiation = false;
-
 static SSL_CTX *SSL_context = NULL;
 static bool ssl_loaded_verify_locations = false;
 #endif
@@ -329,6 +318,26 @@ rloop:
 }
 
 /*
+ * Report a COMMERROR.
+ *
+ * This function holds an interrupt before reporting this error to avoid
+ * a self deadlock situation, see MPP-13718 for more info.
+ */
+#ifdef USE_SSL
+static void
+report_commerror(const char *err_msg)
+{
+	HOLD_INTERRUPTS();
+
+	ereport(COMMERROR,
+			(errcode(ERRCODE_PROTOCOL_VIOLATION),
+			 errmsg("%s",err_msg)));
+
+	RESUME_INTERRUPTS();
+}
+#endif
+
+/*
  *	Write data to a secure connection.
  */
 ssize_t
@@ -342,62 +351,15 @@ secure_write(Port *port, void *ptr, size_t len)
 		int			err;
 		unsigned long ecode;
 
-		/*
-		 * If SSL renegotiations are enabled and we're getting close to the
-		 * limit, start one now; but avoid it if there's one already in
-		 * progress.  Request the renegotiation 1kB before the limit has
-		 * actually expired.
-		 */
-		if (ssl_renegotiation_limit && !in_ssl_renegotiation &&
-			port->count > (ssl_renegotiation_limit - 1) * 1024L)
-		{
-			in_ssl_renegotiation = true;
-
-			/*
-			 * The way we determine that a renegotiation has completed is by
-			 * observing OpenSSL's internal renegotiation counter.  Make sure
-			 * we start out at zero, and assume that the renegotiation is
-			 * complete when the counter advances.
-			 *
-			 * OpenSSL provides SSL_renegotiation_pending(), but this doesn't
-			 * seem to work in testing.
-			 */
-			SSL_clear_num_renegotiations(port->ssl);
-
-			SSL_set_session_id_context(port->ssl, (void *) &SSL_context,
-									   sizeof(SSL_context));
-			if (SSL_renegotiate(port->ssl) <= 0)
-				ereport(COMMERROR,
-						(errcode(ERRCODE_PROTOCOL_VIOLATION),
-						 errmsg("SSL failure during renegotiation start")));
-			else
-			{
-				int			retries;
-
-				/*
-				 * A handshake can fail, so be prepared to retry it, but only
-				 * a few times.
-				 */
-				for (retries = 0;; retries++)
-				{
-					if (SSL_do_handshake(port->ssl) > 0)
-						break;	/* done */
-					ereport(COMMERROR,
-							(errcode(ERRCODE_PROTOCOL_VIOLATION),
-							 errmsg("SSL handshake failure on renegotiation, retrying")));
-					if (retries >= 20)
-						ereport(FATAL,
-								(errcode(ERRCODE_PROTOCOL_VIOLATION),
-								 errmsg("could not complete SSL handshake on renegotiation, too many failures")));
-				}
-			}
-		}
-
 wloop:
 		errno = 0;
 		ERR_clear_error();
 		n = SSL_write(port->ssl, ptr, len);
 		err = SSL_get_error(port->ssl, n);
+
+		const int ERR_MSG_LEN = ERROR_BUF_SIZE + 20;
+		char err_msg[ERR_MSG_LEN];
+
 		ecode = (err != SSL_ERROR_NONE || n < 0) ? ERR_get_error() : 0;
 		switch (err)
 		{
@@ -422,9 +384,9 @@ wloop:
 				}
 				break;
 			case SSL_ERROR_SSL:
-				ereport(COMMERROR,
-						(errcode(ERRCODE_PROTOCOL_VIOLATION),
-						 errmsg("SSL error: %s", SSLerrmessage(ecode))));
+				snprintf((char *)&err_msg, ERR_MSG_LEN, "SSL error: %s", SSLerrmessage(ecode));
+				report_commerror(err_msg);
+				/* fall through */
 				errno = ECONNRESET;
 				n = -1;
 				break;
@@ -437,40 +399,21 @@ wloop:
 				n = -1;
 				break;
 			default:
-				ereport(COMMERROR,
-						(errcode(ERRCODE_PROTOCOL_VIOLATION),
-						 errmsg("unrecognized SSL error code: %d",
-								err)));
+				snprintf((char *)&err_msg, ERR_MSG_LEN, "unrecognized SSL error code: %d", err);
+				report_commerror(err_msg);
+
 				errno = ECONNRESET;
 				n = -1;
 				break;
 		}
-
-		if (n >= 0)
-		{
-			/* is renegotiation complete? */
-			if (in_ssl_renegotiation &&
-				SSL_num_renegotiations(port->ssl) >= 1)
-			{
-				in_ssl_renegotiation = false;
-				port->count = 0;
-			}
-
-			/*
-			 * if renegotiation is still ongoing, and we've gone beyond the
-			 * limit, kill the connection now -- continuing to use it can be
-			 * considered a security problem.
-			 */
-			if (in_ssl_renegotiation &&
-				port->count > ssl_renegotiation_limit * 1024L)
-				ereport(FATAL,
-						(errcode(ERRCODE_PROTOCOL_VIOLATION),
-						 errmsg("SSL failed to renegotiate connection before limit expired")));
-		}
 	}
 	else
 #endif
+	{
+		prepare_for_client_write();
 		n = send(port->sock, ptr, len, 0);
+		client_write_ended();
+	}
 
 	return n;
 }
@@ -527,6 +470,8 @@ my_sock_write(BIO *h, const char *buf, int size)
 {
 	int			res = 0;
 
+	prepare_for_client_write();
+
 	res = send(BIO_get_fd(h, NULL), buf, size, 0);
 	BIO_clear_retry_flags(h);
 	if (res <= 0)
@@ -536,6 +481,8 @@ my_sock_write(BIO *h, const char *buf, int size)
 			BIO_set_retry_write(h);
 		}
 	}
+
+	client_write_ended();
 
 	return res;
 }
@@ -1249,14 +1196,14 @@ static const char *
 SSLerrmessage(unsigned long ecode)
 {
 	const char *errreason;
-	static char errbuf[32];
+	static char errbuf[ERROR_BUF_SIZE];
 
 	if (ecode == 0)
 		return _("no SSL error reported");
 	errreason = ERR_reason_error_string(ecode);
 	if (errreason != NULL)
 		return errreason;
-	snprintf(errbuf, sizeof(errbuf), _("SSL error code %lu"), ecode);
+	snprintf(errbuf, ERROR_BUF_SIZE, _("SSL error code %lu"), ecode);
 	return errbuf;
 }
 

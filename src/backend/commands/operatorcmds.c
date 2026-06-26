@@ -38,6 +38,7 @@
 #include "access/htup_details.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
+#include "catalog/oid_dispatch.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
 #include "commands/alter.h"
@@ -50,6 +51,9 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
+
+#include "cdb/cdbvars.h"
+#include "cdb/cdbdisp_query.h"
 
 /*
  * DefineOperator
@@ -92,7 +96,7 @@ DefineOperator(List *names, List *parameters)
 	 * parameters; therefore, a future release of PostgreSQL may disallow it
 	 * as the name of a user-defined operator.
 	 */
-	if (strcmp(oprName, "=>") == 0)
+	if (Gp_role != GP_ROLE_EXECUTE && strcmp(oprName, "=>") == 0)
 		ereport(WARNING,
 				(errmsg("=> is deprecated as an operator name"),
 				 errdetail("This name may be disallowed altogether in future versions of PostgreSQL.")));
@@ -295,7 +299,7 @@ DefineOperator(List *names, List *parameters)
 	/*
 	 * now have OperatorCreate do all the work..
 	 */
-	return
+	Oid oprOid =
 		OperatorCreate(oprName, /* operator name */
 					   oprNamespace,	/* namespace */
 					   typeId1, /* left type id */
@@ -307,6 +311,23 @@ DefineOperator(List *names, List *parameters)
 					   joinOid, /* optional join sel. procedure name */
 					   canMerge,	/* operator merges */
 					   canHash);	/* operator hashes */
+
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		DefineStmt * stmt = makeNode(DefineStmt);
+		stmt->kind = OBJECT_OPERATOR;
+		stmt->oldstyle = false;
+		stmt->defnames = names;
+		stmt->args = NIL;
+		stmt->definition = parameters;
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									GetAssignedOidsForDispatch(),
+									NULL);
+	}
+	return oprOid;
 }
 
 /*

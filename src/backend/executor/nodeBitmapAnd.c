@@ -28,8 +28,10 @@
 
 #include "postgres.h"
 
+#include "cdb/cdbvars.h"
 #include "executor/execdebug.h"
 #include "executor/nodeBitmapAnd.h"
+#include "nodes/tidbitmap.h"
 
 
 /* ----------------------------------------------------------------
@@ -41,7 +43,7 @@
 BitmapAndState *
 ExecInitBitmapAnd(BitmapAnd *node, EState *estate, int eflags)
 {
-	BitmapAndState *bitmapandstate = makeNode(BitmapAndState);
+	BitmapAndState *bitmapandstate;
 	PlanState **bitmapplanstates;
 	int			nplans;
 	int			i;
@@ -56,6 +58,7 @@ ExecInitBitmapAnd(BitmapAnd *node, EState *estate, int eflags)
 	 */
 	nplans = list_length(node->bitmapplans);
 
+	bitmapandstate = makeNode(BitmapAndState);
 	bitmapplanstates = (PlanState **) palloc0(nplans * sizeof(PlanState *));
 
 	/*
@@ -98,7 +101,8 @@ MultiExecBitmapAnd(BitmapAndState *node)
 	PlanState **bitmapplans;
 	int			nplans;
 	int			i;
-	TIDBitmap  *result = NULL;
+	bool		empty = false;
+	TIDBitmap  *hbm = NULL;
 
 	/* must provide our own instrumentation support */
 	if (node->ps.instrument)
@@ -116,40 +120,82 @@ MultiExecBitmapAnd(BitmapAndState *node)
 	for (i = 0; i < nplans; i++)
 	{
 		PlanState  *subnode = bitmapplans[i];
-		TIDBitmap  *subresult;
+		Node		*subresult = NULL;
 
-		subresult = (TIDBitmap *) MultiExecProcNode(subnode);
+		subresult = MultiExecProcNode(subnode);
 
-		if (!subresult || !IsA(subresult, TIDBitmap))
+		if (!subresult || !(IsA(subresult, TIDBitmap) || IsA(subresult, StreamBitmap)))
 			elog(ERROR, "unrecognized result from subplan");
 
-		if (result == NULL)
-			result = subresult; /* first subplan */
+		/*
+		 * If this is a hash bitmap, intersect it now with other hash bitmaps.
+		 * If we encounter some streamed bitmaps we'll add this hash bitmap
+		 * as a stream to it.
+		 */
+		if (IsA(subresult, TIDBitmap))
+		{
+			/* first subplan that generates a hash bitmap */
+			if (hbm == NULL)
+				hbm = (TIDBitmap *) subresult;
+			else
+			{
+				tbm_intersect(hbm, (TIDBitmap *)subresult);
+			}
+
+			/*
+			 * If at any stage we have a completely empty bitmap, we can fall out
+			 * without evaluating the remaining subplans, since ANDing them can no
+			 * longer change the result.  (Note: the fact that indxpath.c orders
+			 * the subplans by selectivity should make this case more likely to
+			 * occur.)
+			 */
+			if (tbm_is_empty(hbm))
+			{
+				/*
+				 * GPDB_84_MERGE_FIXME: If we saw any StreamBitmap inputs, we
+				 * will create an OpStream to AND the empty result with the
+				 * StreamBitmaps we saw already. We could just close them now,
+				 * and return an empty hash bitmap here, but I'm not sure how
+				 * to close the already-opened stream bitmaps correctly.
+				 */
+				empty = true;
+				break;
+			}
+		}
 		else
 		{
-			tbm_intersect(result, subresult);
-			tbm_free(subresult);
+			/*
+			 * result is a streamed bitmap, add it as a node to the existing
+			 * stream -- or initialize one otherwise.
+			 */
+			if (node->bitmap)
+			{
+				if (node->bitmap != subresult)
+   				{
+	   				StreamBitmap *s = (StreamBitmap *)subresult;
+	   				stream_move_node((StreamBitmap *)node->bitmap, s, BMS_AND);
+			   	}
+			}
+   			else
+	   			node->bitmap = subresult;
 		}
-
-		/*
-		 * If at any stage we have a completely empty bitmap, we can fall out
-		 * without evaluating the remaining subplans, since ANDing them can no
-		 * longer change the result.  (Note: the fact that indxpath.c orders
-		 * the subplans by selectivity should make this case more likely to
-		 * occur.)
-		 */
-		if (tbm_is_empty(result))
-			break;
 	}
-
-	if (result == NULL)
-		elog(ERROR, "BitmapAnd doesn't support zero inputs");
 
 	/* must provide our own instrumentation support */
 	if (node->ps.instrument)
-		InstrStopNode(node->ps.instrument, 0 /* XXX */ );
+        InstrStopNode(node->ps.instrument, empty ? 0 : 1);
 
-	return (Node *) result;
+	/* check to see if we have any hash bitmaps */
+	if (hbm != NULL)
+	{
+		if (node->bitmap && IsA(node->bitmap, StreamBitmap))
+			stream_add_node((StreamBitmap *)node->bitmap,
+						tbm_create_stream_node(hbm), BMS_AND);
+		else
+			node->bitmap = (Node *) hbm;
+	}
+
+	return (Node *) node->bitmap;
 }
 
 /* ----------------------------------------------------------------
@@ -186,6 +232,13 @@ ExecEndBitmapAnd(BitmapAndState *node)
 void
 ExecReScanBitmapAnd(BitmapAndState *node)
 {
+	/*
+	 * For optimizer a rescan call on BitmapIndexScan could free up the bitmap. So,
+	 * we voluntarily set our bitmap to NULL to ensure that we don't have an out
+	 * of scope pointer
+	 */
+	node->bitmap = NULL;
+
 	int			i;
 
 	for (i = 0; i < node->nplans; i++)

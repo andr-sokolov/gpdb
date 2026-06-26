@@ -20,10 +20,13 @@
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/objectaccess.h"
+#include "catalog/oid_dispatch.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
+#include "cdb/cdbvars.h"
 #include "commands/defrem.h"
+#include "commands/tablecmds.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -549,6 +552,7 @@ RemoveConstraintById(Oid conId)
 	if (OidIsValid(con->conrelid))
 	{
 		Relation	rel;
+		bool		is_part_child = false;
 
 		/*
 		 * If the constraint is for a relation, open and exclusive-lock the
@@ -589,8 +593,14 @@ RemoveConstraintById(Oid conId)
 			heap_close(pgrel, RowExclusiveLock);
 		}
 
-		/* Keep lock on constraint's rel until end of xact */
-		heap_close(rel, NoLock);
+		is_part_child = !rel_needs_long_lock(RelationGetRelid(rel));
+
+		if (is_part_child)
+			/* sufficiently locked, in the case of a partitioned table */
+			heap_close(rel, AccessExclusiveLock);
+		else
+			/* Keep lock on constraint's rel until end of xact */
+			heap_close(rel, NoLock);
 	}
 	else if (OidIsValid(con->contypid))
 	{
@@ -610,6 +620,22 @@ RemoveConstraintById(Oid conId)
 	/* Clean up */
 	ReleaseSysCache(tup);
 	heap_close(conDesc, RowExclusiveLock);
+}
+
+
+/*
+ * GetConstraintNameByOid
+ *		Get the name of the constraint with the given oid, if any.
+ *
+ * Returns a palloc'd string, or NULL if no constraint can be found.
+ */
+char *
+GetConstraintNameByOid(Oid constraintId)
+{
+	if (!OidIsValid(constraintId))
+		return NULL;
+
+	return get_constraint_name(constraintId);
 }
 
 /*
@@ -752,6 +778,64 @@ AlterConstraintNamespaces(Oid ownerId, Oid oldNspId,
 }
 
 /*
+ * ConstraintSetParentConstraint
+ *		Set a partition's constraint as child of its parent table's
+ *
+ * This updates the constraint's pg_constraint row to show it as inherited, and
+ * add a dependency to the parent so that it cannot be removed on its own.
+ */
+void
+ConstraintSetParentConstraint(Oid childConstrId, Oid parentConstrId)
+{
+	Relation	constrRel;
+	Form_pg_constraint constrForm;
+	HeapTuple	tuple,
+				newtup;
+	ObjectAddress depender;
+	ObjectAddress referenced;
+
+	constrRel = heap_open(ConstraintRelationId, RowExclusiveLock);
+	tuple = SearchSysCache1(CONSTROID, ObjectIdGetDatum(childConstrId));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for constraint %u", childConstrId);
+	newtup = heap_copytuple(tuple);
+	constrForm = (Form_pg_constraint) GETSTRUCT(newtup);
+	if (OidIsValid(parentConstrId))
+	{
+		/* don't allow setting parent for a constraint that already has one */
+		Assert(constrForm->coninhcount == 0);
+
+		constrForm->conislocal = false;
+		constrForm->coninhcount++;
+
+		simple_heap_update(constrRel, &tuple->t_self, newtup);
+		CatalogUpdateIndexes(constrRel, newtup);
+
+		ObjectAddressSet(referenced, ConstraintRelationId, parentConstrId);
+		ObjectAddressSet(depender, ConstraintRelationId, childConstrId);
+
+		recordDependencyOn(&depender, &referenced, DEPENDENCY_INTERNAL_AUTO);
+	}
+	else
+	{
+		constrForm->coninhcount--;
+		constrForm->conislocal = true;
+
+		/* Make sure there's no further inheritance. */
+		Assert(constrForm->coninhcount == 0);
+
+		deleteDependencyRecordsForClass(ConstraintRelationId, childConstrId,
+										ConstraintRelationId,
+										DEPENDENCY_INTERNAL_AUTO);
+		simple_heap_update(constrRel, &tuple->t_self, newtup);
+		CatalogUpdateIndexes(constrRel, newtup);
+	}
+	
+	ReleaseSysCache(tuple);
+	heap_close(constrRel, RowExclusiveLock);
+}
+
+/*
  * get_constraint_relation_oids
  *		Find the IDs of the relations to which a constraint refers.
  */
@@ -826,6 +910,45 @@ get_relation_constraint_oid(Oid relid, const char *conname, bool missing_ok)
 	heap_close(pg_constraint, AccessShareLock);
 
 	return conOid;
+}
+
+/*
+ * Return the OID of the constraint associated with the given index in the
+ * given relation; or InvalidOid if no such index is catalogued.
+ */
+Oid
+get_relation_idx_constraint_oid(Oid relationId, Oid indexId)
+{
+	Relation	pg_constraint;
+	SysScanDesc scan;
+	ScanKeyData key;
+	HeapTuple	tuple;
+	Oid			constraintId = InvalidOid;
+
+	pg_constraint = heap_open(ConstraintRelationId, AccessShareLock);
+
+	ScanKeyInit(&key,
+				Anum_pg_constraint_conrelid,
+				BTEqualStrategyNumber,
+				F_OIDEQ,
+				ObjectIdGetDatum(relationId));
+	scan = systable_beginscan(pg_constraint, ConstraintRelidIndexId,
+							  true, NULL, 1, &key);
+	while ((tuple = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_constraint constrForm;
+
+		constrForm = (Form_pg_constraint) GETSTRUCT(tuple);
+		if (constrForm->conindid == indexId)
+		{
+			constraintId = HeapTupleGetOid(tuple);
+			break;
+		}
+	}
+	systable_endscan(scan);
+
+	heap_close(pg_constraint, AccessShareLock);
+	return constraintId;
 }
 
 /*
@@ -996,4 +1119,100 @@ check_functional_grouping(Oid relid,
 	heap_close(pg_constraint, AccessShareLock);
 
 	return result;
+}
+
+
+/**
+ * This method determines if the input attribute is a foreign key and if so,
+ * retrieves the primary key's relation oid and attribute number. It looks at
+ * the pg_constraint system table to determine the answer.
+ * 
+ * Input:
+ * 	relid - relation whose attribute we are examining
+ *  attno - attribute number of the said column
+ *  
+ * Output:
+ * 	*pkrelid - relation id of the table that contains the primary key
+ *  *pkattno - attribute number of the primary key
+ * 	return   - true if found/ false otherwise
+ * 
+ * It returns a value of true if (relid, attno) is indeed a foreign key. It also
+ * sets the output pkrelid and pkattno. If it returns false, then this
+ * column is not a primary key and these output variables are not modified.
+ */
+
+bool
+ConstraintGetPrimaryKeyOf(Oid relid, AttrNumber attno, Oid *pkrelid, AttrNumber *pkattno)
+{
+	bool		found;
+	Relation	conDesc;
+	SysScanDesc conscan;
+	ScanKeyData skey;
+	HeapTuple	tup;
+
+	conDesc = heap_open(ConstraintRelationId, AccessShareLock);
+
+	found = false;
+
+	ScanKeyInit(&skey,
+				Anum_pg_constraint_conrelid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(relid));
+
+	conscan = systable_beginscan(conDesc, ConstraintRelidIndexId, true,
+								 NULL, 1, &skey);
+
+	while (HeapTupleIsValid(tup = systable_getnext(conscan)))
+	{
+		Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tup);
+		
+		if (con->conrelid == relid && con->contype == CONSTRAINT_FOREIGN)
+		{
+			Datum		val;
+			bool		valisnull;
+			Datum		*valarray;
+			int          valarray_length;
+
+			/* first ensure that this is the right key */
+			val = heap_getattr(tup, Anum_pg_constraint_conkey,
+					RelationGetDescr(conDesc), &valisnull);
+
+			Assert(!valisnull);
+
+			deconstruct_array(DatumGetArrayTypeP(val),
+					INT2OID, 2, true, 's',
+					&valarray, NULL, &valarray_length);
+
+			if (valarray_length == 1 && DatumGetInt16(valarray[0]) == attno)
+			{
+				Datum		fval;
+				bool		fvalisnull;
+				Datum		*fvalarray;
+				int          fvalarray_length;
+
+				/* this is the right key, now extract the primary table,key */
+				Assert(con->confrelid != InvalidOid);
+
+				fval = heap_getattr(tup, Anum_pg_constraint_confkey,
+						RelationGetDescr(conDesc), &fvalisnull);
+
+				Assert(!fvalisnull);
+				deconstruct_array(DatumGetArrayTypeP(fval),
+						INT2OID, 2, true, 's',
+						&fvalarray, NULL, &fvalarray_length);
+
+				Assert(fvalarray_length == 1);
+
+				found = true;
+				*pkrelid = con->confrelid;
+				*pkattno = (AttrNumber) DatumGetInt16(fvalarray[0]);
+				break;
+			}
+		}
+	}
+
+	systable_endscan(conscan);
+	heap_close(conDesc, AccessShareLock);
+
+	return found;
 }

@@ -37,38 +37,57 @@ typedef enum NodeTag
 	T_ResultRelInfo,
 	T_EState,
 	T_TupleTableSlot,
+	T_CdbProcess,
+	T_Slice,
+	T_SliceTable,
+	T_CursorPosInfo,
+	T_ShareNodeEntry,
+	T_PartitionState,
+	T_QueryDispatchDesc,
+	T_OidAssignment,
 
 	/*
 	 * TAGS FOR PLAN NODES (plannodes.h)
 	 */
 	T_Plan = 100,
+	T_Scan,
+	T_Join,
+
+	/* Real plan node starts below.  Scan and Join are "Virtual nodes",
+	 * It will take the form of IndexScan, SeqScan, etc.
+	 * CteScan will take the form of SubqueryScan.
+	 */
 	T_Result,
+	T_Plan_Start = T_Result,
 	T_ModifyTable,
 	T_Append,
 	T_MergeAppend,
 	T_RecursiveUnion,
+	T_Sequence,
 	T_BitmapAnd,
 	T_BitmapOr,
-	T_Scan,
 	T_SeqScan,
+	T_DynamicSeqScan,
 	T_IndexScan,
+	T_DynamicIndexScan,
 	T_IndexOnlyScan,
 	T_BitmapIndexScan,
+	T_DynamicBitmapIndexScan,
 	T_BitmapHeapScan,
+	T_DynamicBitmapHeapScan,
 	T_TidScan,
 	T_SubqueryScan,
 	T_FunctionScan,
+	T_TableFunctionScan,
 	T_ValuesScan,
 	T_CteScan,
 	T_WorkTableScan,
 	T_ForeignScan,
-	T_Join,
 	T_NestLoop,
 	T_MergeJoin,
 	T_HashJoin,
 	T_Material,
 	T_Sort,
-	T_Group,
 	T_Agg,
 	T_WindowAgg,
 	T_Unique,
@@ -76,6 +95,14 @@ typedef enum NodeTag
 	T_SetOp,
 	T_LockRows,
 	T_Limit,
+	T_Motion,
+	T_ShareInputScan,
+	T_Repeat,
+	T_SplitUpdate,
+	T_RowTrigger,
+	T_AssertOp,
+	T_PartitionSelector,
+	T_Plan_End,
 	/* these aren't subclasses of Plan: */
 	T_NestLoopParam,
 	T_PlanRowMark,
@@ -87,33 +114,42 @@ typedef enum NodeTag
 	 * These should correspond one-to-one with Plan node types.
 	 */
 	T_PlanState = 200,
+	T_ScanState,
+	T_JoinState,
+
+	/* Real plan node starts below.  Scan and Join are "Virtal nodes",
+	 * It will take the form of IndexScan, SeqScan, etc.
+	 */
 	T_ResultState,
 	T_ModifyTableState,
 	T_AppendState,
 	T_MergeAppendState,
 	T_RecursiveUnionState,
+	T_SequenceState,
 	T_BitmapAndState,
 	T_BitmapOrState,
-	T_ScanState,
 	T_SeqScanState,
+	T_DynamicSeqScanState,
 	T_IndexScanState,
+	T_DynamicIndexScanState,
 	T_IndexOnlyScanState,
 	T_BitmapIndexScanState,
+	T_DynamicBitmapIndexScanState,
 	T_BitmapHeapScanState,
+	T_DynamicBitmapHeapScanState,
 	T_TidScanState,
 	T_SubqueryScanState,
 	T_FunctionScanState,
+	T_TableFunctionState,
 	T_ValuesScanState,
 	T_CteScanState,
 	T_WorkTableScanState,
 	T_ForeignScanState,
-	T_JoinState,
 	T_NestLoopState,
 	T_MergeJoinState,
 	T_HashJoinState,
 	T_MaterialState,
 	T_SortState,
-	T_GroupState,
 	T_AggState,
 	T_WindowAggState,
 	T_UniqueState,
@@ -121,6 +157,20 @@ typedef enum NodeTag
 	T_SetOpState,
 	T_LockRowsState,
 	T_LimitState,
+	T_MotionState,
+	T_ShareInputScanState,
+	T_RepeatState,
+	T_SplitUpdateState,
+	T_RowTriggerState,
+	T_AssertOpState,
+	T_PartitionSelectorState,
+
+	/*
+	 * TupleDesc and ParamListInfo are not Nodes as such, but you can wrap
+	 * them in TupleDescNode and SerializedParamExternData structs for serialization.
+	 */
+	T_TupleDescNode,
+	T_SerializedParamExternData,
 
 	/*
 	 * TAGS FOR PRIMITIVE NODES (primnodes.h)
@@ -171,11 +221,26 @@ typedef enum NodeTag
 	T_JoinExpr,
 	T_FromExpr,
 	T_IntoClause,
+	T_CopyIntoClause,
+	T_RefreshClause,
+	T_Flow,
+	T_Grouping,
+	T_GroupId,
+	T_DistributedBy,
+	T_DMLActionExpr,
+	T_PartSelectedExpr,
+	T_PartDefaultExpr,
+	T_PartBoundExpr,
+	T_PartBoundInclusionExpr,
+	T_PartBoundOpenExpr,
+	T_PartListRuleExpr,
+	T_PartListNullTestExpr,
+	T_TableOidInfo,
 
 	/*
 	 * TAGS FOR EXPRESSION STATE NODES (execnodes.h)
 	 *
-	 * These correspond (not always one-for-one) to primitive nodes derived
+	 * These correspond (not always one-for-one) to primitive nodes derivedO
 	 * from Expr.
 	 */
 	T_ExprState = 400,
@@ -205,6 +270,14 @@ typedef enum NodeTag
 	T_NullTestState,
 	T_CoerceToDomainState,
 	T_DomainConstraintState,
+	T_GroupingFuncExprState,
+	T_PartSelectedExprState,
+	T_PartDefaultExprState,
+	T_PartBoundExprState,
+	T_PartBoundInclusionExprState,
+	T_PartBoundOpenExprState,
+	T_PartListRuleExprState,
+	T_PartListNullTestExprState,
 
 	/*
 	 * TAGS FOR PLANNER NODES (relation.h)
@@ -229,6 +302,7 @@ typedef enum NodeTag
 	T_ResultPath,
 	T_MaterialPath,
 	T_UniquePath,
+	T_ProjectionPath,
 	T_EquivalenceClass,
 	T_EquivalenceMember,
 	T_PathKey,
@@ -239,13 +313,25 @@ typedef enum NodeTag
 	T_AppendRelInfo,
 	T_PlaceHolderInfo,
 	T_MinMaxAggInfo,
+	T_Partition,
+	T_PartitionRule,
+	T_PartitionNode,
+	T_PgPartRule,
+	T_SegfileMapNode,
 	T_PlannerParamItem,
+
+    /* Tags for MPP planner nodes (relation.h) */
+    T_CdbMotionPath = 580,
+	T_PartitionSelectorPath,
+    T_CdbRelColumnInfo,
+	T_DistributionKey,
 
 	/*
 	 * TAGS FOR MEMORY NODES (memnodes.h)
 	 */
 	T_MemoryContext = 600,
 	T_AllocSetContext,
+	T_MemoryAccount,
 
 	/*
 	 * TAGS FOR VALUE NODES (value.h)
@@ -284,6 +370,7 @@ typedef enum NodeTag
 	T_ClusterStmt,
 	T_CopyStmt,
 	T_CreateStmt,
+	T_SingleRowErrorDesc,
 	T_DefineStmt,
 	T_DropStmt,
 	T_TruncateStmt,
@@ -317,6 +404,12 @@ typedef enum NodeTag
 	T_CreateRoleStmt,
 	T_AlterRoleStmt,
 	T_DropRoleStmt,
+	T_CreateQueueStmt,
+	T_AlterQueueStmt,
+	T_DropQueueStmt,
+	T_CreateResourceGroupStmt,
+	T_DropResourceGroupStmt,
+	T_AlterResourceGroupStmt,
 	T_LockStmt,
 	T_ConstraintsSetStmt,
 	T_ReindexStmt,
@@ -366,6 +459,26 @@ typedef enum NodeTag
 	T_ReplicaIdentityStmt,
 	T_AlterSystemStmt,
 
+	/* GPDB additions */
+	T_PartitionBy,
+	T_PartitionElem,
+	T_PartitionRangeItem,
+	T_PartitionBoundSpec,
+	T_PartitionSpec,
+	T_PartitionValuesSpec,
+	T_AlterPartitionId,
+	T_AlterPartitionCmd,
+	T_InheritPartitionCmd,
+	T_CreateFileSpaceStmt,
+	T_FileSpaceEntry,
+	T_DropFileSpaceStmt,
+	T_TableValueExpr,
+	T_DenyLoginInterval,
+	T_DenyLoginPoint,
+	T_AlterTypeStmt,
+	T_SetDistributionCmd,
+	T_ExpandStmtSpec,
+
 	/*
 	 * TAGS FOR PARSE TREE NODES (parsenodes.h)
 	 */
@@ -393,6 +506,8 @@ typedef enum NodeTag
 	T_RangeTblEntry,
 	T_RangeTblFunction,
 	T_WithCheckOption,
+	T_GroupingClause,
+	T_GroupingFunc,
 	T_SortGroupClause,
 	T_WindowClause,
 	T_PrivGrantee,
@@ -406,6 +521,7 @@ typedef enum NodeTag
 	T_XmlSerialize,
 	T_WithClause,
 	T_CommonTableExpr,
+	T_ColumnReferenceStorageDirective,
 
 	/*
 	 * TAGS FOR REPLICATION GRAMMAR PARSE NODES (replnodes.h)
@@ -431,7 +547,15 @@ typedef enum NodeTag
 	T_WindowObjectData,			/* private in nodeWindowAgg.c */
 	T_TIDBitmap,				/* in nodes/tidbitmap.h */
 	T_InlineCodeBlock,			/* in nodes/parsenodes.h */
-	T_FdwRoutine				/* in foreign/fdwapi.h */
+	T_FdwRoutine,				/* in foreign/fdwapi.h */
+    T_StreamBitmap,             /* in nodes/tidbitmap.h */
+	T_SelectedParts,            /* in executor/nodePartitionSelector.h */
+	T_CookedConstraint,			/* in catalog/heap.h */
+
+    /* CDB: tags for random other stuff */
+    T_CdbExplain_StatHdr = 1000,             /* in cdb/cdbexplain.c */
+	T_GpPolicy,	/* in catalog/gp_policy.h */
+
 } NodeTag;
 
 /*
@@ -526,6 +650,14 @@ castNodeImpl(NodeTag type, void *ptr)
 extern char *nodeToString(const void *obj);
 
 /*
+ * nodes/outfast.c. This special version of nodeToString is only used by serializeNode.
+ * It's a quick hack that allocates 8K buffer for StringInfo struct through initStringIinfoSizeOf
+ */
+extern char *nodeToBinaryStringFast(void *obj, int *length);
+
+extern Node *readNodeFromBinaryString(const char *str, int len);
+
+/*
  * nodes/{readfuncs.c,read.c}
  */
 extern void *stringToNode(char *str);
@@ -605,13 +737,28 @@ typedef enum JoinType
 	 */
 	JOIN_SEMI,					/* 1 copy of each LHS row that has match(es) */
 	JOIN_ANTI,					/* 1 copy of each LHS row that has no match */
+	JOIN_LASJ_NOTIN,			/* Left Anti Semi Join with Not-In semantics:
+									If any NULL values are produced by inner side,
+									return no join results. Otherwise, same as LASJ */
 
 	/*
 	 * These codes are used internally in the planner, but are not supported
 	 * by the executor (nor, indeed, by most of the planner).
 	 */
 	JOIN_UNIQUE_OUTER,			/* LHS path must be made unique */
-	JOIN_UNIQUE_INNER			/* RHS path must be made unique */
+	JOIN_UNIQUE_INNER,			/* RHS path must be made unique */
+
+	/*
+	 * GPDB: Like JOIN_UNIQUE_OUTER/INNER, these codes are used internally
+	 * in the planner, but are not supported by the executor or by most of the
+	 * planner. A JOIN_DEDUP_SEMI join indicates a semi-join, but to be
+	 * implemented by performing a normal inner join, and eliminating the
+	 * duplicates with a UniquePath above the join. That can be useful in
+	 * an MPP environment, if performing the join as an inner join avoids
+	 * moving the larger of the two relations.
+	 */
+	JOIN_DEDUP_SEMI,			/* inner join, LHS path must be made unique afterwards */
+	JOIN_DEDUP_SEMI_REVERSE		/* inner join, RHS path must be made unique afterwards */
 
 	/*
 	 * We might need additional join types someday.
@@ -637,6 +784,34 @@ typedef enum JoinType
 	  ((1 << JOIN_LEFT) | \
 	   (1 << JOIN_FULL) | \
 	   (1 << JOIN_RIGHT) | \
-	   (1 << JOIN_ANTI))) != 0)
+	   (1 << JOIN_ANTI) | \
+	   (1 << JOIN_LASJ_NOTIN))) != 0)
+
+/*
+ * FlowType - kinds of tuple flows in parallelized plans.
+ *
+ * This enum is a MPP extension.
+ */
+typedef enum FlowType
+{
+	FLOW_UNDEFINED,		/* used prior to calculation of type of derived flow */
+	FLOW_SINGLETON,		/* flow has single stream */
+	FLOW_REPLICATED,	/* flow is replicated across IOPs */
+	FLOW_PARTITIONED,	/* flow is partitioned across IOPs */
+} FlowType;
+
+/*
+ * DispatchMethod - MPP dispatch method.
+ *
+ * There are currently three possibilties, an initial value of undetermined,
+ * and a value for each of the ways the dispatch code implements.
+ */
+typedef enum DispatchMethod
+{
+	DISPATCH_UNDETERMINED = 0,	/* Used prior to determination. */
+	DISPATCH_SEQUENTIAL,		/* Dispatch on entry postgres process only. */
+	DISPATCH_PARALLEL			/* Dispatch on query executor and entry processes. */
+
+} DispatchMethod;
 
 #endif   /* NODES_H */

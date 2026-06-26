@@ -78,6 +78,12 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <limits.h>
+#include "access/xlog.h"
+/* headers required for process affinity bindings */
+#ifdef HAVE_NUMA_H
+#define NUMA_VERSION1_COMPATIBILITY 1
+#include <numa.h>
+#endif
 
 #ifdef HAVE_SYS_SELECT_H
 #include <sys/select.h>
@@ -106,28 +112,42 @@
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
 #include "postmaster/bgworker_internals.h"
+#include "postmaster/bgwriter.h"
 #include "postmaster/fork_process.h"
 #include "postmaster/pgarch.h"
 #include "postmaster/postmaster.h"
+#include "postmaster/fts.h"
 #include "postmaster/syslogger.h"
+#include "postmaster/backoff.h"
+#include "postmaster/bgworker.h"
 #include "replication/walsender.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/pg_shmem.h"
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
+#include "storage/procsignal.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
 #include "utils/datetime.h"
 #include "utils/dynamic_loader.h"
+#include "utils/gdd.h"
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
 #include "utils/timeout.h"
 
-#ifdef EXEC_BACKEND
-#include "storage/spin.h"
-#endif
+#include "cdb/cdbgang.h"                /* cdbgang_parse_gpqeid_params */
+#include "cdb/cdbtm.h"
+#include "cdb/cdbvars.h"
+#include "cdb/ic_proxy_bgworker.h"
 
+/*
+ * This is set in backends that are handling a GPDB specific message (FTS or
+ * fault injector) on mirror.
+ */
+bool am_mirror = false;
+/* GPDB specific flag to handle deadlocks during parallel segment start. */
+volatile bool *pm_launch_walreceiver = NULL;
 
 /*
  * Possible types of a backend. Beyond being the possible bkend_type values in
@@ -239,7 +259,11 @@ bool		enable_bonjour = false;
 char	   *bonjour_name;
 bool		restart_after_crash = true;
 
-/* PIDs of special child processes; 0 when not running */
+/*
+ * PIDs of special child processes; 0 when not running. When adding a new PID
+ * to the list, remember to add the process title to GetServerProcessTitle()
+ * as well.
+ */
 static pid_t StartupPID = 0,
 			BgWriterPID = 0,
 			CheckpointerPID = 0,
@@ -308,7 +332,7 @@ static bool FatalError = false; /* T if recovering from backend crash */
  *
  * Notice that this state variable does not distinguish *why* we entered
  * states later than PM_RUN --- Shutdown and FatalError must be consulted
- * to find that out.  FatalError is never true in PM_RECOVERY_* or PM_RUN
+ * to find that out.  FatalError is never true in PM_INIT through PM_RUN
  * states, nor in PM_SHUTDOWN states (because we don't enter those states
  * when trying to recover from a crash).  It can be true in PM_STARTUP state,
  * because we don't clear it until we've successfully started WAL redo.
@@ -339,6 +363,49 @@ static time_t AbortStartTime = 0;
 /* Length of said timeout */
 #define SIGKILL_CHILDREN_AFTER_SECS		5
 
+/* Set at database system is ready to accept connections */
+pg_time_t PMAcceptingConnectionsStartTime = 0;
+
+static BackgroundWorker PMAuxProcList[MaxPMAuxProc] =
+{
+	{"ftsprobe process",
+	 BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION,
+	 BgWorkerStart_DtxRecovering, /* no need to wait dtx recovery */
+	 0, /* restart immediately if ftsprobe exits with non-zero code */
+	 FtsProbeMain, {0}, {0}, 0, 0,
+	 FtsProbeStartRule},
+
+	{"global deadlock detector process",
+	 BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION,
+	 BgWorkerStart_RecoveryFinished,
+	 0, /* restart immediately if gdd exits with non-zero code */
+	 GlobalDeadLockDetectorMain, {0}, {0}, 0, 0,
+	 GlobalDeadLockDetectorStartRule},
+
+	{"dtx recovery process",
+	 BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION,
+	 BgWorkerStart_DtxRecovering, /* no need to wait dtx recovery */
+	 0, /* restart immediately if dtx recovery process exits with non-zero code */
+	 DtxRecoveryMain, {0}, {0}, 0, 0,
+	 DtxRecoveryStartRule},
+
+	{"sweeper process",
+	 BGWORKER_SHMEM_ACCESS,
+	 BgWorkerStart_RecoveryFinished,
+	 0, /* restart immediately if sweeper process exits with non-zero code */
+	 BackoffSweeperMain, {0}, {0}, 0, 0,
+	 BackoffSweeperStartRule},
+
+#ifdef ENABLE_IC_PROXY
+	{"ic proxy process",
+	 0,
+	 BgWorkerStart_RecoveryFinished,
+	 0, /* restart immediately if ic proxy process exits with non-zero code */
+	 ICProxyMain, {0}, {0}, 0, 0,
+	 ICProxyStartRule},
+#endif  /* ENABLE_IC_PROXY */
+};
+
 static bool ReachedNormalRunning = false;		/* T if we've reached PM_RUN */
 
 bool		ClientAuthInProgress = false;		/* T during new-client
@@ -367,6 +434,11 @@ static volatile bool HaveCrashedWorker = false;
 static unsigned int random_seed = 0;
 static struct timeval random_start_time;
 
+/* some GUC values used in fetching status from status transition */
+extern char	   *locale_monetary;
+extern char	   *locale_numeric;
+extern char    *locale_collate;
+
 #ifdef USE_BONJOUR
 static DNSServiceRef bonjour_sdref = NULL;
 #endif
@@ -378,6 +450,7 @@ static void CloseServerPorts(int status, Datum arg);
 static void unlink_external_pid_file(int status, Datum arg);
 static void getInstallationPaths(const char *argv0);
 static void checkDataDir(void);
+static void checkPgDir(const char *dir);
 static Port *ConnCreate(int serverFd);
 static void ConnFree(Port *port);
 static void reset_shared(int port);
@@ -401,7 +474,7 @@ static int	ServerLoop(void);
 static int	BackendStartup(Port *port);
 static int	ProcessStartupPacket(Port *port, bool SSLdone);
 static void SendNegotiateProtocolVersion(List *unrecognized_protocol_options);
-static void processCancelRequest(Port *port, void *pkt);
+static void processCancelRequest(Port *port, void *pkt, MsgType code);
 static int	initMasks(fd_set *rmask);
 static void report_fork_failure_to_client(Port *port, int errnum);
 static CAC_state canAcceptConnections(void);
@@ -423,6 +496,10 @@ static pid_t StartChildProcess(AuxProcType type);
 static void StartAutovacuumWorker(void);
 static void MaybeStartWalReceiver(void);
 static void InitPostmasterDeathWatchHandle(void);
+
+static void setProcAffinity(int id);
+
+bool isAuxiliaryBgWorker(BackgroundWorker *worker);
 
 #ifdef EXEC_BACKEND
 
@@ -494,6 +571,7 @@ typedef struct
 	pg_time_t	first_syslogger_file_time;
 	bool		redirection_done;
 	bool		IsBinaryUpgrade;
+	bool		ConvertMasterDataDirToSegment;
 	int			max_safe_fds;
 	int			MaxBackends;
 #ifdef WIN32
@@ -532,6 +610,9 @@ static void ShmemBackendArrayRemove(Backend *bn);
 /* Macros to check exit status of a child process */
 #define EXIT_STATUS_0(st)  ((st) == 0)
 #define EXIT_STATUS_1(st)  (WIFEXITED(st) && WEXITSTATUS(st) == 1)
+
+/* if we are a QD postmaster or not */
+bool Gp_entry_postmaster = false;
 
 #ifndef WIN32
 /*
@@ -636,7 +717,7 @@ PostmasterMain(int argc, char *argv[])
 	 * tcop/postgres.c (the option sets should not conflict) and with the
 	 * common help() function in main/main.c.
 	 */
-	while ((opt = getopt(argc, argv, "A:B:bc:C:D:d:EeFf:h:ijk:lN:nOo:Pp:r:S:sTt:W:-:")) != -1)
+	while ((opt = getopt(argc, argv, "A:B:bc:C:D:d:EeFf:h:ijk:lMmN:nOo:Pp:r:S:sTt:W:-:")) != -1)
 	{
 		switch (opt)
 		{
@@ -666,7 +747,10 @@ PostmasterMain(int argc, char *argv[])
 				break;
 
 			case 'E':
-				SetConfigOption("log_statement", "all", PGC_POSTMASTER, PGC_S_ARGV);
+				Gp_entry_postmaster = true;
+				/*
+				 * 	SetConfigOption("log_statement", "all", PGC_POSTMASTER, PGC_S_ARGV);
+				 */
 				break;
 
 			case 'e':
@@ -704,6 +788,27 @@ PostmasterMain(int argc, char *argv[])
 
 			case 'l':
 				SetConfigOption("ssl", "true", PGC_POSTMASTER, PGC_S_ARGV);
+				break;
+
+			case 'M':
+				/* Undocumented flag used for mutating a directory that was a copy of a
+				 * master data directory and needs to now be a segment directory. Only
+				 * use on the first time the segment is started, and only use in
+				 * utility mode, as changes will be destructive, and will assume that
+				 * the segment has never participated in a distributed
+				 * transaction.*/
+				ConvertMasterDataDirToSegment = true;
+				break;
+
+			case 'm':
+				/*
+				 * In maintenance mode:
+				 * 	1. allow DML on catalog table
+				 * 	2. allow DML on segments
+				 */
+				SetConfigOption("maintenance_mode",  	  	"true", PGC_POSTMASTER, PGC_S_ARGV);
+				SetConfigOption("allow_segment_DML", 	  	"true", PGC_POSTMASTER, PGC_S_ARGV);
+				SetConfigOption("allow_system_table_mods",	"true",  PGC_POSTMASTER, PGC_S_ARGV);
 				break;
 
 			case 'N':
@@ -831,6 +936,19 @@ PostmasterMain(int argc, char *argv[])
 	if (!SelectConfigFiles(userDoption, progname))
 		ExitPostmaster(2);
 
+	/*
+	 * CDB/MPP/GPDB: Set the processor affinity (may be a no-op on
+	 * some platforms). The port number is nice to use because we know
+	 * that different segments on a single host will not have the same
+	 * port numbers.
+	 *
+	 * We want to do this as early as we can -- so that the OS knows
+	 * about our binding, and all of our child processes will inherit
+	 * the same binding.
+ 	 */
+	if (gp_set_proc_affinity)
+		setProcAffinity(PostPortNumber);
+
 	if (output_config_variable != NULL)
 	{
 		/*
@@ -852,9 +970,28 @@ PostmasterMain(int argc, char *argv[])
 	ChangeToDataDir();
 
 	/*
+     * CDB: Decouple NBuffers from MaxBackends.  The entry db doesn't benefit
+     * from buffers in excess of the global catalog size; this is typically
+     * small and unrelated to the number of clients.  Segment dbs need enough
+     * buffers to accommodate the QEs concurrently accessing the database; but
+     * non-leaf QEs don't necessarily access the database (some are used only
+     * for sorting, hashing, etc); so again the number of buffers need not be
+     * in proportion to the number of connections.
+	 */
+	if (NBuffers < 16)
+	{
+		/*
+		 * Do not accept -B so small that backends are likely to starve for
+		 * lack of buffers.  The specific choices here are somewhat arbitrary.
+		 */
+		write_stderr("%s: the number of buffers (-B) must be at least 16\n", progname);
+		ExitPostmaster(1);
+	}
+
+	/*
 	 * Check for invalid combinations of GUC settings.
 	 */
-	if (ReservedBackends >= MaxConnections)
+	if (ReservedBackends > MaxConnections)
 	{
 		write_stderr("%s: superuser_reserved_connections must be less than max_connections\n", progname);
 		ExitPostmaster(1);
@@ -871,6 +1008,30 @@ PostmasterMain(int argc, char *argv[])
 		ereport(ERROR,
 				(errmsg("WAL streaming (max_wal_senders > 0) requires wal_level \"archive\", \"hot_standby\", or \"logical\"")));
 
+    if ( GpIdentity.dbid == -1 && Gp_role == GP_ROLE_UTILITY)
+    {
+        /**
+         * okay in utility mode! -- when starting the master in utility mode to fetch the configuration contents,
+         *  we don't actually know the dbid.
+         */
+    }
+	else if ( GpIdentity.dbid < 0 )
+	{
+	    ereport(FATAL,
+            (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+             errmsg("dbid (from -b option) is not specified or is invalid.  This value must be >= 0, or >= -1 in utility mode.  "
+             "The dbid value to pass can be determined from this server's entry in the segment configuration; it may be -1 if running in utility mode.")));
+	}
+
+    if ( GpIdentity.segindex < -1 ) /* -1 is okay -- that means the master */
+	{
+	    ereport(FATAL,
+            (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+             errmsg("contentid (from -C option) is not specified or is invalid.  This value must be >= -1.  "
+             "The contentid value to pass can be determined this server's entry in the segment configuration; it may be -1 for a master, or in utility mode."
+             )));
+	}
+
 	/*
 	 * Other one-time internal sanity checks can go here, if they are fast.
 	 * (Put any slow processing further down, after postmaster.pid creation.)
@@ -886,7 +1047,7 @@ PostmasterMain(int argc, char *argv[])
 	 * getopt(3) library so that it will work correctly in subprocesses.
 	 */
 	optind = 1;
-#ifdef HAVE_INT_OPTRESET
+#if defined(HAVE_INT_OPTRESET) || !defined(HAVE_GETOPT)
 	optreset = 1;				/* some systems need this too */
 #endif
 
@@ -924,12 +1085,25 @@ PostmasterMain(int argc, char *argv[])
 	CreateDataDirLockFile(true);
 
 	/*
+	 * Remember postmaster startup time
+     * CDB: Moved this code up from below for use in error message headers.
+	 */
+	PgStartTime = GetCurrentTimestamp();
+
+	/*
 	 * Initialize SSL library, if specified.
 	 */
 #ifdef USE_SSL
 	if (EnableSSL)
 		secure_initialize();
 #endif
+
+	/*
+	 * CDB: gpdb auxilary process like fts probe, dtx recovery process is
+	 * essential, we need to load them ahead of custom shared preload libraries
+	 * to avoid exceeding max_worker_processes.
+	 */
+	load_auxiliary_libraries();
 
 	/*
 	 * process any libraries that should be preloaded at postmaster start
@@ -1258,7 +1432,8 @@ PostmasterMain(int argc, char *argv[])
 		 * since there is no way to connect to the database in this case.
 		 */
 		ereport(FATAL,
-				(errmsg("could not load pg_hba.conf")));
+				(errcode(ERRCODE_CONFIG_FILE_ERROR),
+				 (errmsg("could not load pg_hba.conf"))));
 	}
 	if (!load_ident())
 	{
@@ -1422,8 +1597,6 @@ getInstallationPaths(const char *argv0)
 static void
 checkDataDir(void)
 {
-	char		path[MAXPGPATH];
-	FILE	   *fp;
 	struct stat stat_buf;
 
 	Assert(DataDir);
@@ -1492,18 +1665,38 @@ checkDataDir(void)
 	/* Look for PG_VERSION before looking for pg_control */
 	ValidatePgVersion(DataDir);
 
-	snprintf(path, sizeof(path), "%s/global/pg_control", DataDir);
+    /* for mirroring, the check for pg_control was removed.  a mirror must be able to start
+     *  without a pg_control file.  The  check for pg_control will be done
+     *  when the control file is read by xlog initialization.
+     */
+}
 
-	fp = AllocateFile(path, PG_BINARY_R);
-	if (fp == NULL)
+
+/*
+ * check if file or directory under "DataDir" exists and is accessible
+ */
+static void
+checkPgDir(const char *dir)
+{
+	struct stat st;
+	/*
+	 * DataDir is known to be smaller than MAXPGPATH, and 'dir' argument is always
+	 * a short constant.
+	 */
+	char		buf[MAXPGPATH + MAXPGPATH];
+
+	snprintf(buf, sizeof(buf), "%s%s", DataDir, dir);
+
+	if (stat(buf, &st) != 0)
 	{
-		write_stderr("%s: could not find the database system\n"
-					 "Expected to find it in the directory \"%s\",\n"
-					 "but could not open file \"%s\": %s\n",
-					 progname, DataDir, path, strerror(errno));
-		ExitPostmaster(2);
+		/* check if pg_log is there */
+		snprintf(buf, sizeof(buf), "%s%s", DataDir, "/pg_log");
+		if (stat(buf, &st) == 0)
+			elog(LOG, "System file or directory missing (%s), shutting down segment", dir);
+
+		/* quit all processes and exit */
+		pmdie(SIGQUIT);
 	}
-	FreeFile(fp);
 }
 
 /*
@@ -1679,6 +1872,26 @@ ServerLoop(void)
 			}
 		}
 
+		/* Sanity check for system directories on all segments */
+		checkPgDir("");
+		checkPgDir("/base");
+		checkPgDir("/global");
+		checkPgDir("/pg_twophase");
+		checkPgDir("/pg_utilitymodedtmredo");
+		checkPgDir("/pg_distributedlog");
+		checkPgDir("/pg_multixact");
+		checkPgDir("/pg_subtrans");
+		checkPgDir("/pg_xlog");
+		checkPgDir("/pg_clog");
+		checkPgDir("/pg_multixact/members");
+		checkPgDir("/pg_multixact/offsets");
+
+		/*
+		 * Block all signals until we wait again.  (This makes it safe for our
+		 * signal handlers to do nontrivial work.)
+		 */
+		PG_SETMASK(&BlockSig);
+
 		/*
 		 * New connection pending on any of our sockets? If so, fork a child
 		 * process to deal with it.
@@ -1751,10 +1964,6 @@ ServerLoop(void)
 			if (AutoVacPID != 0)
 				start_autovac_launcher = false; /* signal processed */
 		}
-
-		/* If we have lost the archiver, try to start a new one */
-		if (XLogArchivingActive() && PgArchPID == 0 && pmState == PM_RUN)
-			PgArchPID = pgarch_start();
 
 		/* If we have lost the stats collector, try to start a new one */
 		if (PgStatPID == 0 &&
@@ -1876,6 +2085,30 @@ initMasks(fd_set *rmask)
 	return maxsock + 1;
 }
 
+/*
+ * Once the flag is reset, libpq connections (e.g. FTS probe requests) should
+ * not get CAC_MIRROR_READY response.  This flag is needed during GPDB startup
+ * to enable "pg_ctl -w".  It need not interfere during or after promotion.
+ * This function is called right after removing RECOVERY_COMMAND_FILE upon
+ * receiving a promotion request.
+ */
+void inline
+ResetMirrorReadyFlag(void)
+{
+	*pm_launch_walreceiver = false;
+}
+
+static inline void
+SetMirrorReadyFlag(void)
+{
+	*pm_launch_walreceiver = true;
+}
+
+static inline bool
+GetMirrorReadyFlag(void)
+{
+	return *pm_launch_walreceiver;
+}
 
 /*
  * Read a client's startup packet and do something according to it.
@@ -1895,6 +2128,8 @@ ProcessStartupPacket(Port *port, bool SSLdone)
 	void	   *buf;
 	ProtocolVersion proto;
 	MemoryContext oldcontext;
+    char       *gpqeid = NULL;
+	XLogRecPtr  recptr;
 
 	pq_startmsgread();
 	if (pq_getbytes((char *) &len, 4) == EOF)
@@ -1919,7 +2154,7 @@ ProcessStartupPacket(Port *port, bool SSLdone)
 	{
 		ereport(COMMERROR,
 				(errcode(ERRCODE_PROTOCOL_VIOLATION),
-				 errmsg("invalid length of startup packet")));
+				 errmsg("invalid length of startup packet %ld",(long)len)));
 		return STATUS_ERROR;
 	}
 
@@ -1949,9 +2184,9 @@ ProcessStartupPacket(Port *port, bool SSLdone)
 	 */
 	port->proto = proto = ntohl(*((ProtocolVersion *) buf));
 
-	if (proto == CANCEL_REQUEST_CODE)
+	if (proto == CANCEL_REQUEST_CODE || proto == FINISH_REQUEST_CODE)
 	{
-		processCancelRequest(port, buf);
+		processCancelRequest(port, buf, proto);
 		/* Not really an error, but we don't want to proceed further */
 		return STATUS_ERROR;
 	}
@@ -2050,6 +2285,8 @@ retry1:
 				port->user_name = pstrdup(valptr);
 			else if (strcmp(nameptr, "options") == 0)
 				port->cmdline_options = pstrdup(valptr);
+			else if (strcmp(nameptr, "gpqeid") == 0)
+				gpqeid = valptr;
 			else if (strcmp(nameptr, "replication") == 0)
 			{
 				/*
@@ -2079,6 +2316,26 @@ retry1:
 				 */
 				unrecognized_protocol_options =
 					lappend(unrecognized_protocol_options, pstrdup(nameptr));
+			}
+			else if (strcmp(nameptr, GPCONN_TYPE) == 0)
+			{
+				am_mirror = IsRoleMirror();
+				if (strcmp(valptr, GPCONN_TYPE_FTS) == 0)
+				{
+					if (IS_QUERY_DISPATCHER())
+						ereport(FATAL,
+								(errcode(ERRCODE_PROTOCOL_VIOLATION),
+								 errmsg("cannot handle FTS connection on master")));
+					am_ftshandler = true;
+				}
+				else
+					ereport(FATAL,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("invalid value for option: \"%s\"", GPCONN_TYPE)));
+			}
+			else if (strcmp(nameptr, "diff_options") == 0)
+			{
+				port->diff_options = pstrdup(valptr);
 			}
 			else
 			{
@@ -2177,8 +2434,14 @@ retry1:
 	 * can make sense to first make a basebackup and then stream changes
 	 * starting from that.
 	 */
-	if (am_walsender && !am_db_walsender)
+	if ((am_walsender && !am_db_walsender) || am_ftshandler)
 		port->database_name[0] = '\0';
+
+	/*
+	 * CDB: Process "gpqeid" parameter string for qExec startup.
+	 */
+	if (gpqeid)
+		cdbgang_parse_gpqeid_params(port, gpqeid);
 
 	/*
 	 * Done putting stuff in TopMemoryContext.
@@ -2193,9 +2456,16 @@ retry1:
 	switch (port->canAcceptConnections)
 	{
 		case CAC_STARTUP:
+			if (am_ftshandler && am_mirror)
+				break;
+
+			recptr = last_xlog_replay_location();
+
 			ereport(FATAL,
 					(errcode(ERRCODE_CANNOT_CONNECT_NOW),
-					 errmsg("the database system is starting up")));
+					 errmsg(POSTMASTER_IN_STARTUP_MSG),
+					 errdetail(POSTMASTER_IN_RECOVERY_DETAIL_MSG " %X/%X",
+						   (uint32) (recptr >> 32), (uint32) recptr)));
 			break;
 		case CAC_SHUTDOWN:
 			ereport(FATAL,
@@ -2203,9 +2473,13 @@ retry1:
 					 errmsg("the database system is shutting down")));
 			break;
 		case CAC_RECOVERY:
+			recptr = last_xlog_replay_location();
+
 			ereport(FATAL,
 					(errcode(ERRCODE_CANNOT_CONNECT_NOW),
-					 errmsg("the database system is in recovery mode")));
+					 errmsg(POSTMASTER_IN_RECOVERY_MSG),
+					 errdetail(POSTMASTER_IN_RECOVERY_DETAIL_MSG " %X/%X",
+						   (uint32) (recptr >> 32), (uint32) recptr)));
 			break;
 		case CAC_TOOMANY:
 			ereport(FATAL,
@@ -2213,7 +2487,32 @@ retry1:
 					 errmsg("sorry, too many clients already")));
 			break;
 		case CAC_WAITBACKUP:
-			/* OK for now, will check in InitPostgres */
+			/* Greenplum does not currently use WAITBACKUP state. */
+			Assert(port->canAcceptConnections != CAC_WAITBACKUP);
+			break;
+		case CAC_MIRROR_READY:
+			if (am_ftshandler)
+			{
+				/* Even if the connection state is MIRROR_READY, the role
+				 * may change to primary during promoting. Hence, we need
+				 * to decline this connection to avoid confusion. This needs
+				 * to wait until promotion is finished and pmState changed
+				 * to PM_RUN.
+				 */
+				if (!am_mirror)
+					ereport(FATAL,
+							(errmsg("mirror is being promoted.")));
+				break;
+			}
+
+			recptr = last_xlog_replay_location();
+			ereport(FATAL,
+					(errcode(ERRCODE_MIRROR_READY),
+					 errmsg(POSTMASTER_IN_RECOVERY_MSG),
+					 errdetail(POSTMASTER_IN_RECOVERY_DETAIL_MSG " %X/%X\n"
+							   POSTMASTER_MIRROR_VERSION_DETAIL_MSG " %s",
+							   (uint32) (recptr >> 32), (uint32) recptr,
+							   TextDatumGetCString(pgsql_version(NULL)))));
 			break;
 		case CAC_OK:
 			break;
@@ -2257,7 +2556,7 @@ SendNegotiateProtocolVersion(List *unrecognized_protocol_options)
  * Nothing is sent back to the client.
  */
 static void
-processCancelRequest(Port *port, void *pkt)
+processCancelRequest(Port *port, void *pkt, MsgType code)
 {
 	CancelRequestPacket *canc = (CancelRequestPacket *) pkt;
 	int			backendPID;
@@ -2292,10 +2591,21 @@ processCancelRequest(Port *port, void *pkt)
 			if (bp->cancel_key == cancelAuthCode)
 			{
 				/* Found a match; signal that backend to cancel current op */
-				ereport(DEBUG2,
-						(errmsg_internal("processing cancel request: sending SIGINT to process %d",
-										 backendPID)));
-				signal_child(bp->pid, SIGINT);
+				if (code == FINISH_REQUEST_CODE)
+				{
+					ereport(LOG,
+							(errmsg_internal("query finish request to process %d",
+											 backendPID)));
+					SendProcSignal(bp->pid, PROCSIG_QUERY_FINISH,
+								   InvalidBackendId);
+				}
+				else
+				{
+					ereport(DEBUG2,
+							(errmsg_internal("processing cancel request: sending SIGINT to process %d",
+											 backendPID)));
+					signal_child(bp->pid, SIGINT);
+				}
 			}
 			else
 				/* Right PID, wrong key: no way, Jose */
@@ -2336,6 +2646,12 @@ canAcceptConnections(void)
 			result = CAC_WAITBACKUP;	/* allow superusers only */
 		else if (Shutdown > NoShutdown)
 			return CAC_SHUTDOWN;	/* shutdown is pending */
+		/*
+		 * If the wal receiver has been launched at least once, return that
+		 * the mirror is ready.
+		 */
+		else if (GetMirrorReadyFlag())
+			return CAC_MIRROR_READY;
 		else if (!FatalError &&
 				 (pmState == PM_STARTUP ||
 				  pmState == PM_RECOVERY))
@@ -2601,6 +2917,23 @@ pmdie(SIGNAL_ARGS)
 			ereport(LOG,
 					(errmsg("received smart shutdown request")));
 
+			if (pmState == PM_STARTUP)
+			{
+				/*
+				 * If this is a standby or mirror, clean-up the startup and
+				 * walreceiver processes.
+				 */
+				if (StartupPID != 0)
+					signal_child(StartupPID, SIGTERM);
+				if (WalReceiverPID != 0)
+					signal_child(WalReceiverPID, SIGTERM);
+
+				/*
+				 * Keep the PM_STARTUP and let the PostmasterStateMachine handle
+				 * state transition after Startup and WalReceiver die.
+				 */
+			}
+
 			if (pmState == PM_RUN || pmState == PM_RECOVERY ||
 				pmState == PM_HOT_STANDBY || pmState == PM_STARTUP)
 			{
@@ -2686,6 +3019,9 @@ pmdie(SIGNAL_ARGS)
 				/* and the autovac launcher too */
 				if (AutoVacPID != 0)
 					signal_child(AutoVacPID, SIGTERM);
+				/* and the bgwriter too */
+				if (BgWriterPID != 0)
+					signal_child(BgWriterPID, SIGTERM);
 				/* and the walwriter too */
 				if (WalWriterPID != 0)
 					signal_child(WalWriterPID, SIGTERM);
@@ -2840,8 +3176,23 @@ reaper(SIGNAL_ARGS)
 			maybe_start_bgworker();
 
 			/* at this point we are really open for business */
-			ereport(LOG,
-				 (errmsg("database system is ready to accept connections")));
+			{
+				char version[512];
+
+				strlcpy(version, PG_VERSION_STR " compiled on " __DATE__ " " __TIME__,
+						sizeof(version));
+
+#ifdef USE_ASSERT_CHECKING
+				strlcat(version, " (with assert checking)", sizeof(version));
+#endif
+				ereport(LOG,(errmsg("%s", version)));
+
+				ereport(LOG,
+						(errmsg("database system is ready to accept connections"),
+						 errdetail("%s",version)));
+
+				PMAcceptingConnectionsStartTime = (pg_time_t) time(NULL);
+			}
 
 			continue;
 		}
@@ -2954,7 +3305,7 @@ reaper(SIGNAL_ARGS)
 		if (pid == AutoVacPID)
 		{
 			AutoVacPID = 0;
-			if (!EXIT_STATUS_0(exitstatus))
+			if (!EXIT_STATUS_0(exitstatus) && !EXIT_STATUS_1(exitstatus))
 				HandleChildCrash(pid, exitstatus,
 								 _("autovacuum launcher process"));
 			continue;
@@ -3562,13 +3913,24 @@ LogChildExit(int lev, const char *procname, int pid, int exitstatus)
 static void
 PostmasterStateMachine(void)
 {
+	/*
+	 * This state transition to handle master standby or mirrors receives a
+	 * smart shutdown, no need to wait any additional backends.
+	 */
+	if (pmState == PM_STARTUP && StartupPID == 0 && WalReceiverPID == 0)
+	{
+		pmState = PM_WAIT_DEAD_END;
+	}
+
 	if (pmState == PM_WAIT_BACKUP)
 	{
 		/*
 		 * PM_WAIT_BACKUP state ends when online backup mode is not active.
 		 */
 		if (!BackupInProgress())
+		{
 			pmState = PM_WAIT_BACKENDS;
+		}
 	}
 
 	if (pmState == PM_WAIT_READONLY)
@@ -3773,6 +4135,9 @@ PostmasterStateMachine(void)
 	{
 		ereport(LOG,
 				(errmsg("all server processes terminated; reinitializing")));
+
+		/* CDB: reload all auxiliary workers like FTS and DTX recover or GDD */
+		load_auxiliary_libraries();
 
 		/* allow background workers to immediately restart */
 		ResetBackgroundWorkerCrashTimes();
@@ -4266,6 +4631,9 @@ BackendInitialize(Port *port)
 	 */
 	if (am_walsender)
 		init_ps_display("wal sender process", port->user_name, remote_ps_data,
+						update_process_title ? "authentication" : "");
+	else if (am_ftshandler)
+		init_ps_display("fts handler process", port->user_name, remote_ps_data,
 						update_process_title ? "authentication" : "");
 	else
 		init_ps_display(port->user_name, port->database_name, remote_ps_data,
@@ -4792,6 +5160,8 @@ SubPostmasterMain(int argc, char *argv[])
 	if (strcmp(argv[1], "--forkbackend") == 0 ||
 		strcmp(argv[1], "--forkavlauncher") == 0 ||
 		strcmp(argv[1], "--forkavworker") == 0 ||
+		strcmp(argv[1], "--forkautovac") == 0   ||
+		strcmp(argv[1], "--forkglobaldeadlockdetector") == 0 ||
 		strcmp(argv[1], "--forkboot") == 0 ||
 		strncmp(argv[1], "--forkbgworker=", 15) == 0)
 		PGSharedMemoryReAttach();
@@ -4819,6 +5189,13 @@ SubPostmasterMain(int argc, char *argv[])
 
 	/* Read in remaining GUC variables */
 	read_nondefault_variables();
+
+	/*
+	 * CDB: gpdb auxilary process like fts probe, dtx recovery process is
+	 * essential, we need to load them ahead of custom shared preload libraries
+	 * to avoid exceeding max_worker_processes.
+	 */
+	load_auxiliary_libraries();
 
 	/*
 	 * Reload any libraries that were preloaded by the postmaster.  Since we
@@ -4945,8 +5322,8 @@ SubPostmasterMain(int argc, char *argv[])
 		/* Do not want to attach to shared memory */
 
 		SysLoggerMain(argc, argv);		/* does not return */
-	}
 
+	}
 	abort();					/* shouldn't get here */
 }
 #endif   /* EXEC_BACKEND */
@@ -5090,6 +5467,16 @@ sigusr1_handler(SIGNAL_ARGS)
 		/* Start immediately if possible, else remember request for later. */
 		WalReceiverRequested = true;
 		MaybeStartWalReceiver();
+	}
+
+	if (CheckPostmasterSignal(PMSIGNAL_WAKEN_FTS) && FtsProbePID() != 0)
+	{
+		signal_child(FtsProbePID(), SIGINT);
+	}
+
+	if (CheckPostmasterSignal(PMSIGNAL_WAKEN_DTX_RECOVERY) && DtxRecoveryPID() != 0)
+	{
+		signal_child(DtxRecoveryPID(), SIGINT);
 	}
 
 	/*
@@ -5500,6 +5887,8 @@ MaybeStartWalReceiver(void)
 		Shutdown == NoShutdown)
 	{
 		WalReceiverPID = StartWalReceiver();
+		/* wal receiver has been launched */
+		SetMirrorReadyFlag();
 		if (WalReceiverPID != 0)
 			WalReceiverRequested = false;
 		/* else leave the flag set, so we'll try again later */
@@ -5735,6 +6124,8 @@ bgworker_should_start_now(BgWorkerStartTime start_time)
 			break;
 
 		case PM_RUN:
+			if (start_time == BgWorkerStart_DtxRecovering)
+				return true;
 			if (start_time == BgWorkerStart_RecoveryFinished)
 				return true;
 			/* fall through */
@@ -5754,6 +6145,31 @@ bgworker_should_start_now(BgWorkerStartTime start_time)
 	}
 
 	return false;
+}
+
+/*
+ * Does specified start_time need distributed transactions been recovered?
+ */
+static bool
+bgworker_should_start_mpp(BackgroundWorker *worker)
+{
+	BgWorkerStartTime start_time = worker->bgw_start_time;
+
+	/*
+	 * background worker is not scheduled until distributed transactions
+	 * are recovered if it needs to start at BgWorkerStart_RecoveryFinished
+	 * or BgWorkerStart_ConsistentState because it's not safe to do a read
+	 * or write if DTX is not recovered.
+	 */
+	if (IsUnderMasterDispatchMode())
+	{
+		if (!*shmDtmStarted &&
+			(start_time == BgWorkerStart_ConsistentState ||
+			 start_time == BgWorkerStart_RecoveryFinished))
+			return false;
+	}
+
+	return true;
 }
 
 /*
@@ -5886,6 +6302,9 @@ maybe_start_bgworker(void)
 
 		if (bgworker_should_start_now(rw->rw_worker.bgw_start_time))
 		{
+			if (!bgworker_should_start_mpp(&rw->rw_worker))
+				continue;
+
 			/* reset crash time before trying to start worker */
 			rw->rw_crashed_at = 0;
 
@@ -6014,6 +6433,7 @@ save_backend_variables(BackendParameters *param, Port *port,
 
 	param->redirection_done = redirection_done;
 	param->IsBinaryUpgrade = IsBinaryUpgrade;
+	param->ConvertMasterDataDirToSegment = ConvertMasterDataDirToSegment;
 	param->max_safe_fds = max_safe_fds;
 
 	param->MaxBackends = MaxBackends;
@@ -6247,6 +6667,7 @@ restore_backend_variables(BackendParameters *param, Port *port)
 
 	redirection_done = param->redirection_done;
 	IsBinaryUpgrade = param->IsBinaryUpgrade;
+	ConvertMasterDataDirToSegment = param->ConvertMasterDataDirToSegment;
 	max_safe_fds = param->max_safe_fds;
 
 	MaxBackends = param->MaxBackends;
@@ -6432,4 +6853,123 @@ InitPostmasterDeathWatchHandle(void)
 				(errmsg_internal("could not duplicate postmaster handle: error code %lu",
 								 GetLastError())));
 #endif   /* WIN32 */
+}
+
+#if defined(HAVE_NUMA_H) && defined(HAVE_LIBNUMA)
+/* LINUX */
+static void
+setProcAffinity(int id)
+{
+	int limit;
+	nodemask_t mask;
+
+	if (numa_available() < 0)
+	{
+		elog(LOG, "Numa unavailable, will remain unbound.");
+		return;
+	}
+
+	limit = numa_max_node() + 1;
+
+	nodemask_zero(&mask);
+	nodemask_set(&mask, (id % limit));
+
+	elog(LOG, "Numa binding to numa-node %d", (id % limit));
+
+	/* this sets the memory */
+	numa_bind(&mask);
+
+	return;
+}
+#else
+/* UNSUPPORTED */
+static void
+setProcAffinity(int id)
+{
+	elog(LOG, "gp_set_proc_affinity setting ignored; feature not configured");
+}
+#endif
+
+/*
+ * Master is started once in utility mode by gpstart to fetch segment info,
+ * then it is restarted again to production/dispatch mode with "-E" specified.
+ *
+ * This function checks 1) is master, 2) is under dispatch mode
+ */
+bool
+IsUnderMasterDispatchMode(void)
+{
+	if (Gp_entry_postmaster && Gp_role == GP_ROLE_DISPATCH)
+		return true;
+
+	return false;
+}
+
+void
+load_auxiliary_libraries(void)
+{
+	BackgroundWorker *worker;
+	slist_iter iter;
+	int	i;
+	bool registered;
+
+	/* load all auxiliary workers */
+	for (i = 0; i < MaxPMAuxProc; i++)
+	{
+		worker = &PMAuxProcList[i];
+
+		if (worker->bgw_start_rule &&
+			!worker->bgw_start_rule(worker->bgw_main_arg))
+			continue;
+
+		/* skip already registered worker */
+		registered = false;
+		slist_foreach(iter, &BackgroundWorkerList)
+		{
+			RegisteredBgWorker *rw;
+
+			rw = slist_container(RegisteredBgWorker, rw_lnode, iter.cur);
+
+			if (!strcmp(rw->rw_worker.bgw_name, worker->bgw_name) &&
+				rw->rw_worker.bgw_main == worker->bgw_main &&
+				rw->rw_worker.bgw_start_rule == worker->bgw_start_rule)
+				registered = true;
+		}
+		if (registered)
+			continue;
+
+		RegisterBackgroundWorker(worker);
+	}
+}
+
+bool
+isAuxiliaryBgWorker(BackgroundWorker *worker)
+{
+	BackgroundWorker	*aux_worker;
+	int		i;
+
+	Assert(worker);
+
+	for (i = 0; i < MaxPMAuxProc; i++)
+	{
+		aux_worker = &PMAuxProcList[i];
+
+		if (!strcmp(aux_worker->bgw_name, worker->bgw_name) &&
+			aux_worker->bgw_main == worker->bgw_main &&
+			aux_worker->bgw_start_rule == worker->bgw_start_rule)
+			return true;
+	}
+
+	return false;
+}
+
+bool
+amAuxiliaryBgWorker(void)
+{
+	if (!IsBackgroundWorker)
+		return false;
+
+	Assert(MyBgworkerEntry);
+
+	return isAuxiliaryBgWorker(MyBgworkerEntry);
 }

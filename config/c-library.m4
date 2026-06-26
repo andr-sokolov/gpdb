@@ -63,8 +63,8 @@ AC_DEFUN([PGAC_FUNC_GETTIMEOFDAY_1ARG],
 [AC_CACHE_CHECK(whether gettimeofday takes only one argument,
 pgac_cv_func_gettimeofday_1arg,
 [AC_TRY_COMPILE([#include <sys/time.h>],
-[struct timeval *tp;
-struct timezone *tzp;
+[struct timeval *tp = 0;
+struct timezone *tzp = 0;
 gettimeofday(tp,tzp);],
 [pgac_cv_func_gettimeofday_1arg=no],
 [pgac_cv_func_gettimeofday_1arg=yes])])
@@ -88,11 +88,11 @@ AC_DEFUN([PGAC_FUNC_GETPWUID_R_5ARG],
 pgac_cv_func_getpwuid_r_5arg,
 [AC_TRY_COMPILE([#include <sys/types.h>
 #include <pwd.h>],
-[uid_t uid;
-struct passwd *space;
-char *buf;
-size_t bufsize;
-struct passwd **result;
+[uid_t uid = 0;
+struct passwd *space = 0;
+char *buf = 0;
+size_t bufsize = 0;
+struct passwd **result = 0;
 getpwuid_r(uid, space, buf, bufsize, result);],
 [pgac_cv_func_getpwuid_r_5arg=yes],
 [pgac_cv_func_getpwuid_r_5arg=no])])
@@ -255,8 +255,10 @@ int does_int64_snprintf_work()
     return 0;			/* either multiply or snprintf is busted */
   return 1;
 }
+
+int
 main() {
-  exit(! does_int64_snprintf_work());
+  return (! does_int64_snprintf_work());
 }],
 [pgac_cv_snprintf_long_long_int_format=$pgac_format; break],
 [],

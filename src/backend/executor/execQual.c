@@ -38,11 +38,18 @@
 
 #include "access/htup_details.h"
 #include "access/nbtree.h"
+#include "access/tuptoaster.h"
 #include "access/tupconvert.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_type.h"
+#include "cdb/cdbpartition.h"
+#include "cdb/cdbhash.h"
+#include "cdb/cdbvars.h"
+#include "cdb/partitionselection.h"
+#include "cdb/cdbutil.h"
 #include "commands/typecmds.h"
 #include "executor/execdebug.h"
+#include "executor/nodeAgg.h"
 #include "executor/nodeSubplan.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -68,6 +75,15 @@ static bool isAssignmentIndirectionExpr(ExprState *exprstate);
 static Datum ExecEvalAggref(AggrefExprState *aggref,
 			   ExprContext *econtext,
 			   bool *isNull, ExprDoneCond *isDone);
+static Datum ExecEvalGroupingFunc(GroupingFuncExprState *gstate,
+							  ExprContext *econtext,
+							  bool *isNull, ExprDoneCond *isDone);
+static Datum ExecEvalGrouping(ExprState *gstate,
+						  ExprContext *econtext,
+						  bool *isNull, ExprDoneCond *isDone);
+static Datum ExecEvalGroupId(ExprState *gstate,
+						 ExprContext *econtext,
+						 bool *isNull, ExprDoneCond *isDone);
 static Datum ExecEvalWindowFunc(WindowFuncExprState *wfunc,
 				   ExprContext *econtext,
 				   bool *isNull, ExprDoneCond *isDone);
@@ -90,14 +106,10 @@ static Datum ExecEvalParamExec(ExprState *exprstate, ExprContext *econtext,
 				  bool *isNull, ExprDoneCond *isDone);
 static Datum ExecEvalParamExtern(ExprState *exprstate, ExprContext *econtext,
 					bool *isNull, ExprDoneCond *isDone);
-static void init_fcache(Oid foid, Oid input_collation, FuncExprState *fcache,
-			MemoryContext fcacheCxt, bool needDescForSets);
 static void ShutdownFuncExpr(Datum arg);
 static TupleDesc get_cached_rowtype(Oid type_id, int32 typmod,
 				   TupleDesc *cache_field, ExprContext *econtext);
 static void ShutdownTupleDescRef(Datum arg);
-static ExprDoneCond ExecEvalFuncArgs(FunctionCallInfo fcinfo,
-				 List *argList, ExprContext *econtext);
 static void ExecPrepareTuplestoreResult(FuncExprState *fcache,
 							ExprContext *econtext,
 							Tuplestorestate *resultStore,
@@ -142,6 +154,9 @@ static Datum ExecEvalRow(RowExprState *rstate,
 static Datum ExecEvalRowCompare(RowCompareExprState *rstate,
 				   ExprContext *econtext,
 				   bool *isNull, ExprDoneCond *isDone);
+static Datum ExecEvalTableValue(ExprState   *estate,
+								ExprContext *econtext,
+								bool *isNull, ExprDoneCond *isDone);
 static Datum ExecEvalCoalesce(CoalesceExprState *coalesceExpr,
 				 ExprContext *econtext,
 				 bool *isNull, ExprDoneCond *isDone);
@@ -182,6 +197,32 @@ static Datum ExecEvalArrayCoerceExpr(ArrayCoerceExprState *astate,
 						bool *isNull, ExprDoneCond *isDone);
 static Datum ExecEvalCurrentOfExpr(ExprState *exprstate, ExprContext *econtext,
 					  bool *isNull, ExprDoneCond *isDone);
+
+static Datum ExecEvalPartSelectedExpr(PartSelectedExprState *exprstate,
+						ExprContext *econtext,
+						bool *isNull, ExprDoneCond *isDone);
+static Datum ExecEvalPartDefaultExpr(PartDefaultExprState *exprstate,
+						ExprContext *econtext,
+						bool *isNull, ExprDoneCond *isDone);
+static Datum ExecEvalPartBoundExpr(PartBoundExprState *exprstate,
+						ExprContext *econtext,
+						bool *isNull, ExprDoneCond *isDone);
+static Datum ExecEvalPartBoundInclusionExpr(PartBoundInclusionExprState *exprstate,
+								ExprContext *econtext,
+								bool *isNull, ExprDoneCond *isDone);
+static Datum ExecEvalPartBoundOpenExpr(PartBoundOpenExprState *exprstate,
+								ExprContext *econtext,
+								bool *isNull, ExprDoneCond *isDone);
+static Datum ExecEvalPartListRuleExpr(PartListRuleExprState *exprstate,
+								ExprContext *econtext,
+								bool *isNull, ExprDoneCond *isDone);
+static Datum ExecEvalPartListNullTestExpr(PartListNullTestExprState *exprstate,
+							ExprContext *econtext,
+							bool *isNull, ExprDoneCond *isDone);
+
+static bool ExecIsExprUnsafeToConst_walker(Node *node, void *context);
+static bool ExecIsExprUnsafeToConst(Node *node);
+
 
 
 /* ----------------------------------------------------------------
@@ -539,6 +580,77 @@ ExecEvalAggref(AggrefExprState *aggref, ExprContext *econtext,
 	return econtext->ecxt_aggvalues[aggref->aggno];
 }
 
+/*----------------------------------------------------------------
+ *		ExecEvalGroupingFunc
+ *
+ *		Returns a Datum whose value is the value of a GROUPING_ID
+ *		with respect to the given context.
+ */
+static Datum
+ExecEvalGroupingFunc(GroupingFuncExprState *gstate,
+					 ExprContext *econtext,
+					 bool *isNull, ExprDoneCond *isDone)
+{
+	uint64 grpid = 0;
+	ListCell *tmp;
+	int num_args = list_length(gstate->args);
+	int argno = 0;
+
+	if (isDone)
+		*isDone = ExprSingleResult;
+
+	foreach(tmp, gstate->args)
+	{
+		int arg = (int)intVal(lfirst(tmp));
+		int pos_in_grpcols = gstate->ngrpcols - arg - 1;
+		int pos_in_grpingfunc = num_args - argno - 1;
+
+		Assert(pos_in_grpcols >= 0 && pos_in_grpingfunc >= 0);
+
+		if (econtext->grouping & ( ((uint64)1) << pos_in_grpcols))
+			grpid |= ( ((uint64)1) << pos_in_grpingfunc);
+
+		argno++;
+	}
+
+	*isNull = false;
+	return Int64GetDatum(grpid);
+}
+
+/*----------------------------------------------------------------
+ *		ExecEvalGrouping
+ *
+ *		Returns a Datum whose value is the value of a GROUPING
+ *		with respect to the given context.
+ */
+static Datum
+ExecEvalGrouping(ExprState *gstate, ExprContext *econtext,
+				 bool *isNull, ExprDoneCond *isDone)
+{
+	if (isDone)
+		*isDone = ExprSingleResult;
+
+	*isNull = false;
+	return Int64GetDatum(econtext->grouping);
+}
+
+/*----------------------------------------------------------------
+ *		ExecEvalGroupId
+ *
+ *		Returns a Datum whose value is the value of a GROUP_ID
+ *		with respect to the given context.
+ */
+static Datum
+ExecEvalGroupId(ExprState *gstate, ExprContext *econtext,
+				bool *isNull, ExprDoneCond *isDone)
+{
+	if (isDone)
+		*isDone = ExprSingleResult;
+
+	*isNull = false;
+	return UInt32GetDatum(econtext->group_id);
+}
+
 /* ----------------------------------------------------------------
  *		ExecEvalWindowFunc
  *
@@ -639,7 +751,8 @@ ExecEvalScalarVar(ExprState *exprstate, ExprContext *econtext,
 		{
 			if (variable->vartype != attr->atttypid)
 				ereport(ERROR,
-						(errmsg("attribute %d has wrong type", attnum),
+						(errcode(ERRCODE_DATATYPE_MISMATCH),
+						 errmsg("attribute %d has wrong type", attnum),
 						 errdetail("Table has type %s, but query expects %s.",
 								   format_type_be(attr->atttypid),
 								   format_type_be(variable->vartype))));
@@ -940,6 +1053,7 @@ ExecEvalWholeRowFast(WholeRowVarExprState *wrvstate, ExprContext *econtext,
 {
 	Var		   *variable = (Var *) wrvstate->xprstate.expr;
 	TupleTableSlot *slot;
+	TupleDesc	slot_tupdesc;
 	HeapTupleHeader dtuple;
 
 	if (isDone)
@@ -968,6 +1082,20 @@ ExecEvalWholeRowFast(WholeRowVarExprState *wrvstate, ExprContext *econtext,
 	/* Apply the junkfilter if any */
 	if (wrvstate->wrv_junkFilter != NULL)
 		slot = ExecFilterJunk(wrvstate->wrv_junkFilter, slot);
+
+	/*
+	 * If it's a RECORD Var, we'll use the slot's type ID info.  It's likely
+	 * that the slot's type is also RECORD; if so, make sure it's been
+	 * "blessed", so that the Datum can be interpreted later.  (Note: we must
+	 * do this here, not in ExecEvalWholeRowVar, because some plan trees may
+	 * return different slots at different times.  We have to be ready to
+	 * bless additional slots during the run.)
+	 */
+	slot_tupdesc = slot->tts_tupleDescriptor;
+	if (variable->vartype == RECORDOID &&
+		slot_tupdesc->tdtypeid == RECORDOID &&
+		slot_tupdesc->tdtypmod < 0)
+		assign_record_type_typmod(slot_tupdesc);
 
 	/*
 	 * Copy the slot tuple and make sure any toasted fields get detoasted.
@@ -1029,7 +1157,7 @@ ExecEvalWholeRowSlow(WholeRowVarExprState *wrvstate, ExprContext *econtext,
 	if (wrvstate->wrv_junkFilter != NULL)
 		slot = ExecFilterJunk(wrvstate->wrv_junkFilter, slot);
 
-	tuple = ExecFetchSlotTuple(slot);
+	tuple = ExecFetchSlotHeapTuple(slot);
 	tupleDesc = slot->tts_tupleDescriptor;
 
 	/* wrv_tupdesc is a good enough representation of the Var's rowtype */
@@ -1117,7 +1245,7 @@ ExecEvalParamExec(ExprState *exprstate, ExprContext *econtext,
 	if (prm->execPlan != NULL)
 	{
 		/* Parameter not evaluated yet, so go do it */
-		ExecSetParamPlan(prm->execPlan, econtext);
+		ExecSetParamPlan(prm->execPlan, econtext, NULL);
 		/* ExecSetParamPlan should have processed this param... */
 		Assert(prm->execPlan == NULL);
 	}
@@ -1228,7 +1356,6 @@ GetAttributeByNum(HeapTupleHeader tuple,
 	 */
 	tmptup.t_len = HeapTupleHeaderGetDatumLength(tuple);
 	ItemPointerSetInvalid(&(tmptup.t_self));
-	tmptup.t_tableOid = InvalidOid;
 	tmptup.t_data = tuple;
 
 	result = heap_getattr(&tmptup,
@@ -1289,7 +1416,6 @@ GetAttributeByName(HeapTupleHeader tuple, const char *attname, bool *isNull)
 	 */
 	tmptup.t_len = HeapTupleHeaderGetDatumLength(tuple);
 	ItemPointerSetInvalid(&(tmptup.t_self));
-	tmptup.t_tableOid = InvalidOid;
 	tmptup.t_data = tuple;
 
 	result = heap_getattr(&tmptup,
@@ -1305,7 +1431,7 @@ GetAttributeByName(HeapTupleHeader tuple, const char *attname, bool *isNull)
 /*
  * init_fcache - initialize a FuncExprState node during first use
  */
-static void
+void
 init_fcache(Oid foid, Oid input_collation, FuncExprState *fcache,
 			MemoryContext fcacheCxt, bool needDescForSets)
 {
@@ -1483,7 +1609,7 @@ ShutdownTupleDescRef(Datum arg)
 /*
  * Evaluate arguments for a function.
  */
-static ExprDoneCond
+ExprDoneCond
 ExecEvalFuncArgs(FunctionCallInfo fcinfo,
 				 List *argList,
 				 ExprContext *econtext)
@@ -2043,10 +2169,12 @@ ExecMakeTableFunctionResult(ExprState *funcexpr,
 							ExprContext *econtext,
 							MemoryContext argContext,
 							TupleDesc expectedDesc,
-							bool randomAccess)
+							bool randomAccess,
+							uint64 operatorMemKB)
 {
 	Tuplestorestate *tupstore = NULL;
 	TupleDesc	tupdesc = NULL;
+	MemTupleBinding *mt_bind = NULL;
 	Oid			funcrettype;
 	bool		returnsTuple;
 	bool		returnsSet = false;
@@ -2176,8 +2304,12 @@ ExecMakeTableFunctionResult(ExprState *funcexpr,
 	for (;;)
 	{
 		Datum		result;
+		MemTuple	tuple;
 
 		CHECK_FOR_INTERRUPTS();
+
+		if (QueryFinishPending)
+			break;
 
 		/*
 		 * reset per-tuple memory context before each call of the function or
@@ -2261,7 +2393,10 @@ ExecMakeTableFunctionResult(ExprState *funcexpr,
 									   -1,
 									   0);
 				}
-				tupstore = tuplestore_begin_heap(randomAccess, false, work_mem);
+
+				mt_bind = create_memtuple_binding(tupdesc);
+
+				tupstore = tuplestore_begin_heap(randomAccess, false, operatorMemKB);
 				MemoryContextSwitchTo(oldcontext);
 				rsinfo.setResult = tupstore;
 				rsinfo.setDesc = tupdesc;
@@ -2272,7 +2407,27 @@ ExecMakeTableFunctionResult(ExprState *funcexpr,
 			 */
 			if (returnsTuple)
 			{
+				const int staticBufferLimit = 200;
 				HeapTupleHeader td;
+				Datum staticPd[staticBufferLimit];
+				bool staticNull[staticBufferLimit];
+				Datum *pd;
+				bool *pn;
+
+                /**
+                 * use memory on stack if possible, to save palloc calls
+                 */
+				if ( tupdesc->natts > staticBufferLimit)
+				{
+                    pd = (Datum *) palloc(tupdesc->natts * sizeof(Datum));
+                    pn = (bool *) palloc(tupdesc->natts * sizeof(bool));
+                }
+                else
+                {
+                    pd = staticPd;
+                    pn = staticNull;
+                }
+
 
 				td = DatumGetHeapTupleHeader(result);
 
@@ -2293,7 +2448,10 @@ ExecMakeTableFunctionResult(ExprState *funcexpr,
 				tmptup.t_len = HeapTupleHeaderGetDatumLength(td);
 				tmptup.t_data = td;
 
-				tuplestore_puttuple(tupstore, &tmptup);
+				heap_deform_tuple(&tmptup, tupdesc, pd, pn);
+				tuple = memtuple_form_to(mt_bind, pd, pn, NULL, NULL, false);
+
+				tuplestore_puttuple(tupstore, (HeapTuple) tuple);
 			}
 			else
 				tuplestore_putvalues(tupstore, tupdesc, &result, &fcinfo.isnull);
@@ -2333,7 +2491,7 @@ no_function_result:
 	if (rsinfo.setResult == NULL)
 	{
 		MemoryContextSwitchTo(econtext->ecxt_per_query_memory);
-		tupstore = tuplestore_begin_heap(randomAccess, false, work_mem);
+		tupstore = tuplestore_begin_heap(randomAccess, false, operatorMemKB);
 		rsinfo.setResult = tupstore;
 		if (!returnsSet)
 		{
@@ -2344,7 +2502,7 @@ no_function_result:
 			MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
 			nulldatums = (Datum *) palloc0(natts * sizeof(Datum));
 			nullflags = (bool *) palloc(natts * sizeof(bool));
-			memset(nullflags, true, natts * sizeof(bool));
+			MemSetAligned(nullflags, true, natts * sizeof(bool));
 			MemoryContextSwitchTo(econtext->ecxt_per_query_memory);
 			tuplestore_putvalues(tupstore, expectedDesc, nulldatums, nullflags);
 		}
@@ -2522,6 +2680,347 @@ ExecEvalDistinct(FuncExprState *fcache,
 	}
 
 	return result;
+}
+
+static inline void ExecEvalFPStrict2Arg(FuncExprState *expr, ExprContext *econtext, bool *isNull, ExprDoneCond *isDone)
+{
+	ExprDoneCond argDone[2];
+
+	Assert(expr->fp_arg[0] && expr->fp_arg[1]);
+	if(isDone)
+		*isDone = ExprSingleResult;
+
+	expr->fp_datum[0] = ExecEvalExpr(expr->fp_arg[0], econtext, &expr->fp_null[0], &argDone[0]);
+	expr->fp_datum[1] = ExecEvalExpr(expr->fp_arg[1], econtext, &expr->fp_null[1], &argDone[1]);
+
+	*isNull = expr->fp_null[0] || expr->fp_null[1];
+}
+
+static Datum ExecEvalFPStrict2_Int2Eq(FuncExprState *fstate, ExprContext *ctxt, bool *isNull, ExprDoneCond *isDone)
+{
+	ExecEvalFPStrict2Arg(fstate, ctxt, isNull, isDone);
+	return BoolGetDatum(
+			DatumGetInt16(fstate->fp_datum[0]) == DatumGetInt16(fstate->fp_datum[1])
+			);
+}
+
+static Datum ExecEvalFPStrict2_Int4Eq(FuncExprState *fstate, ExprContext *ctxt, bool *isNull, ExprDoneCond *isDone)
+{
+
+	ExecEvalFPStrict2Arg(fstate, ctxt, isNull, isDone);
+	return BoolGetDatum(
+			DatumGetInt32(fstate->fp_datum[0]) == DatumGetInt32(fstate->fp_datum[1])
+			);
+}
+
+static Datum ExecEvalFPStrict2_Int8Eq(FuncExprState *fstate, ExprContext *ctxt, bool *isNull, ExprDoneCond *isDone)
+{
+	ExecEvalFPStrict2Arg(fstate, ctxt, isNull, isDone);
+	return BoolGetDatum(fstate->fp_datum[0] == fstate->fp_datum[1]);
+}
+
+/* Some Oids that we want to fast path.  See pg_proc.h */
+#define INT2EQ_OID 63
+#define INT4EQ_OID 65
+#define TEXTEQ_OID 67
+#define INT8EQ_OID 467
+#define BPCHAREQ_OID 1048
+#define DATE_EQ_OID 1086
+
+/* Optimize x op y if op has no side effect.  Almost all our functions are
+ * strict, 2 args.
+ *
+ * NOTE: You need to implement the ExecEvalFPStrict2_FUNC FAITHFULLY.
+ * For example, before you fast path int4add, make sure your implementation
+ * is the same as the old int4add, that is, you need to handle under/over flow etc.
+ */
+static void FastPathStrict2Func(Oid funcoid, FuncExprState *fstate)
+{
+	static Oid strict2oid[] = {
+		INT2EQ_OID,
+		INT4EQ_OID,
+		DATE_EQ_OID,
+		INT8EQ_OID,
+	};
+	static ExprStateEvalFunc strict2func[] = {
+		(ExprStateEvalFunc) ExecEvalFPStrict2_Int2Eq,
+		(ExprStateEvalFunc) ExecEvalFPStrict2_Int4Eq,
+		(ExprStateEvalFunc) ExecEvalFPStrict2_Int4Eq, /* date_eq is int4 eq */
+		(ExprStateEvalFunc) ExecEvalFPStrict2_Int8Eq,
+	};
+
+	int i;
+
+	COMPILE_ASSERT(ARRAY_SIZE(strict2oid) == ARRAY_SIZE(strict2func));
+
+	for(i=0; i<ARRAY_SIZE(strict2oid); ++i)
+	{
+		if (strict2oid[i] == funcoid)
+		{
+			fstate->xprstate.evalfunc = strict2func[i];
+			fstate->fp_arg[0] = linitial(fstate->args);
+			fstate->fp_arg[1] = lsecond(fstate->args);
+			return;
+		}
+	}
+}
+
+static Datum
+ExecEvalFPScalarArrayInt(ScalarArrayOpExprState *sstate,
+					  ExprContext *econtext,
+					  bool *isNull, ExprDoneCond *isDone)
+{
+	ScalarArrayOpExpr *opexpr = (ScalarArrayOpExpr *) sstate->fxprstate.xprstate.expr;
+	Oid fnoid = opexpr->opfuncid;
+	ExprState *arg = linitial(sstate->fxprstate.args);
+
+	ExprDoneCond argDone;
+	Datum d;
+	bool isnull;
+
+	int i;
+
+	d = ExecEvalExpr(arg, econtext, &isnull, &argDone);
+	Assert(argDone == ExprSingleResult);
+
+	if (isDone)
+		*isDone = ExprSingleResult;
+
+	if (isnull)
+	{
+		*isNull = true;
+		return 0;
+	}
+
+	*isNull = false;
+	if (fnoid == INT4EQ_OID || fnoid == DATE_EQ_OID)
+		d = Int32GetDatum(DatumGetInt32(d));
+	else if (fnoid != INT8EQ_OID)
+	{
+		Assert(fnoid == INT2EQ_OID);
+		d = Int16GetDatum(DatumGetInt16(d));
+	}
+
+	for(i=0; i<sstate->fp_n; ++i)
+	{
+		if(d == sstate->fp_datum[i])
+			return BoolGetDatum(true);
+	}
+
+	return BoolGetDatum(false);
+}
+
+static Datum
+ExecEvalFPScalarArrayStr(ScalarArrayOpExprState *sstate,
+					  ExprContext *econtext,
+					  bool *isNull, ExprDoneCond *isDone)
+{
+	ScalarArrayOpExpr *opexpr = (ScalarArrayOpExpr *) sstate->fxprstate.xprstate.expr;
+	Oid fnoid = opexpr->opfuncid;
+	ExprState *arg = linitial(sstate->fxprstate.args);
+
+	ExprDoneCond argDone;
+	Datum d;
+	bool isnull;
+	Datum ret;
+
+	char *p; void *tofree; int len;
+
+	int i;
+
+	d = ExecEvalExpr(arg, econtext, &isnull, &argDone);
+	Assert(argDone == ExprSingleResult);
+
+	if (isDone)
+		*isDone = ExprSingleResult;
+
+	if (isnull)
+	{
+		*isNull = true;
+		return 0;
+	}
+
+	*isNull = false;
+
+	ret = BoolGetDatum(false);
+
+	varattrib_untoast_ptr_len(d, &p, &len, &tofree);
+
+	/* bpchareq, rid of trailing white space.  see bpeq and bcTruelen */
+	if(fnoid == BPCHAREQ_OID)
+	{
+		while(len > 0 && p[len-1] == ' ')
+			--len;
+	}
+
+	for(i=0; i<sstate->fp_n; ++i)
+	{
+		if(sstate->fp_len[i] != len)
+			continue;
+		if(memcmp(p, DatumGetPointer(sstate->fp_datum[i]), sstate->fp_len[i]) == 0)
+		{
+			ret = BoolGetDatum(true);
+			break;
+		}
+	}
+
+	if(tofree)
+		pfree(tofree);
+
+	return ret;
+}
+
+/* Optimize x in ('A', 'B', 'C') */
+static void FastPathScalarArrayOp(ScalarArrayOpExpr *opexpr, ScalarArrayOpExprState *sstate)
+{
+	ExprState *argstate;
+	Const *argconst;
+	ArrayType *arr;
+
+	char *s;
+	bits8 *bitmap;
+	int bitmask;
+
+	int16		typlen;
+	bool		typbyval;
+	char		typalign;
+
+	Oid fnoid = InvalidOid;
+
+	static Oid optimize_func_oid[] = {
+		INT2EQ_OID,
+		INT4EQ_OID,
+		TEXTEQ_OID,
+		INT8EQ_OID,
+		BPCHAREQ_OID,
+		DATE_EQ_OID,
+	};
+
+	int i;
+
+	/* IN will be evaluated as OR */
+	if (!opexpr->useOr)
+		return;
+
+	/* Check if we optimize these types */
+	for (i=0; i<ARRAY_SIZE(optimize_func_oid); ++i)
+	{
+		if (optimize_func_oid[i] == opexpr->opfuncid)
+		{
+			fnoid = opexpr->opfuncid;
+			break;
+		}
+	}
+
+	if(fnoid == InvalidOid)
+		return;
+
+	/* Better to have just two args */
+	Assert(list_length(sstate->fxprstate.args) == 2);
+
+	/* only if the second args are const */
+	argstate = (ExprState *) lsecond(sstate->fxprstate.args);
+	if (argstate->evalfunc != ExecEvalConst)
+		return;
+
+	argconst = (Const *) argstate->expr;
+
+	/* We do not handle null */
+	if (argconst->constisnull)
+		return;
+
+	arr = DatumGetArrayTypeP(argconst->constvalue);
+	sstate->fp_n = ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr));
+
+	/* We do not handle this case */
+	if (sstate->fp_n <= 0)
+		return;
+
+	sstate->fp_len = (int *) palloc(sizeof(int) * sstate->fp_n);
+	sstate->fp_datum = (Datum *) palloc(sizeof(Datum) * sstate->fp_n);
+
+	/* Type stuff */
+	if (sstate->element_type != ARR_ELEMTYPE(arr))
+	{
+		get_typlenbyvalalign(ARR_ELEMTYPE(arr),
+							 &sstate->typlen,
+							 &sstate->typbyval,
+							 &sstate->typalign);
+		sstate->element_type = ARR_ELEMTYPE(arr);
+	}
+	typlen = sstate->typlen;
+	typbyval = sstate->typbyval;
+	typalign = sstate->typalign;
+
+	/* Loop over the array elements */
+	s = (char *) ARR_DATA_PTR(arr);
+	bitmap = ARR_NULLBITMAP(arr);
+	bitmask = 1;
+
+	for (i = 0; i < sstate->fp_n; i++)
+	{
+		Datum elt;
+
+		/* Do not deal with null yet */
+		if (bitmap && (*bitmap & bitmask) == 0)
+			return;
+
+		elt = fetch_att(s, typbyval, typlen);
+		s = att_addlength_pointer(s, typlen, PointerGetDatum(s));
+		s = (char *) att_align_nominal(s, typalign);
+
+		/* int type */
+		if (fnoid == INT2EQ_OID)
+			sstate->fp_datum[i] = Int16GetDatum(DatumGetInt16(elt));
+		else if (fnoid == INT4EQ_OID || fnoid == DATE_EQ_OID)
+			sstate->fp_datum[i] = Int32GetDatum(DatumGetInt32(elt));
+		else if (fnoid == INT8EQ_OID)
+			sstate->fp_datum[i] = elt;
+		else if (fnoid == TEXTEQ_OID || fnoid == BPCHAREQ_OID)
+		{
+			char *p; void *tofree; int len;
+			char *pdest;
+
+			varattrib_untoast_ptr_len(elt, &p, &len, &tofree);
+
+			/* bpchareq, rid of trailing white space.  see bpeq and bcTruelen */
+			if(fnoid == BPCHAREQ_OID)
+			{
+				while(len > 0 && p[len-1] == ' ')
+					--len;
+			}
+
+			sstate->fp_len[i] = len;
+			pdest = palloc(len);
+			sstate->fp_datum[i] = PointerGetDatum(pdest);
+
+			memcpy(pdest, p, len);
+
+			if(tofree)
+				pfree(tofree);
+		}
+		else
+			Assert(!"Wrong optimize_funcoid");
+
+		/* advance bitmap pointer if any */
+		if (bitmap)
+		{
+			bitmask <<= 1;
+			if (bitmask == 0x100 /* 1<<8 */)
+			{
+				bitmap++;
+				bitmask = 1;
+			}
+		}
+	}
+
+	/* Now we are sure we can fast path this */
+	if (fnoid == INT2EQ_OID || fnoid == INT4EQ_OID || fnoid == INT8EQ_OID || fnoid == DATE_EQ_OID)
+		sstate->fxprstate.xprstate.evalfunc = (ExprStateEvalFunc) ExecEvalFPScalarArrayInt;
+	else if (fnoid == TEXTEQ_OID || fnoid == BPCHAREQ_OID)
+		sstate->fxprstate.xprstate.evalfunc = (ExprStateEvalFunc) ExecEvalFPScalarArrayStr;
+	else
+		Assert(!"Wrong optimize_funcoid");
 }
 
 /*
@@ -3229,6 +3728,10 @@ ExecEvalArray(ArrayExprState *astate, ExprContext *econtext,
 			lbs[i] = elem_lbs[i - 1];
 		}
 
+		/* check for subscript overflow */
+		(void) ArrayGetNItems(ndims, dims);
+		ArrayCheckBounds(ndims, dims, lbs);
+
 		if (havenulls)
 		{
 			dataoffset = ARR_OVERHEAD_WITHNULLS(ndims, nitems);
@@ -3292,7 +3795,7 @@ ExecEvalRow(RowExprState *rstate,
 	isnull = (bool *) palloc(natts * sizeof(bool));
 
 	/* preset to nulls in case rowtype has some later-added columns */
-	memset(isnull, true, natts * sizeof(bool));
+	MemSetAligned(isnull, true, natts * sizeof(bool));
 
 	/* Evaluate field values */
 	i = 0;
@@ -3381,6 +3884,32 @@ ExecEvalRowCompare(RowCompareExprState *rstate,
 
 	*isNull = false;
 	return BoolGetDatum(result);
+}
+
+/* ----------------------------------------------------------------
+ *		ExecEvalTableValue
+ * ----------------------------------------------------------------
+ */
+static Datum
+ExecEvalTableValue(ExprState	*estate,
+				   ExprContext	*econtext,
+				   bool			*isNull,
+				   ExprDoneCond	*isDone)
+{
+	/* Guard against stack overflow due to overly complex expressions */
+	check_stack_depth();
+
+	if (isDone)
+		*isDone = ExprSingleResult;
+
+	/*
+	 * When evaluated as an expression a TableValueExpr will return NULL,
+	 * this NULL is replaced by an AnyTable datum within nodeTableFunction.c
+	 *
+	 * Is there a better way to do this?
+	 */
+	*isNull = true;
+	return (Datum) 0;
 }
 
 /* ----------------------------------------------------------------
@@ -4105,7 +4634,8 @@ ExecEvalFieldSelect(FieldSelectState *fstate,
 	/* As in ExecEvalScalarVar, we should but can't check typmod */
 	if (fselect->resulttype != attr->atttypid)
 		ereport(ERROR,
-				(errmsg("attribute %d has wrong type", fieldnum),
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("attribute %d has wrong type", fieldnum),
 				 errdetail("Table has type %s, but query expects %s.",
 						   format_type_be(attr->atttypid),
 						   format_type_be(fselect->resulttype))));
@@ -4169,7 +4699,6 @@ ExecEvalFieldStore(FieldStoreState *fstate,
 		tuphdr = DatumGetHeapTupleHeader(tupDatum);
 		tmptup.t_len = HeapTupleHeaderGetDatumLength(tuphdr);
 		ItemPointerSetInvalid(&(tmptup.t_self));
-		tmptup.t_tableOid = InvalidOid;
 		tmptup.t_data = tuphdr;
 
 		heap_deform_tuple(&tmptup, tupDesc, values, isnull);
@@ -4177,7 +4706,7 @@ ExecEvalFieldStore(FieldStoreState *fstate,
 	else
 	{
 		/* Convert null input tuple into an all-nulls row */
-		memset(isnull, true, tupDesc->natts * sizeof(bool));
+		MemSetAligned(isnull, true, tupDesc->natts * sizeof(bool));
 	}
 
 	/* Result is never null */
@@ -4234,6 +4763,329 @@ ExecEvalRelabelType(GenericExprState *exprstate,
 					bool *isNull, ExprDoneCond *isDone)
 {
 	return ExecEvalExpr(exprstate->arg, econtext, isNull, isDone);
+}
+
+/* ----------------------------------------------------------------
+ *		ExecEvalPartSelectedExpr
+ *
+ *		Evaluate a PartSelectedExpr
+ * ----------------------------------------------------------------
+ */
+static Datum
+ExecEvalPartSelectedExpr(PartSelectedExprState *exprstate,
+						 ExprContext *econtext,
+						 bool *isNull, ExprDoneCond *isDone)
+{
+	Assert(NULL != exprstate);
+	Assert(NULL != isNull);
+
+	PartSelectedExpr *expr = (PartSelectedExpr *) exprstate->xprstate.expr;
+
+	if (isDone)
+		*isDone = ExprSingleResult;
+
+	*isNull = false;
+	return BoolGetDatum(isPartitionSelected(econtext->ecxt_estate,
+											expr->dynamicScanId,
+											expr->partOid));
+}
+
+/* ----------------------------------------------------------------
+ *		ExecEvalPartDefaultExpr
+ *
+ *		Evaluate a PartDefaultExpr
+ * ----------------------------------------------------------------
+ */
+static Datum ExecEvalPartDefaultExpr(PartDefaultExprState *exprstate,
+						ExprContext *econtext,
+						bool *isNull, ExprDoneCond *isDone)
+{
+	Assert(NULL != exprstate);
+	Assert(NULL != isNull);
+
+	PartDefaultExpr *expr = (PartDefaultExpr *) exprstate->xprstate.expr;
+	PartitionRule *rule = exprstate->selector->levelPartRules[expr->level];
+	Assert (NULL != rule);
+
+	if (isDone)
+	{
+		*isDone = ExprSingleResult;
+	}
+	*isNull = false;
+
+	return BoolGetDatum(rule->parisdefault);
+}
+
+/* ----------------------------------------------------------------
+ *		ExecEvalPartBoundExpr
+ *
+ *		Evaluate a PartBoundExpr
+ * ----------------------------------------------------------------
+ */
+static Datum ExecEvalPartBoundExpr(PartBoundExprState *exprstate,
+						ExprContext *econtext,
+						bool *isNull, ExprDoneCond *isDone)
+{
+	Assert(NULL != exprstate);
+	Assert(NULL != isNull);
+
+	PartBoundExpr *expr = (PartBoundExpr *) exprstate->xprstate.expr;
+	PartitionSelectorState *selector = exprstate->selector;
+	PartitionRule *rule = selector->levelPartRules[expr->level];
+	Assert (NULL != rule);
+	ASSERT_RANGE_PART(selector, expr->level);
+
+	List *parBoundary = NULL;
+
+	parBoundary = expr->isLowerBound ? (List *) rule->parrangestart : (List *) rule->parrangeend;
+
+	/* The constant boundary to return */
+	Const *con = NULL;
+
+	if (parBoundary != NULL)
+	{
+		Assert (1 == list_length(parBoundary));
+		Node *bound = (Node *) linitial(parBoundary);
+		Assert (IsA(bound, Const));
+		con = (Const *) bound;
+	}
+
+	if (isDone)
+	{
+		*isDone = ExprSingleResult;
+	}
+
+	if (NULL != con)
+	{
+		*isNull = con->constisnull;
+		return con->constvalue;
+	}
+
+	/* return NULL if no upper bound or lower bound exists */
+	*isNull = true;
+	return PointerGetDatum(NULL);
+}
+
+/* ----------------------------------------------------------------
+ *		ExecEvalPartBoundInclusionExpr
+ *
+ *		Evaluate a PartBoundInclusionExpr
+ * ----------------------------------------------------------------
+ */
+static Datum ExecEvalPartBoundInclusionExpr(PartBoundInclusionExprState *exprstate,
+							ExprContext *econtext,
+							bool *isNull, ExprDoneCond *isDone)
+{
+	Assert(NULL != exprstate);
+	Assert(NULL != isNull);
+
+	PartBoundInclusionExpr *expr = (PartBoundInclusionExpr *) exprstate->xprstate.expr;
+	PartitionSelectorState *selector = exprstate->selector;
+	PartitionRule *rule = selector->levelPartRules[expr->level];
+	Assert (NULL != rule);
+	ASSERT_RANGE_PART(selector, expr->level);
+
+	bool isIncluded = rule->parrangeendincl;
+
+	if (expr->isLowerBound)
+	{
+		isIncluded = rule->parrangestartincl;
+	}
+
+	if (isDone)
+	{
+		*isDone = ExprSingleResult;
+	}
+	*isNull = false;
+	return BoolGetDatum(isIncluded);
+}
+
+/* ----------------------------------------------------------------
+ *		ExecEvalPartBoundOpenExpr
+ *
+ *		Evaluate a PartBoundOpenExpr
+ * ----------------------------------------------------------------
+ */
+static Datum ExecEvalPartBoundOpenExpr(PartBoundOpenExprState *exprstate,
+							ExprContext *econtext,
+							bool *isNull, ExprDoneCond *isDone)
+{
+	Assert(NULL != exprstate);
+	Assert(NULL != isNull);
+
+	PartBoundOpenExpr *expr = (PartBoundOpenExpr *) exprstate->xprstate.expr;
+
+	PartitionSelectorState *selector = exprstate->selector;
+	PartitionRule *rule = selector->levelPartRules[expr->level];
+	Assert (NULL != rule);
+	ASSERT_RANGE_PART(selector, expr->level);
+
+	bool isOpen = (rule->parrangeend == NULL);
+
+	if (expr->isLowerBound)
+	{
+		isOpen = (rule->parrangestart == NULL);
+	}
+
+	if (isDone)
+	{
+		*isDone = ExprSingleResult;
+	}
+	*isNull = false;
+	return BoolGetDatum(isOpen);
+}
+
+/* ----------------------------------------------------------------
+ *		ExecEvalPartListRuleExpr
+ *
+ *		Evaluate a PartListRuleExpr
+ * ----------------------------------------------------------------
+ */
+static Datum ExecEvalPartListRuleExpr(PartListRuleExprState *exprstate,
+							ExprContext *econtext,
+							bool *isNull, ExprDoneCond *isDone)
+{
+	Assert(NULL != exprstate);
+	Assert(NULL != isNull);
+
+	PartListRuleExpr *expr = (PartListRuleExpr *) exprstate->xprstate.expr;
+
+	PartitionSelectorState *selector = exprstate->selector;
+	PartitionRule *rule = selector->levelPartRules[expr->level];
+	Assert (NULL != rule);
+	ASSERT_LIST_PART(selector, expr->level);
+
+	ListCell *lc = NULL;
+	size_t numVal = rule->parlistvalues ? rule->parlistvalues->length : 0;
+	Datum *array_values = NULL;
+
+	int16	typlen = 0;
+	bool typbyval = false;
+	char typalign = 'i';
+	Oid	consttype = expr->elementtype;
+	get_typlenbyvalalign(consttype, &typlen, &typbyval, &typalign);
+
+	bool *is_null = NULL;
+
+	if (numVal > 0)
+	{
+		is_null = palloc0(sizeof(bool) * numVal);
+#ifdef USE_ASSERT_CHECKING
+		/* The type of the first attribute should match the underlying table col's type */
+		Oid valOid = ((Const *) linitial(lfirst(rule->parlistvalues->head)))->consttype;
+		Assert(valOid == consttype);
+#endif
+		array_values = palloc0(numVal * sizeof(Datum));
+		int datumIdx = 0;
+
+		Const *con = NULL;
+
+		foreach (lc, rule->parlistvalues)
+		{
+			List *values = (List *) lfirst(lc);
+			/*
+			 * Make sure it is single-column partition.
+			 * Optimizer currently doesn't support multi-column partitions.
+			 */
+			Assert (1 == list_length(values));
+			Node *value = (Node *) lfirst(list_nth_cell(values, 0));
+			Assert (IsA(value, Const));
+
+			con = (Const *) value;
+			array_values[datumIdx] = con->constvalue;
+
+			if (con->constisnull)
+			{
+				is_null[datumIdx] = true;
+			}
+
+			++datumIdx;
+		}
+	}
+
+	/*
+	 * If we have an empty list of values in the rule (for default part, or for whatever other reason),
+	 * we will just create an empty array. Returning null might return NULL from parent operator, such
+	 * as ExecEvalScalarArrayOp
+	 */
+	int			dims[1];
+	int			lbs[1];
+
+	dims[0] = numVal;
+	lbs[0] = 1;
+
+	ArrayType *array = construct_md_array(array_values, is_null, 1, dims, lbs,
+			consttype, typlen, typbyval, typalign);
+
+	if (array_values)
+	{
+		Assert(NULL != array);
+		pfree(array_values);
+
+		Assert(NULL != is_null);
+		pfree(is_null);
+	}
+
+	if (isDone)
+	{
+		*isDone = ExprSingleResult;
+	}
+
+	*isNull = false;
+	return PointerGetDatum(array);
+}
+
+/* ----------------------------------------------------------------
+ *		ExecEvalPartListNullTestExpr
+ *
+ *		Evaluate a PartListNullTestExpr
+ * ----------------------------------------------------------------
+ */
+static Datum ExecEvalPartListNullTestExpr(PartListNullTestExprState *exprstate,
+							ExprContext *econtext,
+							bool *isNull, ExprDoneCond *isDone)
+{
+	Assert(NULL != exprstate);
+	Assert(NULL != isNull);
+
+	PartListNullTestExpr *expr = (PartListNullTestExpr *) exprstate->xprstate.expr;
+
+	PartitionSelectorState *selector = exprstate->selector;
+	PartitionRule *rule = selector->levelPartRules[expr->level];
+	Assert (NULL != rule);
+	ASSERT_LIST_PART(selector, expr->level);
+
+	ListCell *lc = NULL;
+	size_t numVal = rule->parlistvalues ? rule->parlistvalues->length : 0;
+
+	*isNull = false;
+
+	if (numVal > 0)
+	{
+		Const *con = NULL;
+		foreach (lc, rule->parlistvalues)
+		{
+			List *values = (List *) lfirst(lc);
+			/* make sure it is single-column partition */
+			Assert (1 == list_length(values));
+			Node *value = (Node *) lfirst(list_nth_cell(values, 0));
+			Assert (IsA(value, Const));
+
+			con = (Const *) value;
+
+			if (con->constisnull && expr->nulltesttype == IS_NULL)
+			{
+				/* Found at least on null value when we were asked to find one */
+				return BoolGetDatum(true);
+			}
+			else if (!con->constisnull && expr->nulltesttype == IS_NOT_NULL)
+			{
+				return BoolGetDatum(true);
+			}
+		}
+	}
+
+	return BoolGetDatum(false);
 }
 
 /* ----------------------------------------------------------------
@@ -4351,23 +5203,54 @@ ExecEvalArrayCoerceExpr(ArrayCoerceExprState *astate,
 /* ----------------------------------------------------------------
  *		ExecEvalCurrentOfExpr
  *
- * The planner should convert CURRENT OF into a TidScan qualification, or some
- * other special handling in a ForeignScan node.  So we have to be able to do
- * ExecInitExpr on a CurrentOfExpr, but we shouldn't ever actually execute it.
- * If we get here, we suppose we must be dealing with CURRENT OF on a foreign
- * table whose FDW doesn't handle it, and complain accordingly.
+ * Evaluate CURRENT OF
+ *
+ * Constant folding must have bound observed values of gp_segment_id,
+ * ctid, and tableoid into the CurrentOfExpr for this function's
+ * consumption.
  * ----------------------------------------------------------------
  */
 static Datum
 ExecEvalCurrentOfExpr(ExprState *exprstate, ExprContext *econtext,
 					  bool *isNull, ExprDoneCond *isDone)
 {
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-		   errmsg("WHERE CURRENT OF is not supported for this table type")));
-	return 0;					/* keep compiler quiet */
-}
+	CurrentOfExpr 	*cexpr = (CurrentOfExpr *) exprstate->expr;
+	bool 			result = false;
+	TupleTableSlot	*slot;
 
+	if (isDone)
+		*isDone = ExprSingleResult;
+	*isNull = false;
+
+	Assert(cexpr->cvarno != INNER_VAR);
+	Assert(cexpr->cvarno != OUTER_VAR);
+
+	slot = econtext->ecxt_scantuple;
+	Assert(!TupIsNull(slot));
+
+	/*
+	 * The currently scanned tuple must use heap storage for it to possibly
+	 * satisfy the CURRENT OF qualification. Despite our grand attempts during
+	 * parsing and constant folding to demand heap storage, the scanning of an
+	 * AO part is still possible, when the current row uses heap storage, but the
+	 * CURRENT OF invocation uses an unpruned scan of the partition table, yielding
+	 * tuples from the AO parts before the desired heap tuple.
+	 */
+	if (TupHasHeapTuple(slot))
+	{
+		ItemPointerData cursor_tid;
+
+		if (execCurrentOf(cexpr, econtext,
+						  slot->tts_tableOid,
+						  &cursor_tid))
+		{
+			if (ItemPointerEquals(&cursor_tid, slot_get_ctid(slot)))
+				result = true;
+		}
+	}
+
+	return BoolGetDatum(result);
+}
 
 /*
  * ExecEvalExprSwitchContext
@@ -4521,6 +5404,31 @@ ExecInitExpr(Expr *node, PlanState *parent)
 				state = (ExprState *) astate;
 			}
 			break;
+		case T_GroupingFunc:
+			{
+				GroupingFunc *gf = (GroupingFunc *)node;
+				GroupingFuncExprState *gstate = makeNode(GroupingFuncExprState);
+
+				gstate->xprstate.evalfunc = (ExprStateEvalFunc) ExecEvalGroupingFunc;
+				gstate->args = gf->args;
+				gstate->ngrpcols = gf->ngrpcols;
+				state = (ExprState *) gstate;
+			}
+			break;
+		case T_Grouping:
+			{
+				ExprState *gstate = makeNode(ExprState);
+				gstate->evalfunc = (ExprStateEvalFunc) ExecEvalGrouping;
+				state = (ExprState *) gstate;
+			}
+			break;
+		case T_GroupId:
+			{
+				ExprState *gstate = makeNode(ExprState);
+				gstate->evalfunc = (ExprStateEvalFunc) ExecEvalGroupId;
+				state = (ExprState *) gstate;
+			}
+			break;
 		case T_WindowFunc:
 			{
 				WindowFunc *wfunc = (WindowFunc *) node;
@@ -4592,7 +5500,9 @@ ExecInitExpr(Expr *node, PlanState *parent)
 				fstate->args = (List *)
 					ExecInitExpr((Expr *) funcexpr->args, parent);
 				fstate->func.fn_oid = InvalidOid;		/* not initialized */
+				FastPathStrict2Func(funcexpr->funcid, fstate);
 				state = (ExprState *) fstate;
+				assign_func_result_transient_type(funcexpr->funcid);
 			}
 			break;
 		case T_OpExpr:
@@ -4604,6 +5514,7 @@ ExecInitExpr(Expr *node, PlanState *parent)
 				fstate->args = (List *)
 					ExecInitExpr((Expr *) opexpr->args, parent);
 				fstate->func.fn_oid = InvalidOid;		/* not initialized */
+				FastPathStrict2Func(opexpr->opfuncid, fstate);
 				state = (ExprState *) fstate;
 			}
 			break;
@@ -4641,6 +5552,8 @@ ExecInitExpr(Expr *node, PlanState *parent)
 					ExecInitExpr((Expr *) opexpr->args, parent);
 				sstate->fxprstate.func.fn_oid = InvalidOid;		/* not initialized */
 				sstate->element_type = InvalidOid;		/* ditto */
+
+				FastPathScalarArrayOp(opexpr, sstate);
 				state = (ExprState *) sstate;
 			}
 			break;
@@ -4969,6 +5882,10 @@ ExecInitExpr(Expr *node, PlanState *parent)
 				state = (ExprState *) rstate;
 			}
 			break;
+		case T_TableValueExpr:
+			state = (ExprState *) makeNode(ExprState);
+			state->evalfunc = ExecEvalTableValue;
+			break;
 		case T_CoalesceExpr:
 			{
 				CoalesceExpr *coalesceexpr = (CoalesceExpr *) node;
@@ -5119,6 +6036,82 @@ ExecInitExpr(Expr *node, PlanState *parent)
 				/* Don't fall through to the "common" code below */
 				return (ExprState *) outlist;
 			}
+		case T_PartSelectedExpr:
+			{
+				PartSelectedExprState *exprstate = makeNode(PartSelectedExprState);
+				exprstate->xprstate.evalfunc = (ExprStateEvalFunc) ExecEvalPartSelectedExpr;
+
+				state = (ExprState *) exprstate;
+			}
+			break;
+		case T_PartDefaultExpr:
+			{
+				Insist(parent && IsA(parent, PartitionSelectorState));
+				PartitionSelectorState *psstate = (PartitionSelectorState *) parent;
+				PartDefaultExprState *exprstate = makeNode(PartDefaultExprState);
+				exprstate->xprstate.evalfunc = (ExprStateEvalFunc) ExecEvalPartDefaultExpr;
+				exprstate->selector = psstate;
+
+				state = (ExprState *) exprstate;
+			}
+			break;
+		case T_PartBoundExpr:
+			{
+				Insist(parent && IsA(parent, PartitionSelectorState));
+				PartitionSelectorState *psstate = (PartitionSelectorState *) parent;
+				PartBoundExprState *exprstate = makeNode(PartBoundExprState);
+				exprstate->xprstate.evalfunc = (ExprStateEvalFunc) ExecEvalPartBoundExpr;
+				exprstate->selector = psstate;
+
+				state = (ExprState *) exprstate;
+			}
+			break;
+		case T_PartBoundInclusionExpr:
+			{
+				Insist(parent && IsA(parent, PartitionSelectorState));
+				PartitionSelectorState *psstate = (PartitionSelectorState *) parent;
+				PartBoundInclusionExprState *exprstate = makeNode(PartBoundInclusionExprState);
+				exprstate->xprstate.evalfunc = (ExprStateEvalFunc) ExecEvalPartBoundInclusionExpr;
+				exprstate->selector = psstate;
+
+				state = (ExprState *) exprstate;
+			}
+			break;
+		case T_PartBoundOpenExpr:
+			{
+				Insist(parent && IsA(parent, PartitionSelectorState));
+				PartitionSelectorState *psstate = (PartitionSelectorState *) parent;
+				PartBoundOpenExprState *exprstate = makeNode(PartBoundOpenExprState);
+				exprstate->xprstate.evalfunc = (ExprStateEvalFunc) ExecEvalPartBoundOpenExpr;
+				exprstate->selector = psstate;
+
+				state = (ExprState *) exprstate;
+			}
+			break;
+		case T_PartListRuleExpr:
+			{
+				Insist(parent && IsA(parent, PartitionSelectorState));
+				PartitionSelectorState *psstate = (PartitionSelectorState *) parent;
+				PartListRuleExprState *exprstate = makeNode(PartListRuleExprState);
+				exprstate->xprstate.evalfunc = (ExprStateEvalFunc) ExecEvalPartListRuleExpr;
+				exprstate->selector = psstate;
+
+				state = (ExprState *) exprstate;
+			}
+			break;
+
+		case T_PartListNullTestExpr:
+			{
+				Insist(parent && IsA(parent, PartitionSelectorState));
+				PartitionSelectorState *psstate = (PartitionSelectorState *) parent;
+				PartListNullTestExprState *exprstate = makeNode(PartListNullTestExprState);
+				exprstate->xprstate.evalfunc = (ExprStateEvalFunc) ExecEvalPartListNullTestExpr;
+				exprstate->selector = psstate;
+
+				state = (ExprState *) exprstate;
+			}
+			break;
+
 		default:
 			elog(ERROR, "unrecognized node type: %d",
 				 (int) nodeTag(node));
@@ -5501,8 +6494,8 @@ ExecProject(ProjectionInfo *projInfo, ExprDoneCond *isDone)
 	numSimpleVars = projInfo->pi_numSimpleVars;
 	if (numSimpleVars > 0)
 	{
-		Datum	   *values = slot->tts_values;
-		bool	   *isnull = slot->tts_isnull;
+		Datum	   *values = slot_get_values(slot);
+		bool	   *isnull = slot_get_isnull(slot);
 		int		   *varSlotOffsets = projInfo->pi_varSlotOffsets;
 		int		   *varNumbers = projInfo->pi_varNumbers;
 		int			i;
@@ -5516,8 +6509,8 @@ ExecProject(ProjectionInfo *projInfo, ExprDoneCond *isDone)
 				TupleTableSlot *varSlot = *((TupleTableSlot **) slotptr);
 				int			varNumber = varNumbers[i] - 1;
 
-				values[i] = varSlot->tts_values[varNumber];
-				isnull[i] = varSlot->tts_isnull[varNumber];
+				values[i] = slot_get_values(varSlot)[varNumber];
+				isnull[i] = slot_get_isnull(varSlot)[varNumber];
 			}
 		}
 		else
@@ -5532,8 +6525,8 @@ ExecProject(ProjectionInfo *projInfo, ExprDoneCond *isDone)
 				int			varNumber = varNumbers[i] - 1;
 				int			varOutputCol = varOutputCols[i] - 1;
 
-				values[varOutputCol] = varSlot->tts_values[varNumber];
-				isnull[varOutputCol] = varSlot->tts_isnull[varNumber];
+				values[varOutputCol] = slot_get_values(varSlot)[varNumber];
+				isnull[varOutputCol] = slot_get_isnull(varSlot)[varNumber];
 			}
 		}
 	}
@@ -5548,8 +6541,8 @@ ExecProject(ProjectionInfo *projInfo, ExprDoneCond *isDone)
 	{
 		if (!ExecTargetList(projInfo->pi_targetlist,
 							econtext,
-							slot->tts_values,
-							slot->tts_isnull,
+							slot_get_values(slot),
+							slot_get_isnull(slot),
 							projInfo->pi_itemIsDone,
 							isDone))
 			return slot;		/* no more result rows, return empty slot */
@@ -5560,4 +6553,197 @@ ExecProject(ProjectionInfo *projInfo, ExprDoneCond *isDone)
 	 * valid virtual tuple.
 	 */
 	return ExecStoreVirtualTuple(slot);
+}
+
+/*
+ * ExecIsExprUnsafeToConst_walker
+ *
+ * Almost all of the expressions are not allowed without the executor.
+ * Returns true as soon as possible we find such unsafe nodes.
+ */
+static bool
+ExecIsExprUnsafeToConst_walker(Node *node, void *context)
+{
+	switch(nodeTag(node))
+	{
+		/*
+		 * Param can be a Const in some situation, but the demanded use case
+		 * so far doesn't want it.
+		 */
+		case T_Const:
+		case T_CaseTestExpr:
+		case T_FuncExpr:
+		case T_OpExpr:
+		case T_DistinctExpr:
+		case T_ScalarArrayOpExpr:
+		case T_BoolExpr:
+		case T_CaseExpr:
+		case T_CoalesceExpr:
+		case T_MinMaxExpr:
+		case T_NullIfExpr:
+		case T_NullTest:
+		case T_BooleanTest:
+		case T_List:
+		case T_TypeCast:
+			return false;
+
+		default:
+			return true;
+	}
+}
+
+/*
+ * ExecIsExprUnsafeToConst
+ *
+ * Returns true if the expression cannot be evaluated to a const value.
+ */
+static bool
+ExecIsExprUnsafeToConst(Node *node)
+{
+	Assert(node != NULL);
+	return ExecIsExprUnsafeToConst_walker(node, NULL);
+}
+
+/*
+ * ExecEvalFunctionArgToConst
+ *
+ * Evaluates an argument of function expression and returns the result.
+ * This is assumed to be used in the parser stage, where
+ * dynamic evaluation such like Var is not available, though we put it
+ * here so that we can extend it to be useful in other places later.
+ */
+Datum
+ExecEvalFunctionArgToConst(FuncExpr *fexpr, int argno, bool *isnull)
+{
+	Expr		   *aexpr;
+	Oid				argtype;
+	int32			argtypmod;
+	Oid				argcollation;
+	Const		   *result;
+
+	/* argument number sanity check */
+	if (argno < 0 || list_length(fexpr->args) <= argno)
+		elog(ERROR, "invalid argument number found during evaluating function argument");
+
+	aexpr = (Expr *) list_nth(fexpr->args, argno);
+	/*
+	 * Check if the expression can be evaluated in the Const fasion.
+	 */
+	if (ExecIsExprUnsafeToConst((Node *) aexpr))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("unable to resolve function argument"),
+				 errposition(exprLocation((Node *) aexpr))));
+
+	argtype = exprType((Node *) aexpr);
+	if (!OidIsValid(argtype))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDETERMINATE_DATATYPE),
+				 errmsg("unable to resolve function argument type"),
+				 errposition(exprLocation((Node *) aexpr))));
+	argtypmod = exprTypmod((Node *) aexpr);
+	argcollation = exprCollation((Node *) aexpr);
+
+	result = (Const *) evaluate_expr(aexpr, argtype, argtypmod, argcollation);
+	/* evaluate_expr always returns Const */
+	Assert(IsA(result, Const));
+
+	if (isnull)
+		*isnull = result->constisnull;
+
+	return result->constvalue;
+}
+
+typedef struct neededColumnContext
+{
+	bool *mask;
+	int n;
+} neededColumnContext;
+
+static bool
+neededColumnContextWalker(Node *node, neededColumnContext *c)
+{
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, Var))
+	{
+		Var *var = (Var *)node;
+
+		if (IS_SPECIAL_VARNO(var->varno))
+			return false;
+
+		if (var->varattno > 0 && var->varattno <= c->n)
+			c->mask[var->varattno - 1] = true;
+
+		/*
+		 * If all attributes are included,
+		 * set all entries in mask to true.
+		 */
+		else if (var->varattno == 0)
+		{
+			int i;
+
+			for (i=0; i < c->n; i++)
+				c->mask[i] = true;
+		}
+
+		return false;
+	}
+	return expression_tree_walker(node, neededColumnContextWalker, (void * )c);
+}
+
+/*
+ * n specifies the number of allowed entries in mask: we use
+ * it for bounds-checking in the walker above.
+ */
+void GetNeededColumnsForScan(Node *expr, bool *mask, int n)
+{
+	neededColumnContext c;
+
+	c.mask = mask;
+	c.n = n;
+
+	neededColumnContextWalker(expr, &c);
+}
+
+/* ----------------------------------------------------------------
+ *	isJoinExprNull
+ *
+ *	Checks if the join expression evaluates to NULL for a given
+ *	input tuple.
+ *
+ *	The input tuple has to be present in the correct TupleTableSlot
+ *	in the ExprContext. For example, if all the expressions
+ *	in joinExpr refer to the inner side of the join,
+ *	econtext->ecxt_innertuple must be valid.
+ * ----------------------------------------------------------------
+ */
+bool
+isJoinExprNull(List *joinExpr, ExprContext *econtext)
+{
+
+	Assert(NULL != joinExpr);
+	bool joinkeys_null = true;
+
+	ListCell   *lc;
+	foreach(lc, joinExpr)
+	{
+		ExprState  *keyexpr = (ExprState *) lfirst(lc);
+		bool		isNull = false;
+
+		/*
+		 * Evaluate the current join attribute value of the tuple
+		 */
+		ExecEvalExpr(keyexpr, econtext, &isNull, NULL);
+
+		if (!isNull)
+		{
+			/* Found at least one non-null join expression, we're done */
+			joinkeys_null = false;
+			break;
+		}
+	}
+
+	return joinkeys_null;
 }

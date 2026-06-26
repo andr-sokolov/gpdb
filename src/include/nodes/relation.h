@@ -4,6 +4,8 @@
  *	  Definitions for planner's internal data structures.
  *
  *
+ * Portions Copyright (c) 2005-2010, Greenplum inc
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -17,7 +19,12 @@
 #include "access/sdir.h"
 #include "nodes/params.h"
 #include "nodes/parsenodes.h"
+#include "nodes/plannodes.h"
+#include "nodes/primnodes.h"
 #include "storage/block.h"
+#include "nodes/plannerconfig.h"
+#include "cdb/cdbpathlocus.h"
+#include "foreign/foreign.h"
 
 
 /*
@@ -25,6 +32,11 @@
  *		Set of relation identifiers (indexes into the rangetable).
  */
 typedef Bitmapset *Relids;
+
+/*
+ * Estimated costs
+ */
+typedef double EstimatedBytes;  /* an estimated number of bytes */
 
 /*
  * When looking for a "cheapest path", this enum specifies whether we want
@@ -55,10 +67,36 @@ typedef struct AggClauseCosts
 {
 	int			numAggs;		/* total number of aggregate functions */
 	int			numOrderedAggs; /* number w/ DISTINCT/ORDER BY/WITHIN GROUP */
+	int			numPureOrderedAggs; /* CDB: number that use ORDER BY/WITHIN GROUP, not counting DISTINCT */
+	bool		hasNonCombine;	/* CDB: any agg func w/o a combine func? */
+	bool		hasNonSerial;	/* CDB: is any partial agg non-serializable? */
 	QualCost	transCost;		/* total per-input-row execution costs */
 	Cost		finalCost;		/* total per-aggregated-row costs */
 	Size		transitionSpace;	/* space for pass-by-ref transition data */
+
+	List   *dqaArgs;	/* CDB: List of distinct DQA argument exprs. */
 } AggClauseCosts;
+
+
+/*
+ * Context for apply shareinput processing during planning.  We could fold
+ * this into PlannerGlobal, but this encapsulates it nicely.
+ */
+typedef struct ApplyShareInputContext
+{
+	List	   *curr_rtable;
+	int		   *share_refcounts;
+	int			share_refcounts_sz;		/* allocated sized of 'share_refcounts' */
+	List *motStack;
+	List *qdShares;
+	List *qdSlices;
+	int nextPlanId;
+
+	ShareInputScan **producers;
+	int		   *sliceMarks;			/* one for each producer */
+	int			producer_count;
+
+} ApplyShareInputContext;
 
 
 /*----------
@@ -99,12 +137,12 @@ typedef struct PlannerGlobal
 	Index		lastRowMarkId;	/* highest PlanRowMark ID assigned */
 
 	bool		transientPlan;	/* redo plan when TransactionXmin changes? */
+	bool		oneoffPlan;		/* redo plan on every execution? */
+	bool		simplyUpdatable; /* can be used with CURRENT OF? */
+
+	ApplyShareInputContext share;	/* workspace for GPDB plan sharing */
+
 } PlannerGlobal;
-
-/* macro for fetching the Plan associated with a SubPlan node */
-#define planner_subplan_get_plan(root, subplan) \
-	((Plan *) list_nth((root)->glob->subplans, (subplan)->plan_id - 1))
-
 
 /*----------
  * PlannerInfo
@@ -192,8 +230,18 @@ typedef struct PlannerInfo
 
 	List	   *eq_classes;		/* list of active EquivalenceClasses */
 
+	List	   *non_eq_clauses;	/* list of non-equivalence clauses */
+
 	List	   *canon_pathkeys; /* list of "canonical" PathKeys */
 
+	PartitionNode *result_partitions;
+	List	   *result_aosegnos;
+
+	List       *list_cteplaninfo; /* list of CtePlannerInfo, one for each CTE */
+
+	/*
+	 * Outer join info
+	 */
 	List	   *left_join_clauses;		/* list of RestrictInfos for
 										 * mergejoinable outer join clauses
 										 * w/nonnullable var on left */
@@ -251,10 +299,69 @@ typedef struct PlannerInfo
 	Relids		curOuterRels;	/* outer rels above current node */
 	List	   *curOuterParams; /* not-yet-assigned NestLoopParams */
 
+	PlannerConfig *config;		/* Planner configuration */
+
+	List	   *dynamicScans;	/* DynamicScanInfos */
+
 	/* optional private data for join_search_hook, e.g., GEQO */
 	void	   *join_search_private;
+
+	int			upd_del_replicated_table;
+	bool		is_split_update;	/* true if UPDATE that modifies
+									 * distribution key columns */
+	bool		is_correlated_subplan; /* true for correlated subqueries nested within subplans */
+	bool		disallow_unique_rowid_path; /* true if we decide not to generate unique rowid path */
 } PlannerInfo;
 
+/*
+ * CtePlanInfo
+ *    Information for subplans that are associated with a CTE.
+ */
+typedef struct CtePlanInfo
+{
+	/*
+	 * A subplan, prepared for sharing among many CTE references by
+	 * prepare_plan_for_sharing(), that implements the CTE. NULL if the
+	 * CTE is not shared among references.
+	 */
+	Plan *shared_plan;
+
+	/*
+	 * The subroot corresponding to the subplan.
+	 */
+	PlannerInfo *subroot;
+} CtePlanInfo;
+
+/*----------
+ * DynamicScanInfo
+ *		Information about scans on partitioned tables.
+ *
+ * Scans on partitioned tables are expanded into Append paths early
+ * in the planning. For each such expansion, we create a DynamicScanInfo
+ * struct.
+ *----------
+ */
+typedef struct
+{
+	/*
+	 * The scans are numbered, so that a Partition Selector can
+	 * refer to the scan.
+	 */
+	int			dynamicScanId;
+
+	/* Parent relation this is for */
+	int			rtindex;
+	Oid			parentOid;
+
+	/* RTindexes of the leaf relations */
+	Relids		children;
+
+	/* Partitioning key information */
+	List	   *partKeyAttnos;
+
+	/* Set to true, if a PartitionSelector has been created for this scan */
+	bool		hasSelector;
+} DynamicScanInfo;
 
 /*
  * In places where it's known that simple_rte_array[] must have been prepared
@@ -265,6 +372,31 @@ typedef struct PlannerInfo
 	((root)->simple_rte_array ? (root)->simple_rte_array[rti] : \
 	 rt_fetch(rti, (root)->parse->rtable))
 
+
+/*
+ * Fetch the Plan associated with a SubPlan node during planning.
+ */
+static inline struct Plan *planner_subplan_get_plan(struct PlannerInfo *root, SubPlan *subplan) 
+{
+	return (Plan *) list_nth(root->glob->subplans, subplan->plan_id - 1);
+}
+
+/**
+ * Fetch the root (PlannerInfo) for a subplan
+ */
+static inline struct PlannerInfo *planner_subplan_get_root(struct PlannerInfo *root, SubPlan *subplan)
+{
+	return (PlannerInfo *) list_nth(root->glob->subroots, subplan->plan_id - 1);
+}
+
+/*
+ * Rewrite the Plan associated with a SubPlan node during planning.
+ */
+static inline void planner_subplan_put_plan(struct PlannerInfo *root, SubPlan *subplan, Plan *plan) 
+{
+	ListCell *cell = list_nth_cell(root->glob->subplans, subplan->plan_id-1);
+	cell->data.ptr_value = plan;
+}
 
 /*----------
  * RelOptInfo
@@ -423,6 +555,7 @@ typedef struct RelOptInfo
 	/* size estimates generated by planner */
 	double		rows;			/* estimated number of result tuples */
 	int			width;			/* estimated avg width of result tuples */
+	bool		onerow;			/* true => rel is inherently 1 row or empty */
 
 	/* per-relation planner control flags */
 	bool		consider_startup;		/* keep cheap-startup-cost paths? */
@@ -451,10 +584,12 @@ typedef struct RelOptInfo
 	List	   *indexlist;		/* list of IndexOptInfo */
 	BlockNumber pages;			/* size estimates derived from pg_class */
 	double		tuples;
+    struct GpPolicy   *cdbpolicy;      /* distribution of stored tuples */
+	char		relstorage;		/* from pg_class.relstorage */
 	double		allvisfrac;
 	/* use "struct Plan" to avoid including plannodes.h here */
-	struct Plan *subplan;		/* if subquery */
-	PlannerInfo *subroot;		/* if subquery */
+	struct Plan *subplan;		/* if subquery (in GPDB: or CTE) */
+	PlannerInfo *subroot;		/* if subquery (in GPDB: or CTE) */
 	List	   *subplan_params; /* if subquery */
 	/* use "struct FdwRoutine" to avoid including fdwapi.h here */
 	struct FdwRoutine *fdwroutine;		/* if foreign table */
@@ -467,6 +602,18 @@ typedef struct RelOptInfo
 	List	   *joininfo;		/* RestrictInfo structures for join clauses
 								 * involving this rel */
 	bool		has_eclass_joins;		/* T means joininfo is incomplete */
+
+	/*
+	 * In a subquery, if this base relation contains quals that must
+	 * be evaluated at "outerquery" locus, and the base relation has a
+	 * different locus, they are kept here in 'upperrestrictinfo', instead of
+	 * 'baserestrictinfo'.
+	 */
+	List	   *upperrestrictinfo;		/* RestrictInfo structures (if base
+										 * rel) */
+
+	/* used by foreign scan */
+	ForeignTable		*ftEntry;
 } RelOptInfo;
 
 /*
@@ -537,8 +684,36 @@ typedef struct IndexOptInfo
 	bool		amsearchnulls;	/* can AM search for NULL/NOT NULL entries? */
 	bool		amhasgettuple;	/* does AM have amgettuple interface? */
 	bool		amhasgetbitmap; /* does AM have amgetbitmap interface? */
+    int         num_leading_eq; /* CDB: always 0, except amcostestimate proc may
+                                 * set it briefly; it is transferred forthwith
+                                 * to the IndexPath (q.v.), then reset. Kludge.
+                                 */
 } IndexOptInfo;
 
+
+/*
+ * CdbRelColumnInfo
+ *
+ * Describes a synthetic column to be added to a baserel's targetlist.
+ * The pseudocols field of the RTE points to a List of CdbRelColumnInfo.
+ */
+typedef struct CdbRelColumnInfo
+{
+	NodeTag		type;                   /* T_CdbRelColumnInfo */
+
+    AttrNumber  pseudoattno;            /* FirstLowInvalidHeapAttributeNumber
+                                         *  minus the 0-based position of the
+                                         *  CdbRelColumnInfo node in the
+                                         *  rte->pseudocols list
+                                         */
+    AttrNumber  targetresno;            /* 1-based position of the pseudo
+                                         *  column in the rel's targetlist
+                                         */
+    Expr       *defexpr;                /* expr to be evaluated in targetlist */
+	Relids	    where_needed;           /* set of relids whose quals use col */
+	int32	    attr_width;             /* expected #bytes for column value */
+    char        colname[NAMEDATALEN+1]; /* name for EXPLAIN */
+} CdbRelColumnInfo;
 
 /*
  * EquivalenceClasses
@@ -667,6 +842,30 @@ typedef struct PathKey
 	bool		pk_nulls_first; /* do NULLs come before normal values? */
 } PathKey;
 
+/*
+ * DistributionKeys
+ *
+ * Like PathKey, but is used to represent data distribution by hash across
+ * segments (DISTRIBUTED BY), rather than sort ordering.
+ */
+typedef struct DistributionKey
+{
+	NodeTag		type;
+
+	List	   *dk_eclasses;	/* the value that is distributed */
+
+	/* Hash operator family that determines the hash function to use */
+	Oid			dk_opfamily;
+} DistributionKey;
+
+/*
+ * CdbEquivClassIsConstant
+ *      is true if the equivalence class represents a pseudo-constant
+ *
+ * This is copied from MUST_BE_REDUNDANT in pathkeys.c
+ */
+#define CdbEquivClassIsConstant(eclass)						\
+	((eclass)->ec_has_const && !(eclass)->ec_below_outer_join)
 
 /*
  * ParamPathInfo
@@ -730,9 +929,45 @@ typedef struct Path
 	Cost		startup_cost;	/* cost expended before fetching any tuples */
 	Cost		total_cost;		/* total cost (assuming all tuples fetched) */
 
+    EstimatedBytes  memory;     /* executor RAM needed for Path + kids */
+
+    CdbPathLocus    locus;      /* distribution of the result tuples */
+
+    bool        motionHazard;   /* true => path contains a CdbMotion operator
+                                 *    without a slackening operator above it */
+	
+	bool		rescannable;    /* CDB: true => path can accept ExecRescan call
+                                 */
 	List	   *pathkeys;		/* sort ordering of path's output */
 	/* pathkeys is a List of PathKey nodes; see above */
+
+	/*
+	 * sameslice_relids indicates which (base) relations will be executed in
+	 * the same slice, if this path is chosen. It is used in partition planning,
+	 * to decide if it's safe to create a PartitionSelector node that affects
+	 * other nodes at a distance. That can only be done if the PartitionSelector
+	 * would be executed in the same slice.
+	 *
+	 * This is a conservative estimate, it's always safe to set it to NULL if
+	 * unsure, and the worst that will happen is that you lose out on potential
+	 * optimizations.
+	 */
+	Relids		sameslice_relids;
 } Path;
+
+/*
+ * PartitionSelectorPath is used for injection of partition selectors
+ */
+typedef struct PartitionSelectorPath
+{
+	Path		path;
+
+    Path	   *subpath;
+
+	DynamicScanInfo *dsinfo;
+	List	   *partKeyExprs;
+	List	   *partKeyAttnos;
+} PartitionSelectorPath;
 
 /* Macro for extracting a path's parameterization relids; beware double eval */
 #define PATH_REQ_OUTER(path)  \
@@ -802,6 +1037,13 @@ typedef struct IndexPath
 	ScanDirection indexscandir;
 	Cost		indextotalcost;
 	Selectivity indexselectivity;
+    int         num_leading_eq; /* CDB: number of leading key columns matched by
+                                 * equality predicates in indexquals.  If equal
+                                 * to indexinfo->ncolumns, at most one distinct
+                                 * value of the index key can satisfy the quals.
+                                 * Further if the index is unique, we can assume
+                                 * at most one visible row satisfies the quals.
+                                 */
 } IndexPath;
 
 /*
@@ -865,6 +1107,16 @@ typedef struct TidPath
 	Path		path;
 	List	   *tidquals;		/* qual(s) involving CTID = something */
 } TidPath;
+
+/*
+ * CdbMotionPath represents transmission of the child Path results
+ * from a set of sending processes to a set of receiving processes.
+ */
+typedef struct CdbMotionPath
+{
+	Path		path;
+    Path	   *subpath;
+} CdbMotionPath;
 
 /*
  * ForeignPath represents a potential scan of a foreign table
@@ -938,6 +1190,18 @@ typedef struct MaterialPath
 {
 	Path		path;
 	Path	   *subpath;
+    bool        cdb_strict;     /* true  => consume and store all input tuples
+                                 *            before yielding output tuples
+                                 * false => memoize tuples as they stream thru
+                                 */
+
+	/*
+	 * If 'cdb_shield_child_from_rescans' is set, the sub-plan is not
+	 * rescannable, and the Material never call rescan on it. (The Material
+	 * node will keep all tuples, even if REWIND/BACKWARD/MARK executor flags
+	 * are not set.)
+	 */
+	bool		cdb_shield_child_from_rescans;
 } MaterialPath;
 
 /*
@@ -967,6 +1231,12 @@ typedef struct UniquePath
 	UniquePathMethod umethod;
 	List	   *in_operators;	/* equality operators of the IN clause */
 	List	   *uniq_exprs;		/* expressions to be made unique */
+    Relids      distinct_on_rowid_relids;
+                                /* CDB: set of relids whose row ids are to be
+                                 * uniqueified.
+                                 */
+    bool        must_repartition;
+                                /* CDB: true => add Motion atop subpath  */
 } UniquePath;
 
 /*
@@ -990,6 +1260,15 @@ typedef struct JoinPath
 	 * parent RelOptInfo.
 	 */
 } JoinPath;
+
+/*
+ * IsJoinPath
+ *      Returns true if the node type is one that derives from JoinPath.
+ */
+#define IsJoinPath(node)        \
+    (IsA((node), NestPath) ||   \
+     IsA((node), HashPath) ||   \
+     IsA((node), MergePath))
 
 /*
  * A nested-loop path needs no special fields.
@@ -1049,6 +1328,35 @@ typedef struct HashPath
 	List	   *path_hashclauses;		/* join clauses used for hashing */
 	int			num_batches;	/* number of batches expected */
 } HashPath;
+
+/*
+ * ProjectionPath represents a projection (that is, targetlist computation)
+ *
+ * Nominally, this path node represents using a Result plan node to do a
+ * projection step.  However, if the input plan node supports projection,
+ * we can just modify its output targetlist to do the required calculations
+ * directly, and not need a Result.  In some places in the planner we can just
+ * jam the desired PathTarget into the input path node (and adjust its cost
+ * accordingly), so we don't need a ProjectionPath.  But in other places
+ * it's necessary to not modify the input path node, so we need a separate
+ * ProjectionPath node, which is marked dummy to indicate that we intend to
+ * assign the work to the input plan node.  The estimated cost for the
+ * ProjectionPath node will account for whether a Result will be used or not.
+ */
+typedef struct ProjectionPath
+{
+	Path		path;
+	Path	   *subpath;		/* path representing input source */
+	bool		dummypp;		/* true if no separate Result is needed */
+
+	List	   *cdb_restrict_clauses;
+
+	/*
+	 * Greenplum specific field:
+	 * If force is true, we always create a Result plannode.
+	 */
+	bool        force;
+} ProjectionPath;
 
 /*
  * Restriction clause info.
@@ -1194,6 +1502,12 @@ typedef struct RestrictInfo
 	bool		can_join;		/* see comment above */
 
 	bool		pseudoconstant; /* see comment above */
+
+	/*
+	 * GPDB: does the clause refer to outer query levels? (Which implies that
+	 * it must be evaluted in the same slice as the parent query)
+	 */
+	bool		contain_outer_query_references;
 
 	/* The set of relids (varnos) actually referenced in the clause: */
 	Relids		clause_relids;
@@ -1504,6 +1818,18 @@ typedef struct AppendRelInfo
  * The idea is to evaluate the expression at (only) the ph_eval_at join level,
  * then allow it to bubble up like a Var until the ph_needed join level.
  * ph_needed has the same definition as attr_needed for a regular Var.
+ * ph_may_need is an initial estimate of ph_needed, formed using the
+ * syntactic locations of references to the PHV.  We need this in order to
+ * determine whether the PHV reference forces a join ordering constraint:
+ * if the PHV has to be evaluated below the nullable side of an outer join,
+ * and then used above that outer join, we must constrain join order to ensure
+ * there's a valid place to evaluate the PHV below the join.  The final
+ * actual ph_needed level might be lower than ph_may_need, but we can't
+ * determine that until later on.  Fortunately this doesn't matter for what
+ * we need ph_may_need for: if there's a PHV reference syntactically
+ * above the outer join, it's not going to be allowed to drop below the outer
+ * join, so we would come to the same conclusions about join order even if
+ * we had the final ph_needed value to compare to.
  *
  * The PlaceHolderVar's expression might contain LATERAL references to vars
  * coming from outside its syntactic scope.  If so, those rels are *not*
@@ -1601,6 +1927,88 @@ typedef struct PlannerParamItem
 	Node	   *item;			/* the Var, PlaceHolderVar, or Aggref */
 	int			paramId;		/* its assigned PARAM_EXEC slot number */
 } PlannerParamItem;
+
+/*
+ * Partitioning meta data
+ */
+
+/*
+ * convenient representation of a row of pg_partition -- a partitioning level of
+ * a partitioned table or a template for all the partitioning branches at a level.
+ */
+typedef struct Partition
+{
+	NodeTag type;
+	Oid partid;			/* OID of row in pg_partition. */
+	Oid parrelid;		/* OID in pg_class of top-level partitioned relation */
+	char parkind;		/* 'r', 'l', or (unsupported) 'h' */
+	int16 parlevel;		/* depth below parent partitioned table */
+	bool paristemplate;	/* just a template, or really a part? */
+	int16 parnatts;		/* number of partitioning attributes */
+	AttrNumber *paratts;/* attribute number vector */ 
+	Oid *parclass;		/* operator class vector */
+} Partition;
+
+struct PartitionNode
+{
+	NodeTag type;
+	Partition *part;
+	struct PartitionRule *default_part;
+	List *rules; /* rules for this level */
+};
+
+/* Individual partitioning rule */
+typedef struct PartitionRule
+{
+	NodeTag		 type;
+	Oid			 parruleid;
+	Oid			 paroid;
+	Oid			 parchildrelid;
+	Oid			 parparentoid;
+	bool		 parisdefault;
+	char		*parname;
+	Node		*parrangestart;
+	bool		 parrangestartincl;
+	Node		*parrangeend;
+	bool		 parrangeendincl;
+	Node		*parrangeevery;
+	List		*parlistvalues;
+	int16		 parruleord;
+	List		*parreloptions;
+	Oid			 partemplatespaceId; 	/* the tablespace id for the
+										 * template (or InvalidOid for 
+										 * non-template rules */
+	struct PartitionNode *children; /* sub partition */
+} PartitionRule;
+
+typedef struct PgPartRule
+{
+	NodeTag type;
+	PartitionNode 		*pNode;
+	PartitionRule 		*topRule;	/* the rule for the specified partition */
+
+	/* a textual representation of the partition id (for error msgs) */
+	char		*partIdStr;
+	bool         isName;		/* true if partid is name */
+	int          topRuleRank;	/* rank of topRule */
+	char        *relname; 		/* the error msg formatted "relname" */
+} PgPartRule;
+
+/*
+ * A Mapping created by the QD during data loading that maps a
+ * relation id to the segfile number that is should be inserting
+ * into (in cases of inserting into a partitioned table the QD
+ * assigns a segno for each possible partition child relation).
+ * 
+ * It is a node because it needs to get serialized as a part of 
+ * CopyStmt.
+ */
+typedef struct SegfileMapNode
+{
+	NodeTag 	type;
+	Oid			relid;
+	int			segno;
+} SegfileMapNode;
 
 /*
  * When making cost estimates for a SEMI or ANTI join, there are some

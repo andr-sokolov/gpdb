@@ -46,19 +46,30 @@
 #include <signal.h>
 
 #include "access/clog.h"
+#include "access/distributedlog.h"
 #include "access/subtrans.h"
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/twophase.h"
 #include "catalog/catalog.h"
 #include "miscadmin.h"
+#include "port/atomics.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "storage/spin.h"
 #include "utils/builtins.h"
+#include "utils/combocid.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/tqual.h"
+#include "utils/guc.h"
+#include "utils/memutils.h"
 
+#include "access/xact.h"		/* setting the shared xid */
+
+#include "cdb/cdbtm.h"
+#include "cdb/cdbvars.h"
+#include "utils/sharedsnapshot.h"
 
 /* Our shared memory area */
 typedef struct ProcArrayStruct
@@ -100,6 +111,7 @@ static ProcArrayStruct *procArray;
 
 static PGPROC *allProcs;
 static PGXACT *allPgXact;
+static TMGXACT *allTmGxact;
 
 /*
  * Bookkeeping for tracking emulated transactions in recovery
@@ -247,6 +259,7 @@ CreateSharedProcArray(void)
 
 	allProcs = ProcGlobal->allProcs;
 	allPgXact = ProcGlobal->allPgXact;
+	allTmGxact = ProcGlobal->allTmGxact;
 
 	/* Create or attach to the KnownAssignedXids arrays too, if needed */
 	if (EnableHotStandby)
@@ -353,6 +366,14 @@ ProcArrayRemove(PGPROC *proc, TransactionId latestXid)
 		Assert(!TransactionIdIsValid(allPgXact[proc->pgprocno].xid));
 	}
 
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		DistributedTransactionId gxid = allTmGxact[proc->pgprocno].gxid;
+		if (InvalidDistributedTransactionId != gxid &&
+			TransactionIdPrecedes(ShmemVariableCache->latestCompletedDxid, gxid))
+			ShmemVariableCache->latestCompletedDxid = gxid;
+	}
+
 	for (index = 0; index < arrayP->numProcs; index++)
 	{
 		if (arrayP->pgprocnos[index] == proc->pgprocno)
@@ -374,6 +395,18 @@ ProcArrayRemove(PGPROC *proc, TransactionId latestXid)
 }
 
 
+void
+ProcArrayEndGxact(void)
+{
+	Assert(LWLockHeldByMe(ProcArrayLock));
+	DistributedTransactionId gxid = MyTmGxact->gxid;
+
+	if (InvalidDistributedTransactionId != gxid &&
+		TransactionIdPrecedes(ShmemVariableCache->latestCompletedDxid, gxid))
+		ShmemVariableCache->latestCompletedDxid = gxid;
+	resetGxact();
+}
+
 /*
  * ProcArrayEndTransaction -- mark a transaction as no longer running
  *
@@ -386,9 +419,15 @@ ProcArrayRemove(PGPROC *proc, TransactionId latestXid)
  * the caller to pass latestXid, instead of computing it from the PGPROC's
  * contents, because the subxid information in the PGPROC might be
  * incomplete.)
+ *
+ * GPDB: If this is a global transaction, we might need to do this action
+ * later, rather than now. In that case, this function returns true for
+ * needNotifyCommittedDtxTransaction, and does *not* change the state of the
+ * PGPROC entry. This can only happen for commit; when !isCommit, this always
+ * clears the PGPROC entry.
  */
 void
-ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid)
+ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid, bool lockHeld)
 {
 	PGXACT	   *pgxact = &allPgXact[proc->pgprocno];
 
@@ -400,9 +439,10 @@ ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid)
 		 * else is taking a snapshot.  See discussion in
 		 * src/backend/access/transam/README.
 		 */
-		Assert(TransactionIdIsValid(allPgXact[proc->pgprocno].xid));
-
-		LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+		Assert(TransactionIdIsValid(allPgXact[proc->pgprocno].xid) ||
+			   (IsBootstrapProcessingMode() && latestXid == BootstrapTransactionId));
+		if (!lockHeld)
+			LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
 
 		pgxact->xid = InvalidTransactionId;
 		proc->lxid = InvalidLocalTransactionId;
@@ -411,6 +451,7 @@ ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid)
 		pgxact->vacuumFlags &= ~PROC_VACUUM_STATE_MASK;
 		pgxact->delayChkpt = false;		/* be sure this is cleared in abort */
 		proc->recoveryConflictPending = false;
+		proc->serializableIsoLevel = false;
 
 		/* Clear the subtransaction-XID cache too while holding the lock */
 		pgxact->nxids = 0;
@@ -421,7 +462,8 @@ ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid)
 								  latestXid))
 			ShmemVariableCache->latestCompletedXid = latestXid;
 
-		LWLockRelease(ProcArrayLock);
+		if (!lockHeld)
+			LWLockRelease(ProcArrayLock);
 	}
 	else
 	{
@@ -438,10 +480,15 @@ ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid)
 		pgxact->vacuumFlags &= ~PROC_VACUUM_STATE_MASK;
 		pgxact->delayChkpt = false;		/* be sure this is cleared in abort */
 		proc->recoveryConflictPending = false;
+		proc->serializableIsoLevel = false;
 
 		Assert(pgxact->nxids == 0);
 		Assert(pgxact->overflowed == false);
 	}
+
+	/* Clear distributed transaction status for one-phase commit transaction */
+	if (Gp_role == GP_ROLE_EXECUTE)
+		resetGxact();
 }
 
 
@@ -472,6 +519,7 @@ ProcArrayClearTransaction(PGPROC *proc)
 	/* redundant, but just in case */
 	pgxact->vacuumFlags &= ~PROC_VACUUM_STATE_MASK;
 	pgxact->delayChkpt = false;
+	proc->serializableIsoLevel = false;
 
 	/* Clear the subtransaction-XID cache too */
 	pgxact->nxids = 0;
@@ -1119,6 +1167,46 @@ TransactionIdIsActive(TransactionId xid)
 	return result;
 }
 
+/*
+ * Returns true if there are of serializable backends (except the current
+ * one).
+ *
+ * If allDbs is TRUE then all backends are considered; if allDbs is FALSE
+ * then only backends running in my own database are considered.
+ */
+bool
+HasSerializableBackends(bool allDbs)
+{
+	ProcArrayStruct *arrayP = procArray;
+	bool result = false; /* Assumes */
+	int			index;
+
+	LWLockAcquire(ProcArrayLock, LW_SHARED);
+
+	for (index = 0; index < arrayP->numProcs; index++)
+	{
+		int			pgprocno = arrayP->pgprocnos[index];
+		volatile PGPROC *proc = &allProcs[pgprocno];
+		volatile PGXACT *pgxact = &allPgXact[pgprocno];
+		if (proc->pid == 0)
+			continue;			/* do not count prepared xacts */
+
+		if (allDbs || proc->databaseId == MyDatabaseId)
+		{
+			if (proc->serializableIsoLevel && proc != MyProc)
+			{
+				elogif(Debug_print_snapshot_dtm, LOG,
+					   "Found serializable transaction: database %d, pid %d, xid %d, xmin %d",
+					   proc->databaseId, proc->pid, pgxact->xid, pgxact->xmin);
+				result = true;
+			}
+		}
+	}
+
+	LWLockRelease(ProcArrayLock);
+
+	return result;
+}
 
 /*
  * GetOldestXmin -- returns oldest transaction that was running
@@ -1167,9 +1255,46 @@ TransactionIdIsActive(TransactionId xid)
  * The return value is also adjusted with vacuum_defer_cleanup_age, so
  * increasing that setting on the fly is another easy way to make
  * GetOldestXmin() move backwards, with no consequences for data integrity.
+ *
+ * GPDB: This also needs to deal with distributed snapshots. We keep track of
+ * the oldest local XID that is still visible to any distributed snapshot,
+ * in the DistributedLog subsystem. DistributedLog doesn't distinguish between
+ * different databases, nor vacuums, however. So in GPDB, the 'allDbs' and
+ * 'ignoreVacuum' arguments don't do much, because the value from the
+ * distributed log will include everything.
  */
 TransactionId
 GetOldestXmin(Relation rel, bool ignoreVacuum)
+{
+	TransactionId result;
+
+	result = GetLocalOldestXmin(rel, ignoreVacuum);
+
+	/*
+	 * In QD node, all distributed transactions have an entry in the proc array,
+	 * so we're done.
+	 *
+	 * During binary upgrade and in maintenance mode, we don't have
+	 * distributed transactions, so we're done there too. This ensures correct
+	 * operation of VACUUM FREEZE during pg_upgrade and maintenance mode.
+	 *
+	 * In bootstrap or standalone backend case as well ignore the distributed
+	 * logs using IsPostmasterEnvironment. Otherwise, during initdb can't
+	 * vacuum freeze template0.
+	 */
+	if (IsPostmasterEnvironment && !IS_QUERY_DISPATCHER() &&
+		!IsBinaryUpgrade && !gp_maintenance_mode)
+		result = DistributedLog_GetOldestXmin(result);
+
+	return result;
+}
+
+/*
+ * This is the upstream version of GetOldestXmin(). It doesn't take
+ * distributed transactions into account.
+ */
+TransactionId
+GetLocalOldestXmin(Relation rel, bool ignoreVacuum)
 {
 	ProcArrayStruct *arrayP = procArray;
 	TransactionId result;
@@ -1214,8 +1339,10 @@ GetOldestXmin(Relation rel, bool ignoreVacuum)
 		if (pgxact->vacuumFlags & PROC_IN_LOGICAL_DECODING)
 			continue;
 
+#if 0
 		if (ignoreVacuum && (pgxact->vacuumFlags & PROC_IN_VACUUM))
 			continue;
+#endif
 
 		if (allDbs ||
 			proc->databaseId == MyDatabaseId ||
@@ -1309,7 +1436,472 @@ GetOldestXmin(Relation rel, bool ignoreVacuum)
 	return result;
 }
 
+void
+updateSharedLocalSnapshot(DtxContextInfo *dtxContextInfo,
+						  DtxContext distributedTransactionContext,
+						  Snapshot snapshot,
+						  char *debugCaller)
+{
+	int combocidSize;
+
+	Assert(SharedLocalSnapshotSlot != NULL);
+
+	Assert(snapshot != NULL);
+
+	elogif(Debug_print_full_dtm, LOG,
+		   "updateSharedLocalSnapshot for DistributedTransactionContext = '%s' passed local snapshot (xmin: %u xmax: %u xcnt: %u) curcid: %d",
+		   DtxContextToString(distributedTransactionContext),
+		   snapshot->xmin,
+		   snapshot->xmax,
+		   snapshot->xcnt,
+		   snapshot->curcid);
+
+	LWLockAcquire(SharedLocalSnapshotSlot->slotLock, LW_EXCLUSIVE);
+
+	SharedLocalSnapshotSlot->snapshot.xmin = snapshot->xmin;
+	SharedLocalSnapshotSlot->snapshot.xmax = snapshot->xmax;
+	SharedLocalSnapshotSlot->snapshot.xcnt = snapshot->xcnt;
+
+	if (snapshot->xcnt > 0)
+	{
+		Assert(snapshot->xip != NULL);
+
+		elogif(Debug_print_full_dtm, LOG,
+			   "updateSharedLocalSnapshot count of in-doubt ids %u",
+			   SharedLocalSnapshotSlot->snapshot.xcnt);
+
+		memcpy(SharedLocalSnapshotSlot->snapshot.xip, snapshot->xip, snapshot->xcnt * sizeof(TransactionId));
+	}
+	
+	/* combocid stuff */
+	combocidSize = ((usedComboCids < MaxComboCids) ? usedComboCids : MaxComboCids );
+
+	SharedLocalSnapshotSlot->combocidcnt = combocidSize;	
+	memcpy((void *)SharedLocalSnapshotSlot->combocids, comboCids,
+		   combocidSize * sizeof(ComboCidKeyData));
+
+	SharedLocalSnapshotSlot->snapshot.curcid = snapshot->curcid;
+
+	elogif(Debug_print_full_dtm, LOG,
+		   "updateSharedLocalSnapshot: combocidsize is now %d max %d segmateSync %d->%d",
+		   combocidSize, MaxComboCids, SharedLocalSnapshotSlot->segmateSync, dtxContextInfo->segmateSync);
+
+	SetSharedTransactionId_writer(distributedTransactionContext);
+	
+	SharedLocalSnapshotSlot->QDxid = dtxContextInfo->distributedXid;
+	SharedLocalSnapshotSlot->segmateSync = dtxContextInfo->segmateSync;
+	SharedLocalSnapshotSlot->ready = true;
+
+	elogif(Debug_print_full_dtm, LOG,
+		   "updateSharedLocalSnapshot for DistributedTransactionContext = '%s' setting shared local snapshot xid = %u (xmin: %u xmax: %u xcnt: %u) curcid: %d, QDxid = %u",
+		   DtxContextToString(distributedTransactionContext),
+		   SharedLocalSnapshotSlot->xid,
+		   SharedLocalSnapshotSlot->snapshot.xmin,
+		   SharedLocalSnapshotSlot->snapshot.xmax,
+		   SharedLocalSnapshotSlot->snapshot.xcnt,
+		   SharedLocalSnapshotSlot->snapshot.curcid,
+		   SharedLocalSnapshotSlot->QDxid);
+
+	elogif(Debug_print_snapshot_dtm, LOG,
+		   "[Distributed Snapshot #%u] *Writer Set Shared* gxid %u, (gxid = %u, slot #%d, '%s', '%s')",
+		   QEDtxContextInfo.distributedSnapshot.distribSnapshotId,
+		   SharedLocalSnapshotSlot->QDxid,
+		   getDistributedTransactionId(),
+		   SharedLocalSnapshotSlot->slotid,
+		   debugCaller,
+		   DtxContextToString(distributedTransactionContext));
+	LWLockRelease(SharedLocalSnapshotSlot->slotLock);
+}
+
+static int
+GetDistributedSnapshotMaxCount(DtxContext distributedTransactionContext)
+{
+	switch (distributedTransactionContext)
+	{
+	case DTX_CONTEXT_LOCAL_ONLY:
+	case DTX_CONTEXT_QD_RETRY_PHASE_2:
+	case DTX_CONTEXT_QE_FINISH_PREPARED:
+		return 0;
+
+	case DTX_CONTEXT_QD_DISTRIBUTED_CAPABLE:
+		return GetMaxSnapshotXidCount();
+
+	case DTX_CONTEXT_QE_TWO_PHASE_EXPLICIT_WRITER:
+	case DTX_CONTEXT_QE_TWO_PHASE_IMPLICIT_WRITER:
+	case DTX_CONTEXT_QE_AUTO_COMMIT_IMPLICIT:
+	case DTX_CONTEXT_QE_ENTRY_DB_SINGLETON:
+	case DTX_CONTEXT_QE_READER:
+		if (QEDtxContextInfo.distributedSnapshot.distribSnapshotId != 0)
+			return QEDtxContextInfo.distributedSnapshot.maxCount;
+		else
+			return max_prepared_xacts;		/* UNDONE: For now? */
+	
+	case DTX_CONTEXT_QE_PREPARED:
+		elog(FATAL, "Unexpected segment distribute transaction context: '%s'",
+			 DtxContextToString(distributedTransactionContext));
+		break;
+	
+	default:
+		elog(FATAL, "Unrecognized DTX transaction context: %d",
+			(int) distributedTransactionContext);
+		break;
+	}
+
+	return 0;
+}
+
 /*
+ * Fill in the array of in-progress distributed XIDS in 'snapshot' from the
+ * information that the QE sent us (if any).
+ */
+static void
+FillInDistributedSnapshot(Snapshot snapshot, DtxContext distributedTransactionContext)
+{
+	elogif(Debug_print_full_dtm, LOG,
+		   "FillInDistributedSnapshot DTX Context = '%s'",
+		   DtxContextToString(distributedTransactionContext));
+
+	switch (distributedTransactionContext)
+	{
+	case DTX_CONTEXT_LOCAL_ONLY:
+	case DTX_CONTEXT_QD_RETRY_PHASE_2:
+	case DTX_CONTEXT_QE_FINISH_PREPARED:
+		/*
+		 * No distributed snapshot.
+		 */
+		snapshot->haveDistribSnapshot = false;
+		snapshot->distribSnapshotWithLocalMapping.ds.count = 0;
+		break;
+
+	case DTX_CONTEXT_QD_DISTRIBUTED_CAPABLE:
+		/*
+		 * GetSnapshotData() should've acquired the distributed snapshot
+		 * while holding ProcArrayLock, not here.
+		 */
+		elog(ERROR, "FillInDistributedSnapshot called in context '%s'",
+			 DtxContextToString(distributedTransactionContext));
+		break;
+
+	case DTX_CONTEXT_QE_TWO_PHASE_EXPLICIT_WRITER:
+	case DTX_CONTEXT_QE_TWO_PHASE_IMPLICIT_WRITER:
+	case DTX_CONTEXT_QE_AUTO_COMMIT_IMPLICIT:
+	case DTX_CONTEXT_QE_ENTRY_DB_SINGLETON:
+	case DTX_CONTEXT_QE_READER:
+		/*
+		 * Copy distributed snapshot from the one sent by the QD.
+		 */
+		{
+			DistributedSnapshot *ds = &QEDtxContextInfo.distributedSnapshot;
+
+			if (ds->distribSnapshotId != 0)
+			{
+				snapshot->haveDistribSnapshot = true;
+
+				Assert(ds->xminAllDistributedSnapshots);
+				Assert(ds->xminAllDistributedSnapshots <= ds->xmin);
+
+				DistributedSnapshot_Copy(&snapshot->distribSnapshotWithLocalMapping.ds, ds);
+			}
+			else
+			{
+				snapshot->haveDistribSnapshot = false;
+				snapshot->distribSnapshotWithLocalMapping.ds.count = 0;
+			}
+		}
+		break;
+
+	case DTX_CONTEXT_QE_PREPARED:
+		elog(FATAL, "Unexpected segment distribute transaction context: '%s'",
+			 DtxContextToString(distributedTransactionContext));
+		break;
+
+	default:
+		elog(FATAL, "Unrecognized DTX transaction context: %d",
+			(int) distributedTransactionContext);
+		break;
+	}
+
+	/*
+	 * Nice that we may have collected it, but turn it off...
+	 */
+	if (Debug_disable_distributed_snapshot)
+		snapshot->haveDistribSnapshot = false;
+}
+
+/*
+ * QEDtxContextInfo and SharedLocalSnapshotSlot are both global.
+ */
+static bool
+QEwriterSnapshotUpToDate(void)
+{
+	Assert(!Gp_is_writer);
+
+	if (SharedLocalSnapshotSlot == NULL)
+		elog(ERROR, "SharedLocalSnapshotSlot is NULL");
+
+	LWLockAcquire(SharedLocalSnapshotSlot->slotLock, LW_SHARED);
+	bool result = QEDtxContextInfo.segmateSync == SharedLocalSnapshotSlot->segmateSync &&
+		SharedLocalSnapshotSlot->ready;
+	LWLockRelease(SharedLocalSnapshotSlot->slotLock);
+
+	return result;
+}
+
+void
+getAllDistributedXactStatus(TMGALLXACTSTATUS **allDistributedXactStatus)
+{
+	TMGALLXACTSTATUS *all;
+	int			count;
+	ProcArrayStruct *arrayP = procArray;
+
+	all = palloc(sizeof(TMGALLXACTSTATUS));
+	all->next = 0;
+	all->count = 0;
+	all->statusArray = NULL;
+
+	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+	count = arrayP->numProcs;
+	if (count > 0)
+	{
+		int			i;
+
+		all->statusArray =
+			palloc(MAXALIGN(count * sizeof(TMGXACTSTATUS)));
+		for (i = 0; i < count; i++)
+		{
+			/*
+			 * This function is only used by view gp_distributed_xacts. We do
+			 * not need to return a strictly correct gxact array. So no
+			 * 'volatile' is used for 'gxact'.
+			 */
+			TMGXACT *gxact = &allTmGxact[arrayP->pgprocnos[i]];
+
+			all->statusArray[i].gxid = gxact->gxid;
+			dtxFormGID(all->statusArray[i].gid, gxact->distribTimeStamp, gxact->gxid);
+			all->statusArray[i].state = 0; /* deprecate this field */
+			all->statusArray[i].sessionId = gxact->sessionId;
+			all->statusArray[i].xminDistributedSnapshot = gxact->xminDistributedSnapshot;
+		}
+
+		all->count = count;
+	}
+
+	LWLockRelease(ProcArrayLock);
+
+	*allDistributedXactStatus = all;
+}
+
+/*
+ * Get check point information
+ *
+ * Whether DTM started or not, we must always store DTM information in
+ * this checkpoint record.  A possible case to consider is we might have
+ * in-progress global transactions in shared memory after postmaster reset,
+ * and shutting down without performing DTM recovery.  The subsequent
+ * recovery after this shutdown will read this checkpoint, so we would
+ * lose the in-progress global transaction information if we didn't write it
+ * here.  Note we will certainly read this global transaction information
+ * even if this is a clean shutdown (i.e. not performing multi-pass recovery.)
+ */
+void
+getDtxCheckPointInfo(char **result, int *result_size)
+{
+	TMGXACT_CHECKPOINT *gxact_checkpoint;
+	TMGXACT_LOG *gxact_log_array;
+	int			i;
+	int			actual;
+	ProcArrayStruct *arrayP = procArray;
+
+	if (!IS_QUERY_DISPATCHER())
+	{
+		gxact_checkpoint = palloc(TMGXACT_CHECKPOINT_BYTES(0));
+		gxact_checkpoint->committedCount = 0;
+		*result = (char*) gxact_checkpoint;
+		*result_size = TMGXACT_CHECKPOINT_BYTES(0);
+		return;
+	}
+
+	gxact_checkpoint = palloc(TMGXACT_CHECKPOINT_BYTES(arrayP->numProcs + *shmNumCommittedGxacts));
+	gxact_log_array = &gxact_checkpoint->committedGxactArray[0];
+
+	actual = 0;
+	for (; actual < *shmNumCommittedGxacts; actual++)
+		gxact_log_array[actual] = shmCommittedGxactArray[actual];
+
+	/*
+	 * If a transaction inserted 'commit' record logically before the checkpoint
+	 * REDO pointer, and it hasn't inserted the 'forget' record. we will see 
+	 * needIncludedInCkpt is true. such transactions should be included
+	 * in the checkpoint record so that the second phase of 2PC can be executed
+	 * during crash recovery.
+	 *
+	 * NOTE: the REDO pointer is obtained much earlier in CreateCheckpoint().
+	 * It is possible to include transactions having their commit records
+	 * *after* the REDO pointer in checkpoint record.  Second phase of 2PC for
+	 * such transactions will be executed twice during crash recovery.
+	 * Although redundant, this is not a problem.
+	 */
+	LWLockAcquire(ProcArrayLock, LW_SHARED);
+
+	for (i = 0; i < arrayP->numProcs; i++)
+	{
+		TMGXACT_LOG *gxact_log;
+		TMGXACT *gxact = &allTmGxact[arrayP->pgprocnos[i]];
+
+		if (!gxact->includeInCkpt)
+			continue;
+
+		gxact_log = &gxact_log_array[actual];
+		dtxFormGID(gxact_log->gid, gxact->distribTimeStamp, gxact->gxid);
+		gxact_log->gxid = gxact->gxid;
+
+		elogif(Debug_print_full_dtm, LOG,
+			   "Add DTM checkpoint entry gid = %s.", gxact_log->gid);
+
+		actual++;
+	}
+
+	LWLockRelease(ProcArrayLock);
+
+	gxact_checkpoint->committedCount = actual;
+
+	*result = (char *) gxact_checkpoint;
+	*result_size = TMGXACT_CHECKPOINT_BYTES(actual);
+
+	elogif(Debug_print_full_dtm, LOG,
+		   "Filled in DTM checkpoint information (count = %d).", actual);
+}
+
+/*
+ * DistributedSnapshotMappedEntry_Compare: A compare function for
+ * DistributedTransactionId for use with qsort.
+ */
+static int
+DistributedSnapshotMappedEntry_Compare(const void *p1, const void *p2)
+{
+	const DistributedTransactionId distribXid1 = *(DistributedTransactionId *) p1;
+	const DistributedTransactionId distribXid2 = *(DistributedTransactionId *) p2;
+
+	if (distribXid1 == distribXid2)
+		return 0;
+	else if (distribXid1 > distribXid2)
+		return 1;
+	else
+		return -1;
+}
+
+/*
+ * create distributed snapshot based on current visible distributed transaction
+ */
+static bool
+CreateDistributedSnapshot(DistributedSnapshot *ds, DtxContext distributedTransactionContext)
+{
+	int			i;
+	int			count;
+	DistributedTransactionId xmin;
+	DistributedTransactionId xmax;
+	DistributedSnapshotId distribSnapshotId;
+	DistributedTransactionId globalXminDistributedSnapshots;
+	ProcArrayStruct *arrayP = procArray;
+
+	Assert(LWLockHeldByMe(ProcArrayLock));
+	if (*shmNumCommittedGxacts != 0)
+		elog(ERROR, "Create distributed snapshot before DTM recovery finish");
+
+	xmin = xmax = ShmemVariableCache->latestCompletedDxid + 1;
+
+	/*
+	 * initialize for calculation with xmax, the calculation for this is on
+	 * same lines as globalxmin for local snapshot.
+	 */
+	globalXminDistributedSnapshots = xmax;
+	count = 0;
+
+	Assert(ds->inProgressXidArray != NULL);
+
+	/*
+	 * Gather up current in-progress global transactions for the distributed
+	 * snapshot.
+	 */
+	for (i = 0; i < arrayP->numProcs; i++)
+	{
+		int         pgprocno = arrayP->pgprocnos[i];
+		volatile TMGXACT	*gxact_candidate = &allTmGxact[pgprocno];
+		DistributedTransactionId gxid;
+		DistributedTransactionId dxid;
+
+		/* Update globalXminDistributedSnapshots to be the smallest valid dxid */
+		dxid = gxact_candidate->xminDistributedSnapshot;
+		if (dxid != InvalidDistributedTransactionId && dxid < globalXminDistributedSnapshots)
+			globalXminDistributedSnapshots = dxid;
+
+		/* just fetch once */
+		gxid = gxact_candidate->gxid;
+		if (gxid == InvalidDistributedTransactionId)
+			continue;
+
+		/*
+		 * Include the current distributed transaction in the min/max
+		 * calculation.
+		 */
+		if (gxid < xmin)
+		{
+			xmin = gxid;
+		}
+		if (gxid > xmax)
+		{
+			xmax = gxid;
+		}
+
+		if (gxact_candidate == MyTmGxact)
+			continue;
+
+		if (count >= ds->maxCount)
+			elog(ERROR, "Too many distributed transactions for snapshot");
+
+		ds->inProgressXidArray[count++] = gxid;
+
+		elogif(Debug_print_full_dtm, LOG,
+			   "CreateDistributedSnapshot added inProgressDistributedXid = %u to snapshot",
+			   gxid);
+	}
+
+	distribSnapshotId = pg_atomic_add_fetch_u32((pg_atomic_uint32 *)shmNextSnapshotId, 1);
+
+	/*
+	 * Above globalXminDistributedSnapshots was calculated based on lowest
+	 * dxid in all snapshots but update it to also include actual process
+	 * dxids.
+	 */
+	if (xmin < globalXminDistributedSnapshots)
+		globalXminDistributedSnapshots = xmin;
+
+	/*
+	 * Copy the information we just captured under lock.
+	 */
+	ds->distribTransactionTimeStamp = *shmDistribTimeStamp;
+	ds->xminAllDistributedSnapshots = globalXminDistributedSnapshots;
+	ds->distribSnapshotId = distribSnapshotId;
+	ds->xmin = xmin;
+	ds->xmax = xmax;
+	ds->count = count;
+
+	if (MyTmGxact->xminDistributedSnapshot == InvalidDistributedTransactionId)
+		MyTmGxact->xminDistributedSnapshot = xmin;
+
+	elogif(Debug_print_full_dtm, LOG,
+		   "CreateDistributedSnapshot distributed snapshot has xmin = %u, count = %u, xmax = %u.",
+		   xmin, count, xmax);
+	elogif(Debug_print_snapshot_dtm, LOG,
+		   "[Distributed Snapshot #%u] *Create* (gxid = %u, '%s')",
+		   distribSnapshotId,
+		   MyTmGxact->gxid,
+		   DtxContextToString(distributedTransactionContext));
+
+	return true;
+}
+
+/*----------
  * GetMaxSnapshotXidCount -- get max size for snapshot XID array
  *
  * We have to export this for use by snapmgr.c.
@@ -1367,7 +1959,7 @@ GetMaxSnapshotSubxidCount(void)
  * not statically allocated (see xip allocation below).
  */
 Snapshot
-GetSnapshotData(Snapshot snapshot)
+GetSnapshotData(Snapshot snapshot, DtxContext distributedTransactionContext)
 {
 	ProcArrayStruct *arrayP = procArray;
 	TransactionId xmin;
@@ -1379,8 +1971,16 @@ GetSnapshotData(Snapshot snapshot)
 	bool		suboverflowed = false;
 	volatile TransactionId replication_slot_xmin = InvalidTransactionId;
 	volatile TransactionId replication_slot_catalog_xmin = InvalidTransactionId;
+	DistributedSnapshotWithLocalMapping *dslm = &snapshot->distribSnapshotWithLocalMapping;
+	DistributedSnapshot *ds = &snapshot->distribSnapshotWithLocalMapping.ds;
 
 	Assert(snapshot != NULL);
+
+	/*
+	 * Support for true serializable isolation is not yet implemented in
+	 * Greenplum.  See merge fixme in assign_XactIsoLevel().
+	 */
+	Assert(XactIsoLevel < XACT_SERIALIZABLE);
 
 	/*
 	 * Allocating space for maxProcs xids is usually overkill; numProcs would
@@ -1405,7 +2005,12 @@ GetSnapshotData(Snapshot snapshot)
 			ereport(ERROR,
 					(errcode(ERRCODE_OUT_OF_MEMORY),
 					 errmsg("out of memory")));
+
 		Assert(snapshot->subxip == NULL);
+	}
+
+	if (snapshot->subxip == NULL)
+	{
 		snapshot->subxip = (TransactionId *)
 			malloc(GetMaxSnapshotSubxidCount() * sizeof(TransactionId));
 		if (snapshot->subxip == NULL)
@@ -1413,6 +2018,257 @@ GetSnapshotData(Snapshot snapshot)
 					(errcode(ERRCODE_OUT_OF_MEMORY),
 					 errmsg("out of memory")));
 	}
+
+	/*
+	 * GP: Distributed snapshot.
+	 */
+	elogif(Debug_print_full_dtm, LOG,
+		   "GetSnapshotData maxCount %d, inProgressEntryArray %p",
+		   ds->maxCount,
+		   ds->inProgressXidArray);
+
+	if (ds->inProgressXidArray == NULL)
+	{
+		int maxCount = GetDistributedSnapshotMaxCount(distributedTransactionContext);
+		if (maxCount > 0)
+		{
+			ds->inProgressXidArray =
+				(DistributedTransactionId*)malloc(maxCount * sizeof(DistributedTransactionId));
+			if (ds->inProgressXidArray == NULL)
+				ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY), errmsg("out of memory")));
+
+			ds->maxCount = maxCount;
+
+			dslm->currentLocalXidsCount = 0;
+			dslm->minCachedLocalXid = InvalidTransactionId;
+			dslm->maxCachedLocalXid = InvalidTransactionId;
+
+			if (!IS_QUERY_DISPATCHER())
+			{
+				/*
+				 * Allocate memory for local xid cache, currently allocating it
+				 * same size as distributed, not necessary.
+				 */
+				dslm->inProgressMappedLocalXids =
+					(TransactionId*)malloc(maxCount * sizeof(TransactionId));
+				if (dslm->inProgressMappedLocalXids == NULL)
+					ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY), errmsg("out of memory")));
+
+				dslm->maxLocalXidsCount = maxCount;
+			}
+			else
+				dslm->maxLocalXidsCount = 0;
+		}
+	}
+
+	/*
+	 * MPP Addition. if we are in EXECUTE mode and not the writer... then we
+	 * want to just get the shared snapshot and make it our own.
+	 *
+	 * code for the writer is at the bottom of this function.
+	 *
+	 * NOTE: we could be dispatched and get here before the WRITER can set the
+	 * shared snapshot.  if this happens we'll have to wait around, hopefully
+	 * its never for a very long time.
+	 *
+	 */
+	if (distributedTransactionContext == DTX_CONTEXT_QE_READER ||
+		distributedTransactionContext == DTX_CONTEXT_QE_ENTRY_DB_SINGLETON)
+	{
+		/* the pg_usleep() call below is in units of us (microseconds), interconnect
+		 * timeout is in seconds.  Start with 1 millisecond. */
+		uint64		segmate_timeout_us;
+		uint64		sleep_per_check_us = 1 * 1000;
+		uint64	   	total_sleep_time_us = 0;
+		uint64		warning_sleep_time_us = 0;
+
+		segmate_timeout_us = (3 * (uint64)Max(interconnect_setup_timeout, 1) * 1000* 1000) / 4;
+
+		/*
+		 * Make a copy of the distributed snapshot information; this
+		 * doesn't use the shared-snapshot-slot stuff it is just
+		 * making copies from the QEDtxContextInfo structure sent by
+		 * the QD.
+		 */
+		FillInDistributedSnapshot(snapshot, distributedTransactionContext);
+
+		/*
+		 * If we're a cursor-reader, we get out snapshot from the
+		 * writer via a tempfile in the filesystem. Otherwise it is
+		 * too easy for the writer to race ahead of cursor readers.
+		 */
+		if (QEDtxContextInfo.cursorContext)
+		{
+			readSharedLocalSnapshot_forCursor(
+				snapshot,
+				distributedTransactionContext);
+
+			return snapshot;
+		}
+
+		elogif(Debug_print_snapshot_dtm, LOG,
+			   "[Distributed Snapshot #%u] *Start Reader Match* gxid = %u and currcid %d (%s)",
+			   QEDtxContextInfo.distributedSnapshot.distribSnapshotId,
+			   QEDtxContextInfo.distributedXid,
+			   QEDtxContextInfo.curcid,
+			   DtxContextToString(distributedTransactionContext));
+
+		/*
+		 * This is the second phase of the handshake we started in
+		 * StartTransaction().  Here we get a "good" snapshot from our
+		 * writer. In the process it is possible that we will change
+		 * our transaction's xid (see phase-one in StartTransaction()).
+		 *
+		 * Here we depend on the absolute correctness of our
+		 * writer-gang's info. We need the segmateSync to match *as
+		 * well* as the distributed-xid since the QD may send multiple
+		 * statements with the same distributed-xid/cid but
+		 * *different* local-xids (MPP-3228). The dispatcher will
+		 * distinguish such statements by the segmateSync.
+		 *
+		 * I believe that we still want the older sync mechanism ("ready" flag).
+		 * since it tells the code in TransactionIdIsCurrentTransactionId() that the
+		 * writer may be changing the local-xid (otherwise it would be possible for
+		 * cursor reader gangs to get confused).
+		 */
+		for (;;)
+		{
+			if (QEwriterSnapshotUpToDate())
+			{
+				LWLockAcquire(SharedLocalSnapshotSlot->slotLock, LW_SHARED);
+
+				/*
+				 * YAY we found it.  set the contents of the
+				 * SharedLocalSnapshot to this and move on.
+				 */
+				snapshot->xmin = SharedLocalSnapshotSlot->snapshot.xmin;
+				snapshot->xmax = SharedLocalSnapshotSlot->snapshot.xmax;
+				snapshot->xcnt = SharedLocalSnapshotSlot->snapshot.xcnt;
+
+				/* We now capture our current view of the xip/combocid arrays */
+				memcpy(snapshot->xip, SharedLocalSnapshotSlot->snapshot.xip, snapshot->xcnt * sizeof(TransactionId));
+				memset(snapshot->xip + snapshot->xcnt, 0, (arrayP->maxProcs - snapshot->xcnt) * sizeof(TransactionId));
+
+				snapshot->curcid = SharedLocalSnapshotSlot->snapshot.curcid;
+
+				snapshot->subxcnt = -1;
+
+				/* combocid */
+				if (usedComboCids != SharedLocalSnapshotSlot->combocidcnt)
+				{
+					if (usedComboCids == 0)
+					{
+						MemoryContext oldCtx =  MemoryContextSwitchTo(TopTransactionContext);
+						comboCids = palloc(SharedLocalSnapshotSlot->combocidcnt * sizeof(ComboCidKeyData));
+						MemoryContextSwitchTo(oldCtx);
+					}
+					else
+						comboCids = repalloc(comboCids, SharedLocalSnapshotSlot->combocidcnt * sizeof(ComboCidKeyData));
+				}
+				memcpy(comboCids, (char *)SharedLocalSnapshotSlot->combocids, SharedLocalSnapshotSlot->combocidcnt * sizeof(ComboCidKeyData));
+				usedComboCids = ((SharedLocalSnapshotSlot->combocidcnt < MaxComboCids) ? SharedLocalSnapshotSlot->combocidcnt : MaxComboCids);
+
+				uint32 segmateSync = SharedLocalSnapshotSlot->segmateSync;
+				uint32 comboCidCnt = SharedLocalSnapshotSlot->combocidcnt;
+
+				LWLockRelease(SharedLocalSnapshotSlot->slotLock);
+
+				elogif(Debug_print_snapshot_dtm, LOG,
+					   "Reader qExec usedComboCids: %d shared %d segmateSync %d",
+					   usedComboCids, comboCidCnt, segmateSync);
+
+				SetSharedTransactionId_reader(SharedLocalSnapshotSlot->xid,
+											  SharedLocalSnapshotSlot->snapshot.curcid,
+											  distributedTransactionContext);
+
+				elogif(Debug_print_snapshot_dtm, LOG,
+					   "Reader qExec setting shared local snapshot to: xmin: %d xmax: %d curcid: %d",
+					   snapshot->xmin, snapshot->xmax, snapshot->curcid);
+
+				elogif(Debug_print_snapshot_dtm, LOG,
+					   "GetSnapshotData(): READER currentcommandid %d curcid %d segmatesync %d",
+					   GetCurrentCommandId(false), snapshot->curcid, segmateSync);
+
+				if (TransactionIdPrecedes(snapshot->xmin, TransactionXmin))
+					TransactionXmin = snapshot->xmin;
+
+				return snapshot;
+			}
+			else
+			{
+				/*
+				 * didn't find it. we'll sleep for a small amount of time and
+				 * then try again.
+				 *
+				 * TODO: is there a semaphore or something better we can do here.
+				 */
+				pg_usleep(sleep_per_check_us);
+
+				CHECK_FOR_INTERRUPTS();
+
+				warning_sleep_time_us += sleep_per_check_us;
+				total_sleep_time_us += sleep_per_check_us;
+
+				LWLockAcquire(SharedLocalSnapshotSlot->slotLock, LW_SHARED);
+
+				if (total_sleep_time_us >= segmate_timeout_us)
+				{
+					LWLockRelease(SharedLocalSnapshotSlot->slotLock);
+					LWLockAcquire(SharedSnapshotLock, LW_SHARED); /* For SharedSnapshotDump() */
+					ereport(ERROR,
+							(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+							 errmsg("GetSnapshotData timed out waiting for Writer to set the shared snapshot."),
+							 errdetail("We are waiting for the shared snapshot to have XID: %d but the value "
+									   "is currently: %d."
+									   " waiting for cid to be %d. ready=%d."
+									   "DistributedTransactionContext = %s. "
+									   " Our slotindex is: %d \n"
+									   "Dump of all sharedsnapshots in shmem: %s",
+									   QEDtxContextInfo.distributedXid, SharedLocalSnapshotSlot->QDxid,
+									   QEDtxContextInfo.curcid,
+									   SharedLocalSnapshotSlot->ready,
+									   DtxContextToString(distributedTransactionContext),
+									   SharedLocalSnapshotSlot->slotindex, SharedSnapshotDump())));
+				}
+				else if (warning_sleep_time_us > 1000 * 1000)
+				{
+					/*
+					 * Every second issue warning.
+					 */
+					elogif(Debug_print_snapshot_dtm, LOG,
+						   "[Distributed Snapshot #%u] *No Match* gxid %u = %u and currcid %d (%s)",
+						   QEDtxContextInfo.distributedSnapshot.distribSnapshotId,
+						   QEDtxContextInfo.distributedXid,
+						   SharedLocalSnapshotSlot->QDxid,
+						   QEDtxContextInfo.curcid,
+						   DtxContextToString(distributedTransactionContext));
+
+
+					ereport(LOG,
+							(errmsg("GetSnapshotData did not find shared local snapshot information. "
+									"We are waiting for the shared snapshot to have XID: %d/%u but the value "
+									"is currently: %d/%u."
+									" waiting for cid to be %d. ready=%d."
+									" Our slotindex is: %d \n"
+									"DistributedTransactionContext = %s.",
+									QEDtxContextInfo.distributedXid, QEDtxContextInfo.segmateSync,
+									SharedLocalSnapshotSlot->QDxid, SharedLocalSnapshotSlot->segmateSync,
+									QEDtxContextInfo.curcid,
+									SharedLocalSnapshotSlot->ready,
+									SharedLocalSnapshotSlot->slotindex,
+									DtxContextToString(distributedTransactionContext))));
+					warning_sleep_time_us = 0;
+				}
+
+				LWLockRelease(SharedLocalSnapshotSlot->slotLock);
+				/* UNDONE: Back-off from checking every millisecond... */
+			}
+		}
+	}
+
+	/* We must not be a reader. */
+	Assert(distributedTransactionContext != DTX_CONTEXT_QE_READER);
+	Assert(distributedTransactionContext != DTX_CONTEXT_QE_ENTRY_DB_SINGLETON);
 
 	/*
 	 * It is sufficient to get shared lock on ProcArrayLock, even if we are
@@ -1427,6 +2283,60 @@ GetSnapshotData(Snapshot snapshot)
 
 	/* initialize xmin calculation with xmax */
 	globalxmin = xmin = xmax;
+
+	elogif(Debug_print_full_dtm, LOG,
+		   "GetSnapshotData setting globalxmin and xmin to %u", xmin);
+
+	/*
+	 * Get the distributed snapshot if needed and copy it into the field 
+	 * called distribSnapshotWithLocalMapping in the snapshot structure.
+	 *
+	 * For a distributed transaction:
+	 *   => The corrresponding distributed snapshot is made up of distributed
+	 *      xids from the DTM that are considered in-progress will be kept in
+	 *      the snapshot structure separately from any local in-progress xact.
+	 *
+	 *      The MVCC function XidInSnapshot is used to evaluate whether
+	 *      a tuple is visible through a snapshot. Only committed xids are
+	 *      given to XidInSnapshot for evaluation. XidInSnapshot will first
+	 *      determine if the committed tuple is for a distributed transaction.  
+	 *      If the xact is distributed it will be evaluated only against the
+	 *      distributed snapshot and not the local snapshot.
+	 *
+	 *      Otherwise, when the committed transaction being evaluated is local,
+	 *      then it will be evaluated only against the local portion of the
+	 *      snapshot.
+	 *
+	 * For a local transaction:
+	 *   => Only the local portion of the snapshot: xmin, xmax, xcnt,
+	 *      in-progress (xip), etc, will be filled in.
+	 *
+	 *      Note that in-progress distributed transactions that have reached
+	 *      this database instance and are active will be represented in the
+	 *      local in-progress (xip) array with the distributed transaction's
+	 *      local xid.
+	 *
+	 * In summary: This 2 snapshot scheme (optional distributed, required local)
+	 * handles late arriving distributed transactions properly since that work
+	 * is only evaluated against the distributed snapshot. And, the scheme
+	 * handles local transaction work seeing distributed work properly by
+	 * including distributed transactions in the local snapshot via their
+	 * local xids.
+	 */
+	if (distributedTransactionContext == DTX_CONTEXT_QD_DISTRIBUTED_CAPABLE)
+	{
+		snapshot->haveDistribSnapshot = CreateDistributedSnapshot(
+			ds,
+			distributedTransactionContext);
+
+		elogif(Debug_print_full_dtm, LOG,
+			   "Got distributed snapshot from DistributedSnapshotWithLocalXids_Create = %s",
+			   (snapshot->haveDistribSnapshot ? "true" : "false"));
+
+		/* Nice that we may have collected it, but turn it off... */
+		if (Debug_disable_distributed_snapshot)
+			snapshot->haveDistribSnapshot = false;
+	}
 
 	snapshot->takenDuringRecovery = RecoveryInProgress();
 
@@ -1454,9 +2364,11 @@ GetSnapshotData(Snapshot snapshot)
 			if (pgxact->vacuumFlags & PROC_IN_LOGICAL_DECODING)
 				continue;
 
+#if 0 /* Upstream code not applicable to GPDB, why explained in vacuumStatement_Relation */
 			/* Ignore procs running LAZY VACUUM */
 			if (pgxact->vacuumFlags & PROC_IN_VACUUM)
 				continue;
+#endif
 
 			/* Update globalxmin to be the smallest valid xmin */
 			xid = pgxact->xmin; /* fetch just once */
@@ -1569,7 +2481,19 @@ GetSnapshotData(Snapshot snapshot)
 	replication_slot_catalog_xmin = procArray->replication_slot_catalog_xmin;
 
 	if (!TransactionIdIsValid(MyPgXact->xmin))
+	{
+		/* Not that these values are not set atomically. However,
+		 * each of these assignments is itself assumed to be atomic. */
 		MyPgXact->xmin = TransactionXmin = xmin;
+	}
+	if (IsolationUsesXactSnapshot())
+	{
+		MyProc->serializableIsoLevel = true;
+
+		elogif(Debug_print_snapshot_dtm, LOG,
+			   "Got serializable snapshot: database %d, pid %d, xid %d, xmin %d",
+			   MyProc->databaseId, MyProc->pid, MyPgXact->xid, MyPgXact->xmin);
+	}
 
 	LWLockRelease(ProcArrayLock);
 
@@ -1580,6 +2504,36 @@ GetSnapshotData(Snapshot snapshot)
 	 */
 	if (TransactionIdPrecedes(xmin, globalxmin))
 		globalxmin = xmin;
+
+	if (!IS_QUERY_DISPATCHER())
+	{
+		/*
+		 * Fill in the distributed snapshot information we received from the
+		 * the QD.  Unless we are the QD, in which case we already created a
+		 * new distributed snapshot above.
+		 *
+		 * (We do this after releasing ProcArrayLock, to reduce contention.)
+		 */
+		FillInDistributedSnapshot(snapshot, distributedTransactionContext);
+
+		/*
+		 * In computing RecentGlobalXmin, also take distributed snapshots into
+		 * account.
+		 */
+		if (snapshot->haveDistribSnapshot)
+		{
+			globalxmin =
+				DistributedLog_AdvanceOldestXmin(globalxmin,
+												 ds->distribTransactionTimeStamp,
+												 ds->xminAllDistributedSnapshots);
+		}
+		else if (!gp_maintenance_mode)
+			globalxmin = DistributedLog_GetOldestXmin(globalxmin);
+	}
+
+	if (TransactionIdFollows(globalxmin, xmin))
+		elog(ERROR, "global xmin (%u) is higher than transaction xmin (%u)",
+			globalxmin, xmin);
 
 	/* Update global variables too */
 	RecentGlobalXmin = globalxmin - vacuum_defer_cleanup_age;
@@ -1620,6 +2574,38 @@ GetSnapshotData(Snapshot snapshot)
 	snapshot->regd_count = 0;
 	snapshot->copied = false;
 
+	/*
+	 * Sort the entry {distribXid} to support the QEs doing culls on their
+	 * DisribToLocalXact sorted lists.
+	 */
+	if (Gp_role == GP_ROLE_DISPATCH &&
+		snapshot->haveDistribSnapshot &&
+		ds->count > 1)
+		qsort(ds->inProgressXidArray, ds->count,
+			  sizeof(DistributedTransactionId), DistributedSnapshotMappedEntry_Compare);
+
+	/*
+	 * MPP Addition. If we are the chief then we'll save our local snapshot
+	 * into the shared snapshot. Note: we need to use the shared local
+	 * snapshot for the "Local Implicit using Distributed Snapshot" case, too.
+	 */
+	
+	if ((distributedTransactionContext == DTX_CONTEXT_QE_TWO_PHASE_EXPLICIT_WRITER ||
+		 distributedTransactionContext == DTX_CONTEXT_QE_TWO_PHASE_IMPLICIT_WRITER ||
+		 distributedTransactionContext == DTX_CONTEXT_QE_AUTO_COMMIT_IMPLICIT) &&
+		SharedLocalSnapshotSlot != NULL)
+	{
+		updateSharedLocalSnapshot(
+			&QEDtxContextInfo,
+			distributedTransactionContext,
+			snapshot,
+			"GetSnapshotData");
+	}
+
+	elogif(Debug_print_snapshot_dtm, LOG,
+		   "GetSnapshotData(): WRITER currentcommandid %d curcid %d segmatesync %d",
+		   GetCurrentCommandId(false), snapshot->curcid, QEDtxContextInfo.segmateSync);
+
 	return snapshot;
 }
 
@@ -1654,9 +2640,11 @@ ProcArrayInstallImportedXmin(TransactionId xmin, TransactionId sourcexid)
 		volatile PGXACT *pgxact = &allPgXact[pgprocno];
 		TransactionId xid;
 
+#if 0
 		/* Ignore procs running LAZY VACUUM */
 		if (pgxact->vacuumFlags & PROC_IN_VACUUM)
 			continue;
+#endif
 
 		xid = pgxact->xid;		/* fetch just once */
 		if (xid != sourcexid)
@@ -2132,6 +3120,60 @@ HaveVirtualXIDsDelayingChkpt(VirtualTransactionId *vxids, int nvxids)
 	LWLockRelease(ProcArrayLock);
 
 	return result;
+}
+
+/*
+ * MPP: Special code to update the command id in the SharedLocalSnapshot
+ * when we are in SERIALIZABLE isolation mode.
+ */
+void
+UpdateSerializableCommandId(CommandId curcid)
+{
+	if ((DistributedTransactionContext == DTX_CONTEXT_QE_TWO_PHASE_EXPLICIT_WRITER ||
+		 DistributedTransactionContext == DTX_CONTEXT_QE_TWO_PHASE_IMPLICIT_WRITER) &&
+		 SharedLocalSnapshotSlot != NULL &&
+		 FirstSnapshotSet)
+	{
+		int combocidSize;
+
+		LWLockAcquire(SharedLocalSnapshotSlot->slotLock, LW_EXCLUSIVE);
+
+		if (SharedLocalSnapshotSlot->QDxid != QEDtxContextInfo.distributedXid)
+		{
+			elogif(Debug_print_snapshot_dtm, LOG,
+				   "[Distributed Snapshot #%u] *Can't Update Serializable Command Id* QDxid = %u (gxid = %u, '%s')",
+				   QEDtxContextInfo.distributedSnapshot.distribSnapshotId,
+				   SharedLocalSnapshotSlot->QDxid,
+				   getDistributedTransactionId(),
+				   DtxContextToString(DistributedTransactionContext));
+			LWLockRelease(SharedLocalSnapshotSlot->slotLock);
+			return;
+		}
+
+		elogif(Debug_print_snapshot_dtm, LOG,
+			   "[Distributed Snapshot #%u] *Update Serializable Command Id* segment currcid = %d, TransactionSnapshot currcid = %d, Shared currcid = %d (gxid = %u, '%s')",
+			   QEDtxContextInfo.distributedSnapshot.distribSnapshotId,
+			   QEDtxContextInfo.curcid,
+			   curcid,
+			   SharedLocalSnapshotSlot->snapshot.curcid,
+			   getDistributedTransactionId(),
+			   DtxContextToString(DistributedTransactionContext));
+
+		elogif(Debug_print_snapshot_dtm, LOG,
+			   "serializable writer updating combocid: used combocids %d shared %d",
+			   usedComboCids, SharedLocalSnapshotSlot->combocidcnt);
+
+		combocidSize = ((usedComboCids < MaxComboCids) ? usedComboCids : MaxComboCids );
+
+		SharedLocalSnapshotSlot->combocidcnt = combocidSize;	
+		memcpy((void *)SharedLocalSnapshotSlot->combocids, comboCids,
+			   combocidSize * sizeof(ComboCidKeyData));
+
+		SharedLocalSnapshotSlot->snapshot.curcid = curcid;
+		SharedLocalSnapshotSlot->segmateSync = QEDtxContextInfo.segmateSync;
+
+		LWLockRelease(SharedLocalSnapshotSlot->slotLock);
+	}
 }
 
 /*
@@ -2845,6 +3887,37 @@ DisplayXidCache(void)
 }
 #endif   /* XIDCACHE_DEBUG */
 
+PGPROC *
+FindProcByGpSessionId(long gp_session_id)
+{
+	/* Find the guy who should manage our locks */
+	ProcArrayStruct *arrayP = procArray;
+	int			index;
+
+	Assert(gp_session_id > 0);
+		
+	LWLockAcquire(ProcArrayLock, LW_SHARED);
+
+	for (index = 0; index < arrayP->numProcs; index++)
+	{
+		PGPROC	   *proc = &allProcs[arrayP->pgprocnos[index]];
+			
+		if (proc->pid == MyProc->pid)
+			continue;
+				
+		if (!proc->mppIsWriter)
+			continue;
+				
+		if (proc->mppSessionId == gp_session_id)
+		{
+			LWLockRelease(ProcArrayLock);
+			return proc;
+		}
+	}
+		
+	LWLockRelease(ProcArrayLock);
+	return NULL;
+}
 
 /* ----------------------------------------------
  *		KnownAssignedTransactions sub-module
@@ -3687,6 +4760,126 @@ KnownAssignedXidsDisplay(int trace_level)
 	pfree(buf.data);
 }
 
+/* This function returns a list of all valid distributedTransaction Ids. */
+List *
+ListAllGxid(void)
+{
+	ProcArrayStruct *arrayP = procArray;
+	List		*gxids = NIL;
+	int			index;
+	DistributedTransactionId gxid;
+
+	LWLockAcquire(ProcArrayLock, LW_SHARED);
+
+	for (index = 0; index < arrayP->numProcs; index++)
+	{
+		volatile TMGXACT *gxact = &allTmGxact[arrayP->pgprocnos[index]];
+
+		gxid = gxact->gxid;
+		if (gxid == InvalidDistributedTransactionId)
+			continue;
+		gxids = lappend_int(gxids, gxid);
+	}
+
+	LWLockRelease(ProcArrayLock);
+
+	return gxids;
+}
+
+/*
+ * This function returns true if the gid is an ongoing dtx transaction.
+ */
+bool
+IsDtxInProgress(DistributedTransactionTimeStamp distribTimeStamp, DistributedTransactionId gxid)
+{
+	int i;
+	bool retval;
+	ProcArrayStruct *arrayP = procArray;
+
+	if (*shmDistribTimeStamp != distribTimeStamp)
+		return false;
+
+	retval = false;
+	LWLockAcquire(ProcArrayLock, LW_SHARED);
+
+	for (i = 0; i < arrayP->numProcs; i++)
+	{
+		volatile TMGXACT *gxact = &allTmGxact[arrayP->pgprocnos[i]];
+
+		if (gxact->gxid == gxid)
+		{
+			retval = true;
+			break;
+		}
+	}
+
+	LWLockRelease(ProcArrayLock);
+
+	return retval;
+}
+
+/*
+ * This function returns the corresponding process id given by a
+ * DistributedTransaction Id.
+ */
+int
+GetPidByGxid(DistributedTransactionId gxid)
+{
+	int i;
+	int pid = 0;
+	ProcArrayStruct *arrayP = procArray;
+
+	LWLockAcquire(ProcArrayLock, LW_SHARED);
+
+	for (i = 0; i < arrayP->numProcs; i++)
+	{
+		volatile PGPROC *proc = &allProcs[arrayP->pgprocnos[i]];
+		volatile TMGXACT *gxact = &allTmGxact[arrayP->pgprocnos[i]];
+		if (gxact->gxid == gxid)
+		{
+			pid = proc->pid;
+			break;
+		}
+	}
+
+	LWLockRelease(ProcArrayLock);
+
+	return pid;
+}
+
+DistributedTransactionId
+LocalXidGetDistributedXid(TransactionId xid)
+{
+	int index;
+	DistributedTransactionTimeStamp tstamp;
+	DistributedTransactionId gxid = InvalidDistributedTransactionId;
+	ProcArrayStruct *arrayP = procArray;
+
+	LWLockAcquire(ProcArrayLock, LW_SHARED);
+	for (index = 0; index < arrayP->numProcs; index++)
+	{
+		int		 pgprocno = arrayP->pgprocnos[index];
+		volatile PGXACT *pgxact = &allPgXact[pgprocno];
+		volatile TMGXACT *gxact = &allTmGxact[pgprocno];
+		if (xid == pgxact->xid)
+		{
+			gxid = gxact->gxid;
+			break;
+		}
+	}
+	LWLockRelease(ProcArrayLock);
+
+	/* The transaction has already committed on segment */
+	if (gxid == InvalidDistributedTransactionId)
+	{
+		DistributedLog_GetDistributedXid(xid, &tstamp, &gxid);
+		AssertImply(gxid != InvalidDistributedTransactionId,
+					tstamp == MyTmGxact->distribTimeStamp);
+	}
+
+	return gxid;
+}
+
 /*
  * KnownAssignedXidsReset
  *		Resets KnownAssignedXids to be empty
@@ -3703,5 +4896,65 @@ KnownAssignedXidsReset(void)
 	pArray->tailKnownAssignedXids = 0;
 	pArray->headKnownAssignedXids = 0;
 
+	LWLockRelease(ProcArrayLock);
+}
+
+int
+GetSessionIdByPid(int pid)
+{
+	int sessionId = -1;
+	ProcArrayStruct *arrayP = procArray;
+
+	LWLockAcquire(ProcArrayLock, LW_SHARED);
+	for (int i = 0; i < arrayP->numProcs; i++)
+	{
+		volatile PGPROC *proc = &allProcs[arrayP->pgprocnos[i]];
+		if (proc->pid == pid)
+		{
+			sessionId = proc->mppSessionId;
+			break;
+		}
+	}
+	LWLockRelease(ProcArrayLock);
+	return sessionId;
+}
+
+/*
+ * Set the destination group slot or group id in PGPROC, and send a signal to the proc.
+ * slot is NULL on QE.
+ */
+void
+ResGroupSignalMoveQuery(int sessionId, void *slot, Oid groupId)
+{
+	pid_t pid;
+	BackendId backendId;
+	ProcArrayStruct *arrayP = procArray;
+
+	LWLockAcquire(ProcArrayLock, LW_SHARED);
+	for (int i = 0; i < arrayP->numProcs; i++)
+	{
+		volatile PGPROC *proc = &allProcs[arrayP->pgprocnos[i]];
+		if (proc->mppSessionId != sessionId)
+			continue;
+
+		pid = proc->pid;
+		backendId = proc->backendId;
+		if (Gp_role == GP_ROLE_DISPATCH)
+		{
+			Assert(proc->movetoResSlot == NULL);
+			Assert(slot != NULL);
+			proc->movetoResSlot = slot;
+			SendProcSignal(pid, PROCSIG_RESOURCE_GROUP_MOVE_QUERY, backendId);
+			break;
+		}
+		else if (Gp_role == GP_ROLE_EXECUTE)
+		{
+			Assert(groupId != InvalidOid);
+			Assert(proc->movetoGroupId == InvalidOid);
+			proc->movetoGroupId = groupId;
+			SendProcSignal(pid, PROCSIG_RESOURCE_GROUP_MOVE_QUERY, backendId);
+			/* don't break, need to signal all the procs of this session */
+		}
+	}
 	LWLockRelease(ProcArrayLock);
 }

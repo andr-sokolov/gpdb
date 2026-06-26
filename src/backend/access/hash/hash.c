@@ -36,7 +36,7 @@ typedef struct
 } HashBuildState;
 
 static void hashbuildCallback(Relation index,
-				  HeapTuple htup,
+				  ItemPointer tupleId,
 				  Datum *values,
 				  bool *isnull,
 				  bool tupleIsAlive,
@@ -94,8 +94,8 @@ hashbuild(PG_FUNCTION_ARGS)
 	buildstate.indtuples = 0;
 
 	/* do the heap scan */
-	reltuples = IndexBuildHeapScan(heap, index, indexInfo, true,
-								   hashbuildCallback, (void *) &buildstate);
+	reltuples = IndexBuildScan(heap, index, indexInfo, true,
+							   hashbuildCallback, (void *) &buildstate);
 
 	if (buildstate.spool)
 	{
@@ -133,10 +133,10 @@ hashbuildempty(PG_FUNCTION_ARGS)
  */
 static void
 hashbuildCallback(Relation index,
-				  HeapTuple htup,
+				  ItemPointer tupleId,
 				  Datum *values,
 				  bool *isnull,
-				  bool tupleIsAlive,
+				  bool tupleIsAlive __attribute__((unused)),
 				  void *state)
 {
 	HashBuildState *buildstate = (HashBuildState *) state;
@@ -144,7 +144,7 @@ hashbuildCallback(Relation index,
 
 	/* form an index tuple and point it at the heap tuple */
 	itup = _hash_form_tuple(index, values, isnull);
-	itup->t_tid = htup->t_self;
+	itup->t_tid = *tupleId;
 
 	/* Hash indexes don't index nulls, see notes in hashinsert */
 	if (IndexTupleHasNulls(itup))
@@ -331,10 +331,18 @@ Datum
 hashgetbitmap(PG_FUNCTION_ARGS)
 {
 	IndexScanDesc scan = (IndexScanDesc) PG_GETARG_POINTER(0);
-	TIDBitmap  *tbm = (TIDBitmap *) PG_GETARG_POINTER(1);
+	Node	   *n = (Node *) PG_GETARG_POINTER(1);
+	TIDBitmap  *tbm;
 	HashScanOpaque so = (HashScanOpaque) scan->opaque;
 	bool		res;
 	int64		ntids = 0;
+
+	if (n == NULL)
+		tbm = tbm_create(work_mem * 1024L);
+	else if (!IsA(n, TIDBitmap))
+		elog(ERROR, "non hash bitmap");
+	else
+		tbm = (TIDBitmap *) n;
 
 	res = _hash_first(scan, ForwardScanDirection);
 
@@ -368,7 +376,7 @@ hashgetbitmap(PG_FUNCTION_ARGS)
 		res = _hash_next(scan, ForwardScanDirection);
 	}
 
-	PG_RETURN_INT64(ntids);
+	PG_RETURN_POINTER(tbm);
 }
 
 
@@ -530,6 +538,7 @@ hashbulkdelete(PG_FUNCTION_ARGS)
 	 * each bucket.
 	 */
 	metabuf = _hash_getbuf(rel, HASH_METAPAGE, HASH_READ, LH_META_PAGE);
+	_hash_checkpage(rel, metabuf, LH_META_PAGE);
 	metap = HashPageGetMeta(BufferGetPage(metabuf));
 	orig_maxbucket = metap->hashm_maxbucket;
 	orig_ntuples = metap->hashm_ntuples;
@@ -706,7 +715,7 @@ hashvacuumcleanup(PG_FUNCTION_ARGS)
 
 
 void
-hash_redo(XLogRecPtr lsn, XLogRecord *record)
+hash_redo(XLogRecPtr beginLoc __attribute__((unused)), XLogRecPtr lsn __attribute__((unused)), XLogRecord *record __attribute__((unused)))
 {
 	elog(PANIC, "hash_redo: unimplemented");
 }
