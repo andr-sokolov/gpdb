@@ -112,6 +112,12 @@ extern Oid	LookupNamespaceNoError(const char *nspname);
 extern Oid	LookupExplicitNamespace(const char *nspname, bool missing_ok);
 extern Oid	get_namespace_oid(const char *nspname, bool missing_ok);
 
+extern void DropTempTableNamespaceForResetSession(Oid namespaceOid);
+extern void SetTempNamespace(Oid namespaceOid, Oid toastNamespaceOid);
+extern Oid  ResetTempNamespace(void);
+extern bool TempNamespaceOidIsValid(void);  /* GPDB only:  used by cdbgang.c */
+extern void InitTempTableNamespace(void);
+
 extern Oid	LookupCreationNamespace(const char *nspname);
 extern void CheckSetNamespace(Oid oldNspOid, Oid nspOid, Oid classid,
 				  Oid objid);

@@ -78,6 +78,8 @@ extern StringInfo makeStringInfo(void);
  */
 extern void initStringInfo(StringInfo str);
 
+extern void initStringInfoOfSize(StringInfo str, int bufsize);
+
 /*------------------------
  * resetStringInfo
  * Clears the current content of the StringInfo, if any. The
@@ -146,12 +148,29 @@ extern void appendStringInfoSpaces(StringInfo str, int count);
  * if necessary.
  */
 extern void appendBinaryStringInfo(StringInfo str,
-					   const char *data, int datalen);
+					   const void *data, int datalen);
+
+/*------------------------
+ * appendStringInfoLiteral
+ * Wrap a string literal and send to appendBinaryStringInfo, sort of
+ * the way appendStringInfoString() would do, except without having
+ * to call strlen() on something for which we already know the length 
+ *
+ * NOTE: sizeof() returns full size, including NULL.
+ */
+#define appendStringInfoLiteral(str, lit) (appendBinaryStringInfo(str, (lit), sizeof((lit)) - 1))
 
 /*------------------------
  * enlargeStringInfo
  * Make sure a StringInfo's buffer can hold at least 'needed' more bytes.
  */
 extern void enlargeStringInfo(StringInfo str, int needed);
+
+/*------------------------
+ * replaceStringInfoString
+ * Replace all occurrences of a string in a StringInfo with a different string.
+ */
+
+extern void replaceStringInfoString(StringInfo str, char *replace, char *replacement);
 
 #endif   /* STRINGINFO_H */

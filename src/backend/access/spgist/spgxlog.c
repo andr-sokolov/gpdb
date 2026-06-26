@@ -1075,7 +1075,7 @@ spgRedoVacuumRedirect(XLogRecPtr lsn, XLogRecord *record)
 }
 
 void
-spg_redo(XLogRecPtr lsn, XLogRecord *record)
+spg_redo(XLogRecPtr beginLoc, XLogRecPtr lsn, XLogRecord *record)
 {
 	uint8		info = record->xl_info & ~XLR_INFO_MASK;
 	MemoryContext oldCxt;

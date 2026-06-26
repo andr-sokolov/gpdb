@@ -3,6 +3,8 @@
  * explain.c
  *	  Explain query execution plans
  *
+ * Portions Copyright (c) 2005-2010, Greenplum inc
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994-5, Regents of the University of California
  *
@@ -15,9 +17,12 @@
 
 #include "access/xact.h"
 #include "catalog/pg_type.h"
+#include "cdb/cdbpartition.h"
 #include "commands/createas.h"
 #include "commands/defrem.h"
 #include "commands/prepare.h"
+#include "commands/queue.h"
+#include "executor/execUtils.h"
 #include "executor/hashjoin.h"
 #include "foreign/fdwapi.h"
 #include "optimizer/clauses.h"
@@ -32,6 +37,9 @@
 #include "utils/snapmgr.h"
 #include "utils/tuplesort.h"
 #include "utils/xml.h"
+
+#include "cdb/cdbgang.h"
+#include "executor/execDynamicScan.h"
 
 
 /* Crude hack to avoid changing sizeof(ExplainState) in released branches */
@@ -55,6 +63,7 @@ static void ExplainOneQuery(Query *query, IntoClause *into, ExplainState *es,
 				const char *queryString, ParamListInfo params);
 static void report_triggers(ResultRelInfo *rInfo, bool show_relname,
 				ExplainState *es);
+
 static double elapsed_time(instr_time *starttime);
 static void ExplainPreScanNode(PlanState *planstate, Bitmapset **rels_used);
 static void ExplainPreScanMemberNodes(List *plans, PlanState **planstates,
@@ -83,12 +92,11 @@ static void show_merge_append_keys(MergeAppendState *mstate, List *ancestors,
 					   ExplainState *es);
 static void show_agg_keys(AggState *astate, List *ancestors,
 			  ExplainState *es);
-static void show_group_keys(GroupState *gstate, List *ancestors,
-				ExplainState *es);
 static void show_sort_group_keys(PlanState *planstate, const char *qlabel,
 					 int nkeys, AttrNumber *keycols,
 					 List *ancestors, ExplainState *es);
 static void show_sort_info(SortState *sortstate, ExplainState *es);
+static void show_windowagg_keys(WindowAggState *waggstate, List *ancestors, ExplainState *es);
 static void show_hash_info(HashState *hashstate, ExplainState *es);
 static void show_tidbitmap_info(BitmapHeapScanState *planstate,
 					ExplainState *es);
@@ -105,13 +113,12 @@ static void show_modifytable_info(ModifyTableState *mtstate, ExplainState *es);
 static void ExplainMemberNodes(List *plans, PlanState **planstates,
 				   List *ancestors, ExplainState *es);
 static void ExplainSubPlans(List *plans, List *ancestors,
-				const char *relationship, ExplainState *es);
+				const char *relationship, ExplainState *es, SliceTable *sliceTable);
 static void ExplainProperty(const char *qlabel, const char *value,
 				bool numeric, ExplainState *es);
-static void ExplainOpenGroup(const char *objtype, const char *labelname,
-				 bool labeled, ExplainState *es);
-static void ExplainCloseGroup(const char *objtype, const char *labelname,
-				  bool labeled, ExplainState *es);
+static void ExplainPropertyStringInfo(const char *qlabel, ExplainState *es,
+									  const char *fmt,...)
+									  __attribute__((format(PG_PRINTF_ATTRIBUTE, 3, 4)));
 static void ExplainDummyGroup(const char *objtype, const char *labelname,
 				  ExplainState *es);
 static void ExplainXMLTag(const char *tagname, int flags, ExplainState *es);
@@ -119,6 +126,8 @@ static void ExplainJSONLineEnding(ExplainState *es);
 static void ExplainYAMLLineStarting(ExplainState *es);
 static void escape_yaml(StringInfo buf, const char *str);
 
+/* Include the Greenplum EXPLAIN extensions */
+#include "explain_gp.c"
 
 
 /*
@@ -342,6 +351,13 @@ ExplainOneQuery(Query *query, IntoClause *into, ExplainState *es,
 		INSTR_TIME_SET_CURRENT(planduration);
 		INSTR_TIME_SUBTRACT(planduration, planstart);
 
+		/*
+		 * GPDB_92_MERGE_FIXME: it really should be an optimizer's responsibility
+		 * to correctly set the into-clause and into-policy of the PlannedStmt.
+		 */
+		if (into != NULL)
+			plan->intoClause = copyObject(into);
+
 		/* run it (if needed) and produce output */
 		ExplainOnePlan(plan, into, es, queryString, params, &planduration);
 	}
@@ -438,6 +454,9 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
 	if (es->buffers)
 		instrument_option |= INSTRUMENT_BUFFERS;
 
+	if (es->analyze)
+		instrument_option |= INSTRUMENT_CDB;
+
 	/*
 	 * We always collect timing for the entire statement, even when node-level
 	 * timing is off, so we don't look at es->timing here.  (We could skip
@@ -466,6 +485,16 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
 								GetActiveSnapshot(), InvalidSnapshot,
 								dest, params, instrument_option);
 
+    /* Allocate workarea for summary stats. */
+    if (es->analyze)
+    {
+        /* Attach workarea to QueryDesc so ExecSetParamPlan() can find it. */
+        queryDesc->showstatctx = cdbexplain_showExecStatsBegin(queryDesc,
+															   starttime);
+    }
+	else
+		queryDesc->showstatctx = NULL;
+
 	/* Select execution options */
 	if (es->analyze)
 		eflags = 0;				/* default run-to-completion flags */
@@ -473,6 +502,9 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
 		eflags = EXEC_FLAG_EXPLAIN_ONLY;
 	if (into)
 		eflags |= GetIntoRelEFlags(into);
+
+	queryDesc->plannedstmt->query_mem =
+		ResourceManagerGetQueryMemoryLimit(queryDesc->plannedstmt);
 
 	/* call ExecutorStart to prepare the plan for execution */
 	ExecutorStart(queryDesc, eflags);
@@ -490,6 +522,10 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
 
 		/* run the plan */
 		ExecutorRun(queryDesc, dir, 0L);
+
+		/* Wait for completion of all qExec processes. */
+		if (queryDesc->estate->dispatcherState && queryDesc->estate->dispatcherState->primaryResults)
+			cdbdisp_checkDispatchResult(queryDesc->estate->dispatcherState, DISPATCH_WAIT_NONE);
 
 		/* run cleanup too */
 		ExecutorFinish(queryDesc);
@@ -517,6 +553,33 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
 	/* Print info about runtime of triggers */
 	if (es->analyze)
 		ExplainPrintTriggers(es, queryDesc);
+
+	/*
+	 * Display per-slice and whole-query statistics.
+	 */
+	if (es->analyze)
+		cdbexplain_showExecStatsEnd(queryDesc->plannedstmt, queryDesc->showstatctx,
+									queryDesc->estate, es);
+
+	/*
+	 * Show non-default GUC settings that might have affected the plan as well
+	 * as optimizer settings etc.
+	 */
+	ExplainOpenGroup("Settings", "Settings", true, es);
+
+	ExplainProperty("Optimizer", "Postgres query optimizer", false, es);
+	/* We only list the non-default GUCs in verbose mode */
+	if (es->verbose)
+	{
+		List	*settings;
+
+		settings = gp_guc_list_show(PGC_S_DEFAULT, gp_guc_list_for_explain);
+
+		if (list_length(settings) > 0)
+			ExplainPropertyList("Settings", settings, es);
+	}
+
+	ExplainCloseGroup("Settings", "Settings", true, es);
 
 	/*
 	 * Close down the query and free resources.  Include time for this in the
@@ -562,11 +625,35 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
 void
 ExplainPrintPlan(ExplainState *es, QueryDesc *queryDesc)
 {
+	EState     *estate = queryDesc->estate;
 	Bitmapset  *rels_used = NULL;
 
 	Assert(queryDesc->plannedstmt != NULL);
 	es->pstmt = queryDesc->plannedstmt;
 	es->rtable = queryDesc->plannedstmt->rtable;
+	es->showstatctx = queryDesc->showstatctx;
+
+	/* CDB: Find slice table entry for the root slice. */
+	es->currentSlice = getCurrentSlice(estate, LocallyExecutingSliceIndex(estate));
+
+	/*
+	 * Get local stats if root slice was executed here in the qDisp, as long
+	 * as we haven't already gathered the statistics. This can happen when an
+	 * executor hook generates EXPLAIN output.
+	 */
+	if (es->analyze && !es->showstatctx->stats_gathered)
+	{
+		if (Gp_role != GP_ROLE_EXECUTE && (!es->currentSlice || sliceRunsOnQD(es->currentSlice)))
+			cdbexplain_localExecStats(queryDesc->planstate, es->showstatctx);
+
+        /* Fill in the plan's Instrumentation with stats from qExecs. */
+        if (estate->dispatcherState && estate->dispatcherState->primaryResults)
+            cdbexplain_recvExecStats(queryDesc->planstate,
+                                     estate->dispatcherState->primaryResults,
+                                     LocallyExecutingSliceIndex(estate),
+                                     es->showstatctx);
+	}
+
 	ExplainPreScanNode(queryDesc->planstate, &rels_used);
 	es->rtable_names = select_rtable_names_for_explain(es->rtable, rels_used);
 	es->deparse_cxt = deparse_context_for_plan_rtable(es->rtable,
@@ -593,6 +680,14 @@ ExplainPrintTriggers(ExplainState *es, QueryDesc *queryDesc)
 	List	   *targrels = queryDesc->estate->es_trig_target_relations;
 	int			nr;
 	ListCell   *l;
+
+	/*
+	 * GPDB_91_MERGE_FIXME: If the target is a partitioned table, we
+	 * should also report information on the triggers in the partitions.
+	 * I.e. we should scan the 'ri_partition_hash' of each
+	 * ResultRelInfo as well. This is somewhat academic, though, as long
+	 * as we don't support triggers in GPDB in general..
+	 */
 
 	ExplainOpenGroup("Triggers", "Triggers", false, es);
 
@@ -675,10 +770,10 @@ report_triggers(ResultRelInfo *rInfo, bool show_relname, ExplainState *es)
 			if (show_relname)
 				appendStringInfo(es->str, " on %s", relname);
 			if (es->timing)
-				appendStringInfo(es->str, ": time=%.3f calls=%.0f\n",
+				appendStringInfo(es->str, ": time=%.3f calls=%.ld\n",
 								 1000.0 * instr->total, instr->ntuples);
 			else
-				appendStringInfo(es->str, ": calls=%.0f\n", instr->ntuples);
+				appendStringInfo(es->str, ": calls=%.ld\n", instr->ntuples);
 		}
 		else
 		{
@@ -709,6 +804,142 @@ elapsed_time(instr_time *starttime)
 	return INSTR_TIME_GET_DOUBLE(endtime);
 }
 
+static void
+show_dispatch_info(Slice *slice, ExplainState *es, Plan *plan)
+{
+	int			segments;
+
+	/*
+	 * In non-parallel query, there is no slice information.
+	 */
+	if (!slice)
+		return;
+
+	switch (slice->gangType)
+	{
+		case GANGTYPE_UNALLOCATED:
+		case GANGTYPE_ENTRYDB_READER:
+			segments = 0;
+			break;
+
+		case GANGTYPE_PRIMARY_WRITER:
+		case GANGTYPE_PRIMARY_READER:
+		case GANGTYPE_SINGLETON_READER:
+		{
+			if (slice->directDispatch.isDirectDispatch)
+			{
+				segments = list_length(slice->directDispatch.contentIds);
+			}
+			else
+			{
+				/*
+				 * - for motion nodes we want to display the sender segments
+				 *   count, it can be fetched from lefttree;
+				 * - for non-motion nodes the segments count can be fetched
+				 *   from either lefttree or plan itself, they should be the
+				 *   same;
+				 * - there are also nodes like Hash that might have NULL
+				 *   plan->flow but non-NULL lefttree->flow, so we can use
+				 *   whichever that's available.
+				 */
+				Plan	   *fplan;
+
+				fplan = plan;
+
+				for (;;)
+				{
+					if (IsA(fplan, Motion))
+					{
+						Assert(fplan->lefttree);
+						fplan = fplan->lefttree;
+						continue;
+					}
+
+					if (fplan->flow)
+						break;
+
+					/* No flow on this node. Dig into child. */
+					if (fplan->lefttree)
+					{
+						fplan = fplan->lefttree;
+						continue;
+					}
+					if (IsA(fplan, Append))
+					{
+						Append	   *aplan = (Append *) fplan;
+
+						if (aplan->appendplans)
+						{
+							fplan = (Plan *) linitial(aplan->appendplans);
+							continue;
+						}
+					}
+
+					/*
+					 * No flow, and no subplan. Shouldn't happen, but let's not
+					 * panic if it does.
+					 *
+					 * This shouldn't happen, but just in case the planner
+					 * failed to decorate a node with a flow, don't panic
+					 * in production. Not all nodes need to be marked with a
+					 * flow, as long as the Motions, and the nodes immediately
+					 * below a Motion are, so this just leads to incorrect
+					 * information in EXPLAIN output. We'd still like to fix
+					 * such cases, though so Assert so that we catch them
+					 * during development.
+					 */
+					elog(WARNING, "could not find flow for node of type %d", fplan->type);
+					break;
+				}
+
+				if (!fplan->flow)
+				{
+					/* no flow and no subplan; shouldn't happen */
+					segments = 1;
+				}
+				else if (fplan->flow->flotype == FLOW_SINGLETON)
+					segments = 1;
+				else
+					segments = fplan->flow->numsegments;
+			}
+
+			break;
+		}
+
+		default:
+			segments = 0;		/* keep compiler happy */
+			Assert(false);
+			break;
+	}
+
+	if (es->format == EXPLAIN_FORMAT_TEXT)
+	{
+		if (segments == 0)
+			appendStringInfo(es->str, "  (slice%d)", slice->sliceIndex);
+		else if (slice->primaryGang && gp_log_gang >= GPVARS_VERBOSITY_DEBUG)
+			/*
+			 * In gpdb 5 there was a unique gang_id for each gang, this was
+			 * retired since gpdb 6, so we use the qe identifier from the first
+			 * segment of the gang to identify each gang.
+			 */
+			appendStringInfo(es->str, "  (slice%d; gang%d; segments: %d)",
+							 slice->sliceIndex,
+							 slice->primaryGang->db_descriptors[0]->identifier,
+							 segments);
+		else
+			appendStringInfo(es->str, "  (slice%d; segments: %d)",
+							 slice->sliceIndex, segments);
+	}
+	else
+	{
+		ExplainPropertyInteger("Slice", slice->sliceIndex, es);
+		if (slice->primaryGang && gp_log_gang >= GPVARS_VERBOSITY_DEBUG)
+			ExplainPropertyInteger("Gang", slice->primaryGang->db_descriptors[0]->identifier, es);
+		ExplainPropertyInteger("Segments", segments, es);
+		ExplainPropertyText("Gang Type", gangTypeToString(slice->gangType), es);
+	}
+}
+
 /*
  * ExplainPreScanNode -
  *	  Prescan the planstate tree to identify which RTEs are referenced
@@ -726,9 +957,13 @@ ExplainPreScanNode(PlanState *planstate, Bitmapset **rels_used)
 	switch (nodeTag(plan))
 	{
 		case T_SeqScan:
+		case T_DynamicSeqScan:
+		case T_DynamicIndexScan:
+		case T_ShareInputScan:
 		case T_IndexScan:
 		case T_IndexOnlyScan:
 		case T_BitmapHeapScan:
+		case T_DynamicBitmapHeapScan:
 		case T_TidScan:
 		case T_SubqueryScan:
 		case T_FunctionScan:
@@ -776,6 +1011,11 @@ ExplainPreScanNode(PlanState *planstate, Bitmapset **rels_used)
 		case T_MergeAppend:
 			ExplainPreScanMemberNodes(((MergeAppend *) plan)->mergeplans,
 								((MergeAppendState *) planstate)->mergeplans,
+									  rels_used);
+			break;
+		case T_Sequence:
+			ExplainPreScanMemberNodes(((Sequence *) plan)->subplans,
+									((SequenceState *) planstate)->subplans,
 									  rels_used);
 			break;
 		case T_BitmapAnd:
@@ -854,6 +1094,11 @@ ExplainPreScanSubPlans(List *plans, Bitmapset **rels_used)
  * want it to change at plan-node boundaries.  In non-text formats, es->indent
  * corresponds to the nesting depth of logical output groups, and therefore
  * is controlled by ExplainOpenGroup/ExplainCloseGroup.
+ *
+ * es->parentPlanState points to the parent planstate node and can be used by
+ * PartitionSelector to deparse its printablePredicate. (This is passed in
+ * ExplainState rather than as a normal argument, to avoid changing the
+ * function signature from upstream.)
  */
 static void
 ExplainNode(PlanState *planstate, List *ancestors,
@@ -861,12 +1106,85 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			ExplainState *es)
 {
 	Plan	   *plan = planstate->plan;
+	PlanState  *parentplanstate;
+    Slice      *save_currentSlice = es->currentSlice;    /* save */
 	const char *pname;			/* node type name for text output */
 	const char *sname;			/* node type name for non-text output */
 	const char *strategy = NULL;
 	const char *operation = NULL;
 	int			save_indent = es->indent;
 	bool		haschildren;
+	bool		skip_outer=false;
+	char       *skip_outer_msg = NULL;
+	int			motion_recv;
+	int			motion_snd;
+	float		scaleFactor = 1.0; /* we will divide planner estimates by this factor to produce
+									  per-segment estimates */
+	Slice		*parentSlice = NULL;
+
+	/* Remember who called us. */
+	parentplanstate = es->parentPlanState;
+	es->parentPlanState = planstate;
+
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		/*
+		 * Estimates will have to be scaled down to be per-segment (except in a
+		 * few cases).
+		 */
+		if ((plan->directDispatch).isDirectDispatch)
+		{
+			scaleFactor = 1.0;
+		}
+		else if (plan->flow != NULL && CdbPathLocus_IsBottleneck(*(plan->flow)))
+		{
+			/*
+			 * Data is unified in one place (singleQE or QD), or executed on a
+			 * single segment.  We scale up estimates to make it global.  We
+			 * will later amend this for Motion nodes.
+			 */
+			scaleFactor = 1.0;
+		}
+		else if (plan->flow != NULL && CdbPathLocus_IsSegmentGeneral(*(plan->flow)))
+		{
+			/* Replicated table has full data on every segment */
+			scaleFactor = 1.0;
+		}
+		else if (plan->flow != NULL)
+		{
+			/*
+			 * The plan node is executed on multiple nodes, so scale down the
+			 * number of rows seen by each segment
+			 */
+			scaleFactor = CdbPathLocus_NumSegments(*(plan->flow));
+		}
+		else
+		{
+			/*
+			 * The plan node is executed on multiple nodes, so scale down the
+			 * number of rows seen by each segment
+			 */
+			scaleFactor = getgpsegmentCount();
+		}
+	}
+
+	/*
+	 * If this is a Motion node, we're descending into a new slice.
+	 */
+	if (IsA(plan, Motion))
+	{
+		Motion	   *pMotion = (Motion *) plan;
+		SliceTable *sliceTable = planstate->state->es_sliceTable;
+
+		if (sliceTable)
+		{
+			es->currentSlice = (Slice *) list_nth(sliceTable->slices,
+												  pMotion->motionID);
+			parentSlice = es->currentSlice->parentIndex == -1 ? NULL :
+						  (Slice *) list_nth(sliceTable->slices,
+											 es->currentSlice->parentIndex);
+		}
+	}
 
 	switch (nodeTag(plan))
 	{
@@ -891,6 +1209,9 @@ ExplainNode(PlanState *planstate, List *ancestors,
 					break;
 			}
 			break;
+		case T_Repeat:
+			pname = sname = "Repeat";
+			break;
 		case T_Append:
 			pname = sname = "Append";
 			break;
@@ -900,6 +1221,9 @@ ExplainNode(PlanState *planstate, List *ancestors,
 		case T_RecursiveUnion:
 			pname = sname = "Recursive Union";
 			break;
+		case T_Sequence:
+			pname = sname = "Sequence";
+			break;
 		case T_BitmapAnd:
 			pname = sname = "BitmapAnd";
 			break;
@@ -908,6 +1232,11 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			break;
 		case T_NestLoop:
 			pname = sname = "Nested Loop";
+			if (((NestLoop *)plan)->shared_outer)
+			{
+				skip_outer = true;
+				skip_outer_msg = "See first subplan of Hash Join";
+			}
 			break;
 		case T_MergeJoin:
 			pname = "Merge";	/* "Join" gets added by jointype switch */
@@ -920,8 +1249,14 @@ ExplainNode(PlanState *planstate, List *ancestors,
 		case T_SeqScan:
 			pname = sname = "Seq Scan";
 			break;
+		case T_DynamicSeqScan:
+			pname = sname = "Dynamic Seq Scan";
+			break;
 		case T_IndexScan:
 			pname = sname = "Index Scan";
+			break;
+		case T_DynamicIndexScan:
+			pname = sname = "Dynamic Index Scan";
 			break;
 		case T_IndexOnlyScan:
 			pname = sname = "Index Only Scan";
@@ -929,8 +1264,19 @@ ExplainNode(PlanState *planstate, List *ancestors,
 		case T_BitmapIndexScan:
 			pname = sname = "Bitmap Index Scan";
 			break;
+		case T_DynamicBitmapIndexScan:
+			pname = sname = "Dynamic Bitmap Index Scan";
+			break;
 		case T_BitmapHeapScan:
+			/*
+			 * We print "Bitmap Heap Scan", even for AO tables. It's a bit
+			 * confusing, but that's what the plan node is called, regardless
+			 * of the table type.
+			 */
 			pname = sname = "Bitmap Heap Scan";
+			break;
+		case T_DynamicBitmapHeapScan:
+			pname = sname = "Dynamic Bitmap Heap Scan";
 			break;
 		case T_TidScan:
 			pname = sname = "Tid Scan";
@@ -952,15 +1298,15 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			break;
 		case T_ForeignScan:
 			pname = sname = "Foreign Scan";
+		break;
+		case T_ShareInputScan:
+			pname = sname = "Shared Scan";
 			break;
 		case T_Material:
 			pname = sname = "Materialize";
 			break;
 		case T_Sort:
 			pname = sname = "Sort";
-			break;
-		case T_Group:
-			pname = sname = "Group";
 			break;
 		case T_Agg:
 			sname = "Aggregate";
@@ -986,6 +1332,9 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			break;
 		case T_WindowAgg:
 			pname = sname = "WindowAgg";
+			break;
+		case T_TableFunctionScan:
+			pname = sname = "Table Function Scan";
 			break;
 		case T_Unique:
 			pname = sname = "Unique";
@@ -1017,6 +1366,98 @@ ExplainNode(PlanState *planstate, List *ancestors,
 		case T_Hash:
 			pname = sname = "Hash";
 			break;
+		case T_Motion:
+			{
+				Motion		*pMotion = (Motion *) plan;
+
+				Assert(plan->lefttree);
+				Assert(plan->lefttree->flow);
+
+				motion_snd = es->currentSlice->gangSize;
+				motion_recv = (parentSlice == NULL ? 1 : parentSlice->gangSize);
+
+				/* scale the number of rows by the number of segments sending data */
+				scaleFactor = motion_snd;
+
+				switch (pMotion->motionType)
+				{
+					case MOTIONTYPE_HASH:
+						sname = "Redistribute Motion";
+						break;
+					case MOTIONTYPE_FIXED:
+						if (pMotion->isBroadcast)
+						{
+							sname = "Broadcast Motion";
+						}
+						else if (plan->lefttree->flow->locustype == CdbLocusType_Replicated)
+						{
+							sname = "Explicit Gather Motion";
+							scaleFactor = 1;
+							motion_recv = 1;
+						}
+						else
+						{
+							sname = "Gather Motion";
+							scaleFactor = 1;
+							motion_recv = 1;
+						}
+						break;
+					case MOTIONTYPE_EXPLICIT:
+						sname = "Explicit Redistribute Motion";
+						motion_recv = getgpsegmentCount();
+						break;
+					default:
+						sname = "???";
+						break;
+				}
+
+				{
+					Slice	   *slice = es->currentSlice;
+
+					if (slice->directDispatch.isDirectDispatch)
+					{
+						/* Special handling on direct dispatch */
+						motion_snd = list_length(slice->directDispatch.contentIds);
+					}
+					else if (plan->lefttree->flow->flotype == FLOW_SINGLETON)
+					{
+						/* For SINGLETON we always display sender size as 1 */
+						motion_snd = 1;
+					}
+					else
+					{
+						/* Otherwise find out sender size from outer plan */
+						motion_snd = plan->lefttree->flow->numsegments;
+					}
+
+					if (pMotion->motionType == MOTIONTYPE_FIXED &&
+						!pMotion->isBroadcast)
+					{
+						/* In Gather Motion always display receiver size as 1 */
+						motion_recv = 1;
+					}
+					else
+					{
+						/* Otherwise find out receiver size from plan */
+						motion_recv = plan->flow->numsegments;
+					}
+				}
+
+				pname = psprintf("%s %d:%d", sname, motion_snd, motion_recv);
+			}
+			break;
+		case T_SplitUpdate:
+			pname = sname = "Split";
+			break;
+		case T_AssertOp:
+			pname = sname = "Assert";
+			break;
+		case T_PartitionSelector:
+			pname = sname = "Partition Selector";
+			break;
+		case T_RowTrigger:
+			pname = sname = "RowTrigger";
+ 			break;
 		default:
 			pname = sname = "???";
 			break;
@@ -1031,7 +1472,17 @@ ExplainNode(PlanState *planstate, List *ancestors,
 		if (plan_name)
 		{
 			appendStringInfoSpaces(es->str, es->indent * 2);
-			appendStringInfo(es->str, "%s\n", plan_name);
+			appendStringInfo(es->str, "%s", plan_name);
+
+			/*
+			 * Show slice information after the plan name.
+			 *
+			 * Note: If the top node was a Motion node, we print the slice
+			 * *above* the Motion here. We will print the slice below the
+			 * Motion, below.
+			 */
+			show_dispatch_info(save_currentSlice, es, plan);
+			appendStringInfoChar(es->str, '\n');
 			es->indent++;
 		}
 		if (es->indent)
@@ -1041,11 +1492,26 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			es->indent += 2;
 		}
 		appendStringInfoString(es->str, pname);
+
+		/*
+		 * Print information about the current slice. In order to not make
+		 * the output too verbose, only print it at the slice boundaries,
+		 * ie. at Motion nodes. (We already switched the "current slice"
+		 * to the slice below the Motion.)
+		 */
+		if (IsA(plan, Motion))
+			show_dispatch_info(es->currentSlice, es, plan);
+
 		es->indent++;
 	}
 	else
 	{
 		ExplainPropertyText("Node Type", sname, es);
+		if (nodeTag(plan) == T_Motion)
+		{
+			ExplainPropertyInteger("Senders", motion_snd, es);
+			ExplainPropertyInteger("Receivers", motion_recv, es);
+		}
 		if (strategy)
 			ExplainPropertyText("Strategy", strategy, es);
 		if (operation)
@@ -1054,15 +1520,21 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			ExplainPropertyText("Parent Relationship", relationship, es);
 		if (plan_name)
 			ExplainPropertyText("Subplan Name", plan_name, es);
+
+		show_dispatch_info(es->currentSlice, es, plan);
 	}
 
 	switch (nodeTag(plan))
 	{
 		case T_SeqScan:
+		case T_DynamicSeqScan:
+		case T_DynamicIndexScan:
 		case T_BitmapHeapScan:
+		case T_DynamicBitmapHeapScan:
 		case T_TidScan:
 		case T_SubqueryScan:
 		case T_FunctionScan:
+		case T_TableFunctionScan:
 		case T_ValuesScan:
 		case T_CteScan:
 		case T_WorkTableScan:
@@ -1101,6 +1573,26 @@ ExplainNode(PlanState *planstate, List *ancestors,
 					ExplainPropertyText("Index Name", indexname, es);
 			}
 			break;
+		case T_DynamicBitmapIndexScan:
+			{
+				BitmapIndexScan *bitmapindexscan = (BitmapIndexScan *) plan;
+				Oid indexoid = bitmapindexscan->indexid;
+				Oid parentOid = rel_partition_get_root(indexoid);
+				while (parentOid != InvalidOid)
+				{
+					indexoid = parentOid;
+					parentOid = rel_partition_get_root(indexoid);
+				}
+
+				const char *indexname =
+				explain_get_index_name(indexoid);
+
+				if (es->format == EXPLAIN_FORMAT_TEXT)
+					appendStringInfo(es->str, " on %s", indexname);
+				else
+					ExplainPropertyText("Index Name", indexname, es);
+			}
+			break;
 		case T_ModifyTable:
 			ExplainModifyTarget((ModifyTable *) plan, es);
 			break;
@@ -1129,6 +1621,9 @@ ExplainNode(PlanState *planstate, List *ancestors,
 						break;
 					case JOIN_ANTI:
 						jointype = "Anti";
+						break;
+					case JOIN_LASJ_NOTIN:
+						jointype = "Left Anti Semi (Not-In)";
 						break;
 					default:
 						jointype = "???";
@@ -1177,9 +1672,51 @@ ExplainNode(PlanState *planstate, List *ancestors,
 					ExplainPropertyText("Command", setopcmd, es);
 			}
 			break;
+		case T_ShareInputScan:
+			{
+				ShareInputScan *sisc = (ShareInputScan *) plan;
+				int				slice_id = -1;
+
+				if (es->currentSlice)
+					slice_id = es->currentSlice->sliceIndex;
+
+				if (es->format == EXPLAIN_FORMAT_TEXT)
+					appendStringInfo(es->str, " (share slice:id %d:%d)",
+									 slice_id, sisc->share_id);
+				else
+				{
+					ExplainPropertyInteger("Share ID", sisc->share_id, es);
+					ExplainPropertyInteger("Slice ID", slice_id, es);
+				}
+			}
+			break;
+		case T_PartitionSelector:
+			{
+				PartitionSelector  *ps = (PartitionSelector *)plan;
+				char			   *relname = get_rel_name(ps->relid);
+
+				if (es->format == EXPLAIN_FORMAT_TEXT)
+				{
+					if (ps->scanId != 0)
+						appendStringInfo(es->str, " for %s (dynamic scan id: %d)",
+										 quote_identifier(relname),
+										 ps->scanId);
+					else
+						appendStringInfo(es->str, " for %s", quote_identifier(relname));
+				}
+				else
+				{
+					ExplainPropertyText("Relation", relname, es);
+					if (ps->scanId != 0)
+						ExplainPropertyInteger("Dynamic Scan Id", ps->scanId, es);
+				}
+			}
+			break;
 		default:
 			break;
 	}
+
+	Assert(scaleFactor > 0.0);
 
 	if (es->costs)
 	{
@@ -1187,7 +1724,7 @@ ExplainNode(PlanState *planstate, List *ancestors,
 		{
 			appendStringInfo(es->str, "  (cost=%.2f..%.2f rows=%.0f width=%d)",
 							 plan->startup_cost, plan->total_cost,
-							 plan->plan_rows, plan->plan_width);
+							 ceil(plan->plan_rows / scaleFactor), plan->plan_width);
 		}
 		else
 		{
@@ -1198,6 +1735,10 @@ ExplainNode(PlanState *planstate, List *ancestors,
 		}
 	}
 
+	if (ResManagerPrintOperatorMemoryLimits())
+	{
+		ExplainPropertyInteger("operatorMem", PlanStateOperatorMemKB(planstate), es);
+	}
 	/*
 	 * We have to forcibly clean up the instrumentation state because we
 	 * haven't done ExecutorEnd yet.  This is pretty grotty ...
@@ -1211,10 +1752,12 @@ ExplainNode(PlanState *planstate, List *ancestors,
 	if (planstate->instrument)
 		InstrEndLoop(planstate->instrument);
 
+	/* GPDB_90_MERGE_FIXME: In GPDB, these are printed differently. But does that work
+	 * with the new XML/YAML EXPLAIN output */
 	if (es->analyze &&
 		planstate->instrument && planstate->instrument->nloops > 0)
 	{
-		double		nloops = planstate->instrument->nloops;
+ 		double		nloops = planstate->instrument->nloops;
 		double		startup_sec = 1000.0 * planstate->instrument->startup / nloops;
 		double		total_sec = 1000.0 * planstate->instrument->total / nloops;
 		double		rows = planstate->instrument->ntuples / nloops;
@@ -1269,6 +1812,7 @@ ExplainNode(PlanState *planstate, List *ancestors,
 	switch (nodeTag(plan))
 	{
 		case T_IndexScan:
+		case T_DynamicIndexScan:
 			show_scan_qual(((IndexScan *) plan)->indexqualorig,
 						   "Index Cond", planstate, ancestors, es);
 			if (((IndexScan *) plan)->indexqualorig)
@@ -1298,13 +1842,21 @@ ExplainNode(PlanState *planstate, List *ancestors,
 				   ((IndexOnlyScanState *) planstate)->ioss_HeapFetches, es);
 			break;
 		case T_BitmapIndexScan:
+		case T_DynamicBitmapIndexScan:
 			show_scan_qual(((BitmapIndexScan *) plan)->indexqualorig,
 						   "Index Cond", planstate, ancestors, es);
 			break;
 		case T_BitmapHeapScan:
-			show_scan_qual(((BitmapHeapScan *) plan)->bitmapqualorig,
+		case T_DynamicBitmapHeapScan:
+		{
+			List		*bitmapqualorig;
+
+			bitmapqualorig = ((BitmapHeapScan *) plan)->bitmapqualorig;
+
+			show_scan_qual(bitmapqualorig,
 						   "Recheck Cond", planstate, ancestors, es);
-			if (((BitmapHeapScan *) plan)->bitmapqualorig)
+
+			if (bitmapqualorig)
 				show_instrumentation_count("Rows Removed by Index Recheck", 2,
 										   planstate, es);
 			show_scan_qual(plan->qual, "Filter", planstate, ancestors, es);
@@ -1314,7 +1866,9 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			if (es->analyze)
 				show_tidbitmap_info((BitmapHeapScanState *) planstate, es);
 			break;
+		}
 		case T_SeqScan:
+		case T_DynamicSeqScan:
 		case T_ValuesScan:
 		case T_CteScan:
 		case T_WorkTableScan:
@@ -1395,7 +1949,17 @@ ExplainNode(PlanState *planstate, List *ancestors,
 										   planstate, es);
 			break;
 		case T_HashJoin:
-			show_upper_qual(((HashJoin *) plan)->hashclauses,
+		{
+			HashJoin *hash_join = (HashJoin *) plan;
+			/*
+			 * In the case of an "IS NOT DISTINCT" condition, we display
+			 * hashqualclauses instead of hashclauses.
+			 */
+			List *cond_to_show = hash_join->hashclauses;
+			if (list_length(hash_join->hashqualclauses) > 0)
+				cond_to_show = hash_join->hashqualclauses;
+
+			show_upper_qual(cond_to_show,
 							"Hash Cond", planstate, ancestors, es);
 			show_upper_qual(((HashJoin *) plan)->join.joinqual,
 							"Join Filter", planstate, ancestors, es);
@@ -1407,6 +1971,7 @@ ExplainNode(PlanState *planstate, List *ancestors,
 				show_instrumentation_count("Rows Removed by Filter", 2,
 										   planstate, es);
 			break;
+		}
 		case T_Agg:
 			show_agg_keys((AggState *) planstate, ancestors, es);
 			show_upper_qual(plan->qual, "Filter", planstate, ancestors, es);
@@ -1414,12 +1979,29 @@ ExplainNode(PlanState *planstate, List *ancestors,
 				show_instrumentation_count("Rows Removed by Filter", 1,
 										   planstate, es);
 			break;
+#if 0 /* Group node has been disabled in GPDB */
 		case T_Group:
 			show_group_keys((GroupState *) planstate, ancestors, es);
 			show_upper_qual(plan->qual, "Filter", planstate, ancestors, es);
 			if (plan->qual)
 				show_instrumentation_count("Rows Removed by Filter", 1,
 										   planstate, es);
+			break;
+#endif
+		case T_WindowAgg:
+			show_windowagg_keys((WindowAggState *) planstate, ancestors, es);
+			break;
+		case T_TableFunctionScan:
+			show_scan_qual(plan->qual, "Filter", planstate, ancestors, es);
+			/* TODO: Partitioning and ordering information */
+			break;
+		case T_Unique:
+			show_motion_keys(planstate,
+                             NIL,
+						     ((Unique *) plan)->numCols,
+						     ((Unique *) plan)->uniqColIdx,
+						     "Group Key",
+						     ancestors, es);
 			break;
 		case T_Sort:
 			show_sort_keys((SortState *) planstate, ancestors, es);
@@ -1443,9 +2025,36 @@ ExplainNode(PlanState *planstate, List *ancestors,
 		case T_Hash:
 			show_hash_info((HashState *) planstate, es);
 			break;
+		case T_Repeat:
+			show_upper_qual(plan->qual, "Filter", planstate, ancestors, es);
+			break;
+		case T_Motion:
+			{
+				Motion	   *pMotion = (Motion *) plan;
+
+				if (pMotion->sendSorted || pMotion->motionType == MOTIONTYPE_HASH)
+					show_motion_keys(planstate,
+									 pMotion->hashExprs,
+									 pMotion->numSortCols,
+									 pMotion->sortColIdx,
+									 "Merge Key",
+									 ancestors, es);
+			}
+			break;
+		case T_AssertOp:
+			show_upper_qual(plan->qual, "Assert Cond", planstate, ancestors, es);
+			break;
+		case T_PartitionSelector:
+			explain_partition_selector((PartitionSelector *) plan,
+									   parentplanstate, ancestors, es);
+			break;
 		default:
 			break;
 	}
+
+    /* Show executor statistics */
+	if (planstate->instrument && planstate->instrument->need_cdb)
+		cdbexplain_showExecStats(planstate, es);
 
 	/* Show buffer usage */
 	if (es->buffers && planstate->instrument)
@@ -1563,6 +2172,7 @@ ExplainNode(PlanState *planstate, List *ancestors,
 		IsA(plan, ModifyTable) ||
 		IsA(plan, Append) ||
 		IsA(plan, MergeAppend) ||
+		IsA(plan, Sequence) ||
 		IsA(plan, BitmapAnd) ||
 		IsA(plan, BitmapOr) ||
 		IsA(plan, SubqueryScan) ||
@@ -1575,13 +2185,22 @@ ExplainNode(PlanState *planstate, List *ancestors,
 	}
 
 	/* initPlan-s */
-	if (planstate->initPlan)
-		ExplainSubPlans(planstate->initPlan, ancestors, "InitPlan", es);
+	if (plan->initPlan)
+		ExplainSubPlans(planstate->initPlan, ancestors, "InitPlan", es, planstate->state->es_sliceTable);
 
 	/* lefttree */
-	if (outerPlanState(planstate))
+	if (outerPlan(plan) && !skip_outer)
+	{
 		ExplainNode(outerPlanState(planstate), ancestors,
 					"Outer", NULL, es);
+	}
+    else if (skip_outer)
+    {
+		appendStringInfoSpaces(es->str, es->indent * 2);
+		appendStringInfo(es->str, "  ->  ");
+		appendStringInfoString(es->str, skip_outer_msg);
+		appendStringInfo(es->str, "\n");
+    }
 
 	/* righttree */
 	if (innerPlanState(planstate))
@@ -1606,6 +2225,11 @@ ExplainNode(PlanState *planstate, List *ancestors,
 							   ((MergeAppendState *) planstate)->mergeplans,
 							   ancestors, es);
 			break;
+		case T_Sequence:
+			ExplainMemberNodes(((Sequence *) plan)->subplans,
+							   ((SequenceState *) planstate)->subplans,
+							   ancestors, es);
+			break;
 		case T_BitmapAnd:
 			ExplainMemberNodes(((BitmapAnd *) plan)->bitmapplans,
 							   ((BitmapAndState *) planstate)->bitmapplans,
@@ -1626,7 +2250,7 @@ ExplainNode(PlanState *planstate, List *ancestors,
 
 	/* subPlan-s */
 	if (planstate->subPlan)
-		ExplainSubPlans(planstate->subPlan, ancestors, "SubPlan", es);
+		ExplainSubPlans(planstate->subPlan, ancestors, "SubPlan", es, NULL);
 
 	/* end of child plans */
 	if (haschildren)
@@ -1642,6 +2266,8 @@ ExplainNode(PlanState *planstate, List *ancestors,
 	ExplainCloseGroup("Plan",
 					  relationship ? NULL : "Plan",
 					  true, es);
+
+	es->currentSlice = save_currentSlice;
 }
 
 /*
@@ -1767,11 +2393,41 @@ static void
 show_sort_keys(SortState *sortstate, List *ancestors, ExplainState *es)
 {
 	Sort	   *plan = (Sort *) sortstate->ss.ps.plan;
+	const char *SortKeystr;
 
-	show_sort_group_keys((PlanState *) sortstate, "Sort Key",
+	if (sortstate->noduplicates)
+		SortKeystr = "Sort Key (Distinct)";
+	else
+		SortKeystr = "Sort Key";
+
+	show_sort_group_keys((PlanState *) sortstate, SortKeystr,
 						 plan->numCols, plan->sortColIdx,
 						 ancestors, es);
 }
+
+static void
+show_windowagg_keys(WindowAggState *waggstate, List *ancestors, ExplainState *es)
+{
+	WindowAgg *window = (WindowAgg *) waggstate->ss.ps.plan;
+
+	/* The key columns refer to the tlist of the child plan */
+	ancestors = lcons(window, ancestors);
+	if ( window->partNumCols > 0 )
+	{
+		show_sort_group_keys((PlanState *) outerPlanState(waggstate), "Partition By",
+							 window->partNumCols, window->partColIdx,
+							 ancestors, es);
+	}
+
+	show_sort_group_keys((PlanState *) outerPlanState(waggstate), "Order By",
+						 window->ordNumCols, window->ordColIdx,
+						 ancestors, es);
+	ancestors = list_delete_first(ancestors);
+
+	/* XXX don't show framing for now */
+}
+
+
 
 /*
  * Likewise, for a MergeAppend node.
@@ -1810,6 +2466,7 @@ show_agg_keys(AggState *astate, List *ancestors,
 /*
  * Show the grouping keys for a Group node.
  */
+#if 0
 static void
 show_group_keys(GroupState *gstate, List *ancestors,
 				ExplainState *es)
@@ -1823,6 +2480,7 @@ show_group_keys(GroupState *gstate, List *ancestors,
 						 ancestors, es);
 	ancestors = list_delete_first(ancestors);
 }
+#endif
 
 /*
  * Common code to show sort/group keys, which are represented in plan nodes
@@ -1865,36 +2523,85 @@ show_sort_group_keys(PlanState *planstate, const char *qlabel,
 	}
 
 	ExplainPropertyList(qlabel, result, es);
+
+	/*
+	 * GPDB_90_MERGE_FIXME: handle rollup times printing
+	 * if (rollup_gs_times > 1)
+	 *	appendStringInfo(es->str, " (%d times)", rollup_gs_times);
+	 */
 }
 
 /*
  * If it's EXPLAIN ANALYZE, show tuplesort stats for a sort node
+ *
+ * GPDB_90_MERGE_FIXME: The sort statistics are stored quite differently from
+ * upstream, it would be nice to rewrite this to avoid looping over all the
+ * sort methods and instead have a _get_stats() function as in upstream.
  */
 static void
 show_sort_info(SortState *sortstate, ExplainState *es)
 {
-	Assert(IsA(sortstate, SortState));
-	if (es->analyze && sortstate->sort_Done &&
-		sortstate->tuplesortstate != NULL)
+	CdbExplain_NodeSummary *ns;
+	int			i;
+
+	if (!es->analyze)
+		return;
+
+	ns = ((PlanState *) sortstate)->instrument->cdbNodeSummary;
+	for (i = 0; i < NUM_SORT_METHOD; i++)
 	{
-		Tuplesortstate *state = (Tuplesortstate *) sortstate->tuplesortstate;
+		CdbExplain_Agg	*agg;
 		const char *sortMethod;
 		const char *spaceType;
-		long		spaceUsed;
 
-		tuplesort_get_stats(state, &sortMethod, &spaceType, &spaceUsed);
+		sortMethod = sort_method_enum_str[i];
+
+		/*
+		 * Memory and disk usage statistics are saved separately in GPDB so
+		 * need to pull out the one in question first
+		 */
+		spaceType = "Memory";
+		agg = &ns->sortSpaceUsed[MEMORY_SORT_SPACE_TYPE - 1][i];
+		if (agg->vcnt > 0)
+			spaceType = "Memory";
+		else
+		{
+			spaceType = "Disk";
+			agg = &ns->sortSpaceUsed[DISK_SORT_SPACE_TYPE - 1][i];
+		}
+
+		/*
+		 * If the current sort method in question hasn't been used, skip to
+		 * next one
+		 */
+		if (agg->vcnt  == 0)
+			continue;
 
 		if (es->format == EXPLAIN_FORMAT_TEXT)
 		{
 			appendStringInfoSpaces(es->str, es->indent * 2);
-			appendStringInfo(es->str, "Sort Method: %s  %s: %ldkB\n",
-							 sortMethod, spaceType, spaceUsed);
+			appendStringInfo(es->str, "Sort Method:  %s  %s: %ldkB",
+				sortMethod, spaceType, (long) agg->vsum);
+			if (es->verbose)
+			{
+				appendStringInfo(es->str, "  Max Memory: %ldkB  Avg Memory: %ldkb (%d segments)",
+								 (long) agg->vmax,
+								 (long) (agg->vsum / agg->vcnt),
+								 agg->vcnt);
+			}
+			appendStringInfo(es->str, "\n");
 		}
 		else
 		{
 			ExplainPropertyText("Sort Method", sortMethod, es);
-			ExplainPropertyLong("Sort Space Used", spaceUsed, es);
+			ExplainPropertyLong("Sort Space Used", (long) agg->vsum, es);
 			ExplainPropertyText("Sort Space Type", spaceType, es);
+			if (es->verbose)
+			{
+				ExplainPropertyLong("Sort Max Segment Memory", (long) agg->vmax, es);
+				ExplainPropertyLong("Sort Avg Segment Memory", (long) (agg->vsum / agg->vcnt), es);
+				ExplainPropertyInteger("Sort Segments", agg->vcnt, es);
+			}
 		}
 	}
 }
@@ -2114,6 +2821,7 @@ ExplainTargetRel(Plan *plan, Index rti, ExplainState *es)
 	const char *objecttag = NULL;
 	RangeTblEntry *rte;
 	char	   *refname;
+	int			dynamicScanId = 0;
 
 	rte = rt_fetch(rti, es->rtable);
 	refname = (char *) list_nth(es->rtable_names, rti - 1);
@@ -2123,9 +2831,12 @@ ExplainTargetRel(Plan *plan, Index rti, ExplainState *es)
 	switch (nodeTag(plan))
 	{
 		case T_SeqScan:
+		case T_DynamicSeqScan:
 		case T_IndexScan:
+		case T_DynamicIndexScan:
 		case T_IndexOnlyScan:
 		case T_BitmapHeapScan:
+		case T_DynamicBitmapHeapScan:
 		case T_TidScan:
 		case T_ForeignScan:
 		case T_ModifyTable:
@@ -2135,6 +2846,13 @@ ExplainTargetRel(Plan *plan, Index rti, ExplainState *es)
 			if (es->verbose)
 				namespace = get_namespace_name(get_rel_namespace(rte->relid));
 			objecttag = "Relation Name";
+
+			/* Print dynamic scan id for dynamic scan operators */
+			if (isDynamicScan(plan))
+			{
+				dynamicScanId = DynamicScan_GetDynamicScanIdPrintable(plan);
+			}
+
 			break;
 		case T_FunctionScan:
 			{
@@ -2165,6 +2883,37 @@ ExplainTargetRel(Plan *plan, Index rti, ExplainState *es)
 					}
 				}
 				objecttag = "Function Name";
+			}
+			break;
+		case T_TableFunctionScan:
+			{
+				TableFunctionScan *fscan = (TableFunctionScan *) plan;
+
+				/* Assert it's on a RangeFunction */
+				Assert(rte->rtekind == RTE_TABLEFUNCTION);
+
+				/*
+				 * Unlike in a FunctionScan, in a TableFunctionScan the call
+				 * should always be a function call of a single function.
+				 * Get the real name of the function.
+				 */
+				{
+					RangeTblFunction *rtfunc = fscan->function;
+
+					if (IsA(rtfunc->funcexpr, FuncExpr))
+					{
+						FuncExpr   *funcexpr = (FuncExpr *) rtfunc->funcexpr;
+						Oid			funcid = funcexpr->funcid;
+
+						objectname = get_func_name(funcid);
+						if (es->verbose)
+							namespace =
+								get_namespace_name(get_func_namespace(funcid));
+					}
+				}
+				objecttag = "Function Name";
+
+				/* might be nice to add order by and scatter by info, if it's a TableFunctionScan */
 			}
 			break;
 		case T_ValuesScan:
@@ -2198,6 +2947,10 @@ ExplainTargetRel(Plan *plan, Index rti, ExplainState *es)
 			appendStringInfo(es->str, " %s", quote_identifier(objectname));
 		if (objectname == NULL || strcmp(refname, objectname) != 0)
 			appendStringInfo(es->str, " %s", quote_identifier(refname));
+
+		if (dynamicScanId != 0)
+			appendStringInfo(es->str, " (dynamic scan id: %d)",
+							 dynamicScanId);
 	}
 	else
 	{
@@ -2206,6 +2959,9 @@ ExplainTargetRel(Plan *plan, Index rti, ExplainState *es)
 		if (namespace != NULL)
 			ExplainPropertyText("Schema", namespace, es);
 		ExplainPropertyText("Alias", refname, es);
+
+		if (dynamicScanId != 0)
+			ExplainPropertyInteger("Dynamic Scan Id", dynamicScanId, es);
 	}
 }
 
@@ -2267,18 +3023,29 @@ ExplainMemberNodes(List *plans, PlanState **planstates,
  */
 static void
 ExplainSubPlans(List *plans, List *ancestors,
-				const char *relationship, ExplainState *es)
+				const char *relationship, ExplainState *es,
+				SliceTable *sliceTable)
 {
 	ListCell   *lst;
+	Slice      *saved_slice = es->currentSlice;
 
 	foreach(lst, plans)
 	{
 		SubPlanState *sps = (SubPlanState *) lfirst(lst);
 		SubPlan    *sp = (SubPlan *) sps->xprstate.expr;
 
+		/* Subplan might have its own root slice */
+		if (sliceTable && sp->qDispSliceId > 0)
+		{
+			es->currentSlice = (Slice *)list_nth(sliceTable->slices,
+												 sp->qDispSliceId);
+		}
+
 		ExplainNode(sps->planstate, ancestors,
 					relationship, sp->plan_name, es);
 	}
+
+	es->currentSlice = saved_slice;
 }
 
 /*
@@ -2407,6 +3174,34 @@ ExplainProperty(const char *qlabel, const char *value, bool numeric,
 	}
 }
 
+static void
+ExplainPropertyStringInfo(const char *qlabel, ExplainState *es, const char *fmt,...)
+{
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+
+	for (;;)
+	{
+		va_list		args;
+		int			needed;
+
+		/* Try to format the data. */
+		va_start(args, fmt);
+		needed = appendStringInfoVA(&buf, fmt, args);
+		va_end(args);
+
+		if (needed == 0)
+			break;
+
+		/* Double the buffer size and try again. */
+		enlargeStringInfo(&buf, needed);
+	}
+
+	ExplainPropertyText(qlabel, buf.data, es);
+	pfree(buf.data);
+}
+
 /*
  * Explain a string-valued property.
  */
@@ -2463,7 +3258,7 @@ ExplainPropertyFloat(const char *qlabel, double value, int ndigits,
  * If labeled is true, the group members will be labeled properties,
  * while if it's false, they'll be unlabeled objects.
  */
-static void
+void
 ExplainOpenGroup(const char *objtype, const char *labelname,
 				 bool labeled, ExplainState *es)
 {
@@ -2526,7 +3321,7 @@ ExplainOpenGroup(const char *objtype, const char *labelname,
  * Close a group of related objects.
  * Parameters must match the corresponding ExplainOpenGroup call.
  */
-static void
+void
 ExplainCloseGroup(const char *objtype, const char *labelname,
 				  bool labeled, ExplainState *es)
 {

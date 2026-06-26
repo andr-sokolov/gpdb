@@ -39,6 +39,11 @@ CATALOG(pg_cast,2605)
 	char		castmethod;		/* cast method */
 } FormData_pg_cast;
 
+/* GPDB added foreign key definitions for gpcheckcat. */
+FOREIGN_KEY(castsource REFERENCES pg_type(oid));
+FOREIGN_KEY(casttarget REFERENCES pg_type(oid));
+FOREIGN_KEY(castfunc REFERENCES pg_proc(oid));
+
 typedef FormData_pg_cast *Form_pg_cast;
 
 /*
@@ -362,5 +367,15 @@ DATA(insert ( 1700 1700 1703 i f ));
 /* json to/from jsonb */
 DATA(insert ( 114 3802 0 e i ));
 DATA(insert ( 3802 114 0 e i ));
+
+/* complex type */
+DATA(insert (701  7198 3584 i f));
+DATA(insert (700  7198 3585 i f));
+DATA(insert (20   7198 3586 i f));
+DATA(insert (23   7198 3587 i f));
+DATA(insert (21   7198 3588 i f));
+DATA(insert (600  7198 0 e b));
+DATA(insert (7198  600 0 e b));
+DATA(insert (1700 7198 7597 i f));
 
 #endif   /* PG_CAST_H */

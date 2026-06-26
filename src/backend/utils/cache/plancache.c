@@ -51,6 +51,7 @@
 
 #include "access/transam.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_inherits_fn.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
 #include "nodes/nodeFuncs.h"
@@ -67,7 +68,10 @@
 #include "utils/resowner_private.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "utils/faultinjector.h"
 
+#include "cdb/cdbutil.h"
+#include "cdb/cdbpartition.h"
 
 /*
  * We must skip "overhead" operations that involve database access when the
@@ -86,23 +90,27 @@
 static CachedPlanSource *first_saved_plan = NULL;
 
 static void ReleaseGenericPlan(CachedPlanSource *plansource);
-static List *RevalidateCachedQuery(CachedPlanSource *plansource);
+static List *RevalidateCachedQuery(CachedPlanSource *plansource, IntoClause *intoClause);
 static bool CheckCachedPlan(CachedPlanSource *plansource);
 static CachedPlan *BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
-				ParamListInfo boundParams);
+				ParamListInfo boundParams, IntoClause *intoClause);
 static bool choose_custom_plan(CachedPlanSource *plansource,
-				   ParamListInfo boundParams);
+				   ParamListInfo boundParams,
+				   IntoClause *intoClause);
 static double cached_plan_cost(CachedPlan *plan, bool include_planner);
 static void AcquireExecutorLocks(List *stmt_list, bool acquire);
 static void AcquirePlannerLocks(List *stmt_list, bool acquire);
 static void ScanQueryForLocks(Query *parsetree, bool acquire);
 static bool ScanQueryWalker(Node *node, bool *acquire);
 static bool plan_list_is_transient(List *stmt_list);
+static bool plan_list_is_oneoff(List *stmt_list);
 static TupleDesc PlanCacheComputeResultDesc(List *stmt_list);
 static void PlanCacheRelCallback(Datum arg, Oid relid);
 static void PlanCacheFuncCallback(Datum arg, int cacheid, uint32 hashvalue);
 static void PlanCacheSysCallback(Datum arg, int cacheid, uint32 hashvalue);
 
+/* GUC parameter */
+int	plan_cache_mode;
 
 /*
  * InitPlanCache: initialize module during InitPostgres.
@@ -318,6 +326,7 @@ void
 CompleteCachedPlan(CachedPlanSource *plansource,
 				   List *querytree_list,
 				   MemoryContext querytree_context,
+				   NodeTag sourceTag,
 				   Oid *param_types,
 				   int num_params,
 				   ParserSetupHook parserSetup,
@@ -399,6 +408,7 @@ CompleteCachedPlan(CachedPlanSource *plansource,
 	}
 	else
 		plansource->param_types = NULL;
+	plansource->sourceTag = sourceTag;
 	plansource->num_params = num_params;
 	plansource->parserSetup = parserSetup;
 	plansource->parserSetupArg = parserSetupArg;
@@ -544,7 +554,7 @@ ReleaseGenericPlan(CachedPlanSource *plansource)
  * a tree copying step in a subsequent BuildCachedPlan call.)
  */
 static List *
-RevalidateCachedQuery(CachedPlanSource *plansource)
+RevalidateCachedQuery(CachedPlanSource *plansource, IntoClause *intoClause)
 {
 	bool		snapshot_set;
 	Node	   *rawtree;
@@ -589,15 +599,16 @@ RevalidateCachedQuery(CachedPlanSource *plansource)
 	 * objects; then check again.  We need to do it this way to cover the race
 	 * condition that an invalidation message arrives before we get the locks.
 	 */
-	if (plansource->is_valid)
+	if (plansource->is_valid && intoClause == NULL)
 	{
+		SIMPLE_FAULT_INJECTOR("wait_for_cached_plan_invalid");
 		AcquirePlannerLocks(plansource->query_list, true);
 
 		/*
 		 * By now, if any invalidation has happened, the inval callback
 		 * functions will have marked the query invalid.
 		 */
-		if (plansource->is_valid)
+		if (plansource->is_valid && intoClause == NULL)
 		{
 			/* Successfully revalidated and locked the query. */
 			return NIL;
@@ -674,6 +685,14 @@ RevalidateCachedQuery(CachedPlanSource *plansource)
 									   plansource->param_types,
 									   plansource->num_params);
 
+	/* GPDB: For CTAS query, set its isCTAS to be true */
+	if (intoClause)
+	{
+		Assert(list_length(tlist) == 1);
+		Query *query = (Query *) linitial(tlist);
+		query->parentStmtType = PARENTSTMTTYPE_CTAS;
+	}
+
 	/* Release snapshot if we got one */
 	if (snapshot_set)
 		PopActiveSnapshot();
@@ -690,8 +709,12 @@ RevalidateCachedQuery(CachedPlanSource *plansource)
 	{
 		/* OK, doesn't return tuples */
 	}
+	else if (intoClause != NULL)
+	{
+		/* OK */
+	}
 	else if (resultDesc == NULL || plansource->resultDesc == NULL ||
-			 !equalTupleDescs(resultDesc, plansource->resultDesc))
+			 !equalTupleDescs(resultDesc, plansource->resultDesc, true))
 	{
 		/* can we give a better error message? */
 		if (plansource->fixed_result)
@@ -847,7 +870,7 @@ CheckCachedPlan(CachedPlanSource *plansource)
  */
 static CachedPlan *
 BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
-				ParamListInfo boundParams)
+				ParamListInfo boundParams, IntoClause *intoClause)
 {
 	CachedPlan *plan;
 	List	   *plist;
@@ -870,7 +893,7 @@ BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
 	 * safety, let's treat it as real and redo the RevalidateCachedQuery call.
 	 */
 	if (!plansource->is_valid)
-		qlist = RevalidateCachedQuery(plansource);
+		qlist = RevalidateCachedQuery(plansource, intoClause);
 
 	/*
 	 * If we don't already have a copy of the querytree list that can be
@@ -949,7 +972,18 @@ BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
 	plan = (CachedPlan *) palloc(sizeof(CachedPlan));
 	plan->magic = CACHEDPLAN_MAGIC;
 	plan->stmt_list = plist;
-	if (plan_list_is_transient(plist))
+
+	/*
+	 * In GPDB, the planner is more aggressive, and e.g. eagerly evaluates
+	 * stable functions in the planner already. Such plans are marked as
+	 * 'one-off', and mustn't be reused. Likewise, plans for CTAS are not
+	 * reused, because the plan depends on the target data distribution.
+	 */
+	if (plan_list_is_oneoff(plist) || intoClause)
+	{
+		plan->saved_xmin = BootstrapTransactionId;
+	}
+	else if (plan_list_is_transient(plist))
 	{
 		Assert(TransactionIdIsNormal(TransactionXmin));
 		plan->saved_xmin = TransactionXmin;
@@ -976,9 +1010,13 @@ BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
  * This defines the policy followed by GetCachedPlan.
  */
 static bool
-choose_custom_plan(CachedPlanSource *plansource, ParamListInfo boundParams)
+choose_custom_plan(CachedPlanSource *plansource, ParamListInfo boundParams, IntoClause *intoClause)
 {
 	double		avg_custom_cost;
+
+	/* Force to replan for CTAS */
+	if (intoClause != NULL)
+		return true;
 
 	/* One-shot plans will always be considered custom */
 	if (plansource->is_oneshot)
@@ -990,6 +1028,12 @@ choose_custom_plan(CachedPlanSource *plansource, ParamListInfo boundParams)
 	/* ... nor for transaction control statements */
 	if (IsTransactionStmtPlan(plansource))
 		return false;
+
+	/* Let settings force the decision */
+	if (plan_cache_mode == PLAN_CACHE_MODE_FORCE_GENERIC_PLAN)
+		return false;
+	if (plan_cache_mode == PLAN_CACHE_MODE_FORCE_CUSTOM_PLAN)
+		return true;
 
 	/* See if caller wants to force the decision */
 	if (plansource->cursor_options & CURSOR_OPT_GENERIC_PLAN)
@@ -1068,6 +1112,39 @@ cached_plan_cost(CachedPlan *plan, bool include_planner)
 
 			result += 1000.0 * cpu_operator_cost * (nrelations + 1);
 		}
+
+		/*
+		 * For generic plan, no params will be passed to planner, which leads
+		 * to plan can not genenrate direct dispatch plan, even if all the
+		 * params are const values. Unfortunately, direct dispatch cost v.s.
+		 * full gang dispatch cost is not included in plan's total cost. But
+		 * this cost is significantly. For query could leverage direct
+		 * dispatch, dispatching it to full gangs will result in unneccessary
+		 * QEs, but these QEs still need to go through volcano model, do two
+		 * phase commit and write xlog for Prepare etc, which not only
+		 * consuming CPU but also IO to disk. 
+		 *
+		 * So correctly generating direct dispatch plan matters.  As for custom
+		 * plan, it would pass the const params to planner and is able to
+		 * generate direct dispatch plan when possible. As a result, when we
+		 * evaluate the cost of generic plan and custom plan, we should not
+		 * only consider the plan's total cost and re-plan cost, but also
+		 * consider the cost of failed to generate direct dispatch.
+		 *
+		 * Since non direct dispatch introduces additional IO, we use
+		 * seq_page_cost as base unit to measure non direct dispatch cost. The
+		 * number of unneccessary QEs also measures the amount of this cost.
+		 * Considering clusters with 100 segments v.s. 10 segments, the non
+		 * direct dispatch cost of the 100 segments cluster is definitely
+		 * higher than 10 segments cluster.
+		 */
+		if (!plannedstmt->planTree->directDispatch.isDirectDispatch)
+		{
+			int			ndirectDispatchContentIds =
+				list_length(plannedstmt->planTree->directDispatch.contentIds);
+			int			nsegments = getgpsegmentCount();
+			result += 10.0 * seq_page_cost * (nsegments - ndirectDispatchContentIds);
+		}
 	}
 
 	return result;
@@ -1093,7 +1170,7 @@ cached_plan_cost(CachedPlan *plan, bool include_planner)
  */
 CachedPlan *
 GetCachedPlan(CachedPlanSource *plansource, ParamListInfo boundParams,
-			  bool useResOwner)
+			  bool useResOwner, IntoClause *intoClause)
 {
 	CachedPlan *plan = NULL;
 	List	   *qlist;
@@ -1107,10 +1184,10 @@ GetCachedPlan(CachedPlanSource *plansource, ParamListInfo boundParams,
 		elog(ERROR, "cannot apply ResourceOwner to non-saved cached plan");
 
 	/* Make sure the querytree list is valid and we have parse-time locks */
-	qlist = RevalidateCachedQuery(plansource);
+	qlist = RevalidateCachedQuery(plansource, intoClause);
 
 	/* Decide whether to use a custom plan */
-	customplan = choose_custom_plan(plansource, boundParams);
+	customplan = choose_custom_plan(plansource, boundParams, intoClause);
 
 	if (!customplan)
 	{
@@ -1123,7 +1200,7 @@ GetCachedPlan(CachedPlanSource *plansource, ParamListInfo boundParams,
 		else
 		{
 			/* Build a new generic plan */
-			plan = BuildCachedPlan(plansource, qlist, NULL);
+			plan = BuildCachedPlan(plansource, qlist, NULL, NULL);
 			/* Just make real sure plansource->gplan is clear */
 			ReleaseGenericPlan(plansource);
 			/* Link the new generic plan into the plansource */
@@ -1154,7 +1231,7 @@ GetCachedPlan(CachedPlanSource *plansource, ParamListInfo boundParams,
 			 * find it's a loser, but we don't want to actually execute that
 			 * plan.
 			 */
-			customplan = choose_custom_plan(plansource, boundParams);
+			customplan = choose_custom_plan(plansource, boundParams, intoClause);
 
 			/*
 			 * If we choose to plan again, we need to re-copy the query_list,
@@ -1168,7 +1245,7 @@ GetCachedPlan(CachedPlanSource *plansource, ParamListInfo boundParams,
 	if (customplan)
 	{
 		/* Build a custom plan */
-		plan = BuildCachedPlan(plansource, qlist, boundParams);
+		plan = BuildCachedPlan(plansource, qlist, boundParams, intoClause);
 		/* Accumulate total costs of custom plans, but 'ware overflow */
 		if (plansource->num_custom_plans < INT_MAX)
 		{
@@ -1308,6 +1385,7 @@ CopyCachedPlan(CachedPlanSource *plansource)
 	newsource->magic = CACHEDPLANSOURCE_MAGIC;
 	newsource->raw_parse_tree = copyObject(plansource->raw_parse_tree);
 	newsource->query_string = pstrdup(plansource->query_string);
+	newsource->sourceTag = plansource->sourceTag;
 	newsource->commandTag = plansource->commandTag;
 	if (plansource->num_params > 0)
 	{
@@ -1399,7 +1477,7 @@ CachedPlanGetTargetList(CachedPlanSource *plansource)
 		return NIL;
 
 	/* Make sure the querytree list is valid and we have parse-time locks */
-	RevalidateCachedQuery(plansource);
+	RevalidateCachedQuery(plansource, NULL);
 
 	/* Get the primary statement and find out what it returns */
 	pstmt = PortalListGetPrimaryStmt(plansource->query_list);
@@ -1458,7 +1536,25 @@ AcquireExecutorLocks(List *stmt_list, bool acquire)
 			 * acquire a non-conflicting lock.
 			 */
 			if (list_member_int(plannedstmt->resultRelations, rt_index))
-				lockmode = RowExclusiveLock;
+			{
+				/*
+				 * RowExclusiveLock is acquired in PostgreSQL here.  Greenplum
+				 * acquires ExclusiveLock to avoid distributed deadlock due to
+				 * concurrent UPDATE/DELETE on the same table.  This is in
+				 * parity with CdbTryOpenRelation().  Catalog tables are
+				 * replicated across cluster and don't suffer from the
+				 * deadlock.
+				 * Since we have introduced Global Deadlock Detector, only for ao
+				 * table should we upgrade the lock.
+				 */
+				if (rte->relid >= FirstNormalObjectId &&
+					(plannedstmt->commandType == CMD_UPDATE ||
+					 plannedstmt->commandType == CMD_DELETE) &&
+					CondUpgradeRelLock(rte->relid))
+					lockmode = ExclusiveLock;
+				else
+					lockmode = RowExclusiveLock;
+			}
 			else if ((rc = get_plan_rowmark(plannedstmt->rowMarks, rt_index)) != NULL &&
 					 RowMarkRequiresRowShareLock(rc->markType))
 				lockmode = RowShareLock;
@@ -1532,15 +1628,90 @@ ScanQueryForLocks(Query *parsetree, bool acquire)
 			case RTE_RELATION:
 				/* Acquire or release the appropriate type of lock */
 				if (rt_index == parsetree->resultRelation)
-					lockmode = RowExclusiveLock;
+				{
+					/*
+					 * RowExclusiveLock is acquired in PostgreSQL here.
+					 * Greenplum acquires ExclusiveLock to avoid distributed
+					 * deadlock due to concurrent UPDATE/DELETE on the same
+					 * table.  This is in parity with CdbTryOpenRelation().
+					 * Catalog tables are replicated across cluster and don't
+					 * suffer from the deadlock.
+					 */
+					if (rte->relid >= FirstNormalObjectId &&
+						(parsetree->commandType == CMD_UPDATE ||
+						 parsetree->commandType == CMD_DELETE) &&
+						CondUpgradeRelLock(rte->relid))
+						lockmode = ExclusiveLock;
+					else
+						lockmode = RowExclusiveLock;
+				}
 				else if (get_parse_rowmark(parsetree, rt_index) != NULL)
 					lockmode = RowShareLock;
 				else
 					lockmode = AccessShareLock;
 				if (acquire)
+				{
 					LockRelationOid(rte->relid, lockmode);
+
+					/* If the relation is partitioned, we should acquire corresponding locks on
+					 * each leaf partition before entering InitPlan. The snapshot will acquire before
+					 * the InitPlan, so if we wait the locks for a while in the InitPlan. When we
+					 * get all locks, the snapshot maybe become invalid. So we must acquire lock
+					 * before entering InitPlan to keep the snapshot valid.
+					 * 
+					 * We need to maintain the consistency of the locks of the parent table and the child table.
+					 * Only one situation is special, when the command is to insert, and gdd don't open, the dead 
+					 * lock will happen.
+					 * for example:
+					 * Without locking the partition relations on QD when INSERT with Planner the 
+					 * following dead lock scenario may happen between INSERT and AppendOnly VACUUM 
+					 * drop phase on the partition table:
+					 * 
+					 * 1. AO VACUUM drop on QD: acquired AccessExclusiveLock
+					 * 2. INSERT on QE: acquired RowExclusiveLock
+					 * 3. AO VACUUM drop on QE: waiting for AccessExclusiveLock
+					 * 4. INSERT on QD: waiting for AccessShareLock at ExecutorEnd()
+					 * 
+					 * 2 blocks 3, 1 blocks 4, 1 and 2 will not release their locks until 3 and 4 proceed. 
+					 * Hence INSERT needs to Lock the partition tables on QD here (before 2) to prevent 
+					 * this dead lock.
+					 * 
+					 * This will cause a deadlock. But if gdd have already opened, gdd will solve the 
+					 * dead lock. So it is safe to not get locks for partitions.
+					 * 
+					 * But for the update and delete, we must acquire locks whether the gdd opens or not.
+					 */
+					SIMPLE_FAULT_INJECTOR("cache_wait_lock");
+					if (rel_is_partitioned(rte->relid) && ((parsetree->commandType == CMD_INSERT
+					&& !gp_enable_global_deadlock_detector) || parsetree->commandType == CMD_UPDATE
+					|| parsetree->commandType == CMD_DELETE))
+						find_all_inheritors(rte->relid, lockmode, NULL);
+				}
 				else
+				{
 					UnlockRelationOid(rte->relid, lockmode);
+
+					/*
+					 * If we need to release lock, we also need release leaf patition lock.
+					 */
+					if (rel_is_partitioned(rte->relid) && ((parsetree->commandType == CMD_INSERT 
+					&& !gp_enable_global_deadlock_detector) || parsetree->commandType == CMD_UPDATE 
+					|| parsetree->commandType == CMD_DELETE))
+					{
+						ListCell   *lc;
+						List       *children = NIL;
+						children = find_all_inheritors(rte->relid, NoLock, NULL);
+
+						foreach(lc, children)
+						{
+							Oid child_oid = lfirst_oid(lc);
+							/* find_all_inheritors will also contain the root table's Oid */
+							if (child_oid == rte->relid)
+								continue;
+							UnlockRelationOid(child_oid, lockmode);
+						}
+					}
+				}
 				break;
 
 			case RTE_SUBQUERY:
@@ -1615,6 +1786,28 @@ plan_list_is_transient(List *stmt_list)
 			continue;			/* Ignore utility statements */
 
 		if (plannedstmt->transientPlan)
+			return true;
+	}
+
+	return false;
+}
+
+/*
+ * plan_list_is_oneoff: check if any of the plans in the list are one-off plans
+ */
+static bool
+plan_list_is_oneoff(List *stmt_list)
+{
+	ListCell   *lc;
+
+	foreach(lc, stmt_list)
+	{
+		PlannedStmt *plannedstmt = (PlannedStmt *) lfirst(lc);
+
+		if (!IsA(plannedstmt, PlannedStmt))
+			continue;			/* Ignore utility statements */
+
+		if (plannedstmt->oneoffPlan)
 			return true;
 	}
 

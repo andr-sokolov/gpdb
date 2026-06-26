@@ -31,9 +31,12 @@
 #include "optimizer/paths.h"
 #include "optimizer/predtest.h"
 #include "optimizer/restrictinfo.h"
+#include "optimizer/subselect.h"
 #include "optimizer/var.h"
+#include "parser/parsetree.h"
 #include "utils/builtins.h"
 #include "utils/bytea.h"
+#include "utils/faultinjector.h"
 #include "utils/lsyscache.h"
 #include "utils/pg_locale.h"
 #include "utils/selfuncs.h"
@@ -779,11 +782,23 @@ get_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	{
 		IndexPath  *ipath = (IndexPath *) lfirst(lc);
 
+		/* CDB: Flag RelOptInfo if at most one row can satisfy index quals. */
+		if (ipath->num_leading_eq > 0 &&
+			ipath->num_leading_eq == ipath->indexinfo->ncolumns &&
+			ipath->indexinfo->unique)
+			rel->onerow = true;
+
 		if (index->amhasgettuple)
 			add_path(rel, (Path *) ipath);
 
 		if (index->amhasgetbitmap &&
-			(ipath->path.pathkeys == NIL ||
+			/* GPDB: Give a chance of bitmap index path if seqscan is disabled.
+			 * GPDB_92_MERGE_FIXME: Maybe we should remove this check to follow
+			 * pg upstream? test co_nestloop_idxscan output will diff with and
+			 * without this line.
+			 */
+			(!enable_seqscan ||
+			 ipath->path.pathkeys == NIL ||
 			 ipath->indexselectivity < 1.0))
 			*bitindexpaths = lappend(*bitindexpaths, ipath);
 	}
@@ -1609,6 +1624,17 @@ bitmap_and_cost_est(PlannerInfo *root, RelOptInfo *rel, List *paths)
 						  bpath.path.param_info,
 						  (Path *) &apath,
 						  get_loop_count(root, required_outer));
+
+	#ifdef FAULT_INJECTOR
+		/* Simulate an bitmapAnd plan by changing bitmap cost. */
+		if (FaultInjector_InjectFaultIfSet("simulate_bitmap_and",
+									DDLNotSpecified,
+									"",
+									"") == FaultInjectorTypeSkip)
+		{
+			bpath.path.total_cost = 0;
+		}
+	#endif
 
 	return bpath.path.total_cost;
 }

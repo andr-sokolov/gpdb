@@ -19,6 +19,7 @@
 #include "miscadmin.h"
 #include "utils/datum.h"
 #include "utils/memutils.h"
+#include "nodes/tidbitmap.h"
 
 /* GUC parameter */
 int			GinFuzzySearchLimit = 0;
@@ -1774,11 +1775,20 @@ Datum
 gingetbitmap(PG_FUNCTION_ARGS)
 {
 	IndexScanDesc scan = (IndexScanDesc) PG_GETARG_POINTER(0);
-	TIDBitmap  *tbm = (TIDBitmap *) PG_GETARG_POINTER(1);
+	Node 	   *n = (Node *) PG_GETARG_POINTER(1);
+	TIDBitmap  *tbm;
 	GinScanOpaque so = (GinScanOpaque) scan->opaque;
 	int64		ntids;
 	ItemPointerData iptr;
 	bool		recheck;
+
+	if (n == NULL)
+		/* XXX should we use less than work_mem for this? */
+		tbm = tbm_create(work_mem * 1024L);
+	else if (!IsA(n, TIDBitmap))
+		elog(ERROR, "non hash bitmap");
+	else
+		tbm = (TIDBitmap *)n;
 
 	/*
 	 * Set up the scan keys, and check for unsatisfiable query.
@@ -1787,7 +1797,7 @@ gingetbitmap(PG_FUNCTION_ARGS)
 	ginNewScanKey(scan);
 
 	if (GinIsVoidRes(scan))
-		PG_RETURN_INT64(0);
+		PG_RETURN_POINTER(tbm);
 
 	ntids = 0;
 
@@ -1824,5 +1834,5 @@ gingetbitmap(PG_FUNCTION_ARGS)
 		ntids++;
 	}
 
-	PG_RETURN_INT64(ntids);
+	PG_RETURN_POINTER(tbm);
 }

@@ -66,6 +66,9 @@ extern bool processSQLNamePattern(PGconn *conn, PQExpBuffer buf,
 					  bool have_where, bool force_escape,
 					  const char *schemavar, const char *namevar,
 					  const char *altnamevar, const char *visibilityrule);
+/* GPDB additions */
+extern char *escape_backslashes(const char *src, bool quotes_too);
+
 extern void buildShSecLabelQuery(PGconn *conn, const char *catalog_name,
 					 Oid objectId, PQExpBuffer sql);
 extern void emitShSecLabels(PGconn *conn, PGresult *res,

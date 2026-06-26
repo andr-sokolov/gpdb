@@ -22,7 +22,11 @@
 #include "postmaster/autovacuum.h"
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
+#include "utils/guc.h"
 #include "utils/syscache.h"
+
+#include "access/distributedlog.h"
+#include "cdb/cdbvars.h"
 
 
 /* Number of OIDs to prefetch (preallocate) per XLOG write */
@@ -31,6 +35,8 @@
 /* pointer to "variable cache" in shared memory (set up by shmem.c) */
 VariableCache ShmemVariableCache = NULL;
 
+int xid_stop_limit;
+int xid_warn_limit;
 
 /*
  * Allocate the next XID for a new transaction or subtransaction.
@@ -54,7 +60,6 @@ GetNewTransactionId(bool isSubXact)
 	if (IsBootstrapProcessingMode())
 	{
 		Assert(!isSubXact);
-		MyPgXact->xid = BootstrapTransactionId;
 		return BootstrapTransactionId;
 	}
 
@@ -114,15 +119,15 @@ GetNewTransactionId(bool isSubXact)
 						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 						 errmsg("database is not accepting commands to avoid wraparound data loss in database \"%s\"",
 								oldest_datname),
-						 errhint("Stop the postmaster and vacuum that database in single-user mode.\n"
-								 "You might also need to commit or roll back old prepared transactions.")));
+						 errhint("Shutdown Greenplum Database. Lower the xid_stop_limit GUC. Execute a database-wide VACUUM in that database. Reset the xid_stop_limit GUC."
+								 )));
 			else
 				ereport(ERROR,
 						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 						 errmsg("database is not accepting commands to avoid wraparound data loss in database with OID %u",
 								oldest_datoid),
-						 errhint("Stop the postmaster and vacuum that database in single-user mode.\n"
-								 "You might also need to commit or roll back old prepared transactions.")));
+						 errhint("Shutdown Greenplum Database. Lower the xid_stop_limit GUC. Execute a database-wide VACUUM in that database. Reset the xid_stop_limit GUC."
+								 )));
 		}
 		else if (TransactionIdFollowsOrEquals(xid, xidWarnLimit))
 		{
@@ -134,15 +139,15 @@ GetNewTransactionId(bool isSubXact)
 						(errmsg("database \"%s\" must be vacuumed within %u transactions",
 								oldest_datname,
 								xidWrapLimit - xid),
-						 errhint("To avoid a database shutdown, execute a database-wide VACUUM in that database.\n"
-								 "You might also need to commit or roll back old prepared transactions.")));
+						 errhint("To avoid a database shutdown, execute a database-wide VACUUM in that database."
+								 )));
 			else
 				ereport(WARNING,
 						(errmsg("database with OID %u must be vacuumed within %u transactions",
 								oldest_datoid,
 								xidWrapLimit - xid),
-						 errhint("To avoid a database shutdown, execute a database-wide VACUUM in that database.\n"
-								 "You might also need to commit or roll back old prepared transactions.")));
+						 errhint("To avoid a database shutdown, execute a database-wide VACUUM in that database."
+								 )));
 		}
 
 		/* Re-acquire lock and start over */
@@ -161,6 +166,7 @@ GetNewTransactionId(bool isSubXact)
 	 */
 	ExtendCLOG(xid);
 	ExtendSUBTRANS(xid);
+	DistributedLog_Extend(xid);
 
 	/*
 	 * Now advance the nextXid counter.  This must not happen until after we
@@ -169,6 +175,34 @@ GetNewTransactionId(bool isSubXact)
 	 * more XIDs until there is CLOG space for them.
 	 */
 	TransactionIdAdvance(ShmemVariableCache->nextXid);
+
+	/*
+	 * To aid testing, you can set the debug_burn_xids GUC, to consume XIDs
+	 * faster. If set, we bump the XID counter to the next value divisible by
+	 * 4096, minus one. The idea is to skip over "boring" XID ranges, but
+	 * still step through XID wraparound, CLOG page boundaries etc. one XID
+	 * at a time.
+	 */
+	if (Debug_burn_xids)
+	{
+		TransactionId xx;
+		uint32		r;
+
+		/*
+		 * Based on the minimum of ENTRIES_PER_PAGE (DistributedLog),
+		 * SUBTRANS_XACTS_PER_PAGE, CLOG_XACTS_PER_PAGE.
+		 */
+		const uint32      page_extend_limit = 4 * 1024;
+
+		xx = ShmemVariableCache->nextXid;
+
+		r = xx % page_extend_limit;
+		if (r > 1 && r < (page_extend_limit - 1))
+		{
+			xx += page_extend_limit - r - 1;
+			ShmemVariableCache->nextXid = xx;
+		}
+	}
 
 	/*
 	 * We must store the new XID into the shared ProcArray before releasing
@@ -277,18 +311,18 @@ SetTransactionIdLimit(TransactionId oldest_datfrozenxid, Oid oldest_datoid)
 
 	/*
 	 * We'll refuse to continue assigning XIDs in interactive mode once we get
-	 * within 1M transactions of data loss.  This leaves lots of room for the
-	 * DBA to fool around fixing things in a standalone backend, while not
-	 * being significant compared to total XID space. (Note that since
+	 * within xid_stop_limit transactions of data loss.  This leaves lots of
+	 * room for the DBA to fool around fixing things in a standalone backend,
+	 * while not being significant compared to total XID space. (Note that since
 	 * vacuuming requires one transaction per table cleaned, we had better be
 	 * sure there's lots of XIDs left...)
 	 */
-	xidStopLimit = xidWrapLimit - 1000000;
+	xidStopLimit = xidWrapLimit - (TransactionId)xid_stop_limit;
 	if (xidStopLimit < FirstNormalTransactionId)
 		xidStopLimit -= FirstNormalTransactionId;
 
 	/*
-	 * We'll start complaining loudly when we get within 10M transactions of
+	 * We'll start complaining loudly when we get within xid_warn_limit of
 	 * the stop point.  This is kind of arbitrary, but if you let your gas
 	 * gauge get down to 1% of full, would you be looking for the next gas
 	 * station?  We need to be fairly liberal about this number because there
@@ -297,7 +331,7 @@ SetTransactionIdLimit(TransactionId oldest_datfrozenxid, Oid oldest_datoid)
 	 * this configurable.  If you know enough to configure it, you know enough
 	 * to not get in this kind of trouble in the first place.)
 	 */
-	xidWarnLimit = xidStopLimit - 10000000;
+	xidWarnLimit = xidStopLimit  - (TransactionId)xid_warn_limit;
 	if (xidWarnLimit < FirstNormalTransactionId)
 		xidWarnLimit -= FirstNormalTransactionId;
 
@@ -423,17 +457,10 @@ ForceTransactionIdLimitUpdate(void)
 
 
 /*
- * GetNewObjectId -- allocate a new OID
- *
- * OIDs are generated by a cluster-wide counter.  Since they are only 32 bits
- * wide, counter wraparound will occur eventually, and therefore it is unwise
- * to assume they are unique unless precautions are taken to make them so.
- * Hence, this routine should generally not be used directly.  The only
- * direct callers should be GetNewOid() and GetNewRelFileNode() in
- * catalog/catalog.c.
+ * Requires OidGenLock to be held by caller.
  */
-Oid
-GetNewObjectId(void)
+static Oid
+GetNewObjectIdUnderLock(void)
 {
 	Oid			result;
 
@@ -441,7 +468,7 @@ GetNewObjectId(void)
 	if (RecoveryInProgress())
 		elog(ERROR, "cannot assign OIDs during recovery");
 
-	LWLockAcquire(OidGenLock, LW_EXCLUSIVE);
+	Assert(LWLockHeldByMe(OidGenLock));
 
 	/*
 	 * Check for wraparound of the OID counter.  We *must* not return 0
@@ -491,7 +518,139 @@ GetNewObjectId(void)
 	(ShmemVariableCache->nextOid)++;
 	(ShmemVariableCache->oidCount)--;
 
+	return result;
+}
+
+/*
+ * GetNewObjectId -- allocate a new OID
+ *
+ * OIDs are generated by a cluster-wide counter. Since they are only
+ * 32 bits wide, counter wraparound will occur eventually, and
+ * therefore it is unwise to assume they are unique unless precautions
+ * are taken to make them so. Hence, this routine should generally not
+ * be used directly. The only direct callers should be GetNewOid() and
+ * GetNewOidWithIndex() in catalog/catalog.c. It's also called from
+ * cdb_sync_oid_to_segments() in cdb/cdboidsync.c to synchronize the
+ * OID counter on the QD with its QEs.
+ */
+Oid
+GetNewObjectId(void)
+{
+	Oid			result;
+
+	LWLockAcquire(OidGenLock, LW_EXCLUSIVE);
+
+	result = GetNewObjectIdUnderLock();
+
 	LWLockRelease(OidGenLock);
 
 	return result;
+}
+
+/*
+ * AdvanceObjectId -- advance object id counter for QD and QE nodes
+ *
+ * When advancing the Oid counter of a QD, it should only be for the purpose
+ * of syncing Oid counters logically compared with the numeric maximum Oid
+ * counter value among the primary segments.
+ *
+ * When advancing the Oid counter of a QE, the QD provides the preassigned OID
+ * to the QE nodes which will be used as the relation's OID. QE nodes do not
+ * use this OID as the relfilenode value anymore so the OID counter is not
+ * incremented. This function forcefully increments the QE node's OID counter
+ * to be about the same as the OID provided by the QD node.
+ */
+void
+AdvanceObjectId(Oid newOid)
+{
+	LWLockAcquire(OidGenLock, LW_EXCLUSIVE);
+
+	if (OidFollowsNextOid(newOid))
+	{
+		int32 nextOidDifference = (int32)(newOid - ShmemVariableCache->nextOid);
+
+		/*
+		 * We directly set the nextOid counter to the given OID instead of
+		 * doing incremental calls to GetNewObjectIdUnderLock(). Update the
+		 * oidCount to VAR_OID_PREFETCH and create an xlog if we have
+		 * exhausted the current oidCount. We should always be moving forward
+		 * and never backwards.
+		 */
+		ShmemVariableCache->nextOid = newOid;
+		if (nextOidDifference >= ShmemVariableCache->oidCount)
+		{
+			XLogPutNextOid(ShmemVariableCache->nextOid + VAR_OID_PREFETCH);
+			ShmemVariableCache->oidCount = VAR_OID_PREFETCH;
+		}
+		else
+			ShmemVariableCache->oidCount -= nextOidDifference;
+	}
+
+	LWLockRelease(OidGenLock);
+}
+
+/*
+ * Requires RelfilenodeGenLock to be held by caller.
+ */
+static Oid
+GetNewSegRelfilenodeUnderLock(void)
+{
+	Oid result;
+
+	Assert(LWLockHeldByMe(RelfilenodeGenLock));
+
+	if (ShmemVariableCache->nextRelfilenode < ((Oid) FirstNormalObjectId) &&
+		IsPostmasterEnvironment)
+	{
+		/* wraparound in normal environment */
+		ShmemVariableCache->nextRelfilenode = FirstNormalObjectId;
+		ShmemVariableCache->relfilenodeCount = 0;
+	}
+
+	if (ShmemVariableCache->relfilenodeCount == 0)
+	{
+		XLogPutNextRelfilenode(ShmemVariableCache->nextRelfilenode + VAR_OID_PREFETCH);
+		ShmemVariableCache->relfilenodeCount = VAR_OID_PREFETCH;
+	}
+
+	result = ShmemVariableCache->nextRelfilenode;
+
+	(ShmemVariableCache->nextRelfilenode)++;
+	(ShmemVariableCache->relfilenodeCount)--;
+
+	return result;
+}
+
+/*
+ * GetNewSegRelfilenode -- allocate a new relfilenode value
+ *
+ * Similar to GetNewObjectId but for relfilenodes. This function has its own
+ * separate counter and is used to allocate relfilenode values instead of
+ * trying to use the newly generated OIDs (QD) or preassigned OIDs (QE) as the
+ * relfilenode.
+ */
+Oid
+GetNewSegRelfilenode(void)
+{
+	Oid result;
+
+	LWLockAcquire(RelfilenodeGenLock, LW_EXCLUSIVE);
+
+	result = GetNewSegRelfilenodeUnderLock();
+
+	LWLockRelease(RelfilenodeGenLock);
+
+	return result;
+}
+
+/*
+ * Is the given Oid logically > ShmemVariableCache->nextOid?
+ */
+bool
+OidFollowsNextOid(Oid id)
+{
+	int32		diff;
+
+	diff = (int32) (id - ShmemVariableCache->nextOid);
+	return (diff > 0);
 }

@@ -20,8 +20,6 @@
 /*
  * allpaths.c
  */
-extern bool enable_geqo;
-extern int	geqo_threshold;
 
 /* Hook for plugins to replace standard_join_search() */
 typedef RelOptInfo *(*join_search_hook_type) (PlannerInfo *root,
@@ -154,6 +152,19 @@ typedef enum
 	PATHKEYS_DIFFERENT			/* neither pathkey includes the other */
 } PathKeysComparison;
 
+typedef struct
+{
+	Node *replaceThis;
+	Node *withThis;
+	int numReplacementsDone;
+} ReplaceExpressionMutatorReplacement;
+
+extern PathKey *makePathKey(EquivalenceClass *eclass, Oid opfamily,
+							int strategy, bool nulls_first);
+
+extern Node * replace_expression_mutator(Node *node, void *context);
+extern void generate_implied_quals(PlannerInfo *root);
+
 extern PathKeysComparison compare_pathkeys(List *keys1, List *keys2);
 extern bool pathkeys_contained_in(List *keys1, List *keys2);
 extern Path *get_cheapest_path_for_pathkeys(List *paths, List *pathkeys,
@@ -165,6 +176,10 @@ extern Path *get_cheapest_fractional_path_for_pathkeys(List *paths,
 										  double fraction);
 extern List *build_index_pathkeys(PlannerInfo *root, IndexOptInfo *index,
 					 ScanDirection scandir);
+
+Var *
+find_indexkey_var(PlannerInfo *root, RelOptInfo *rel, AttrNumber varattno);
+
 extern List *build_expression_pathkey(PlannerInfo *root, Expr *expr,
 						 Relids nullable_relids, Oid opno,
 						 Relids rel, bool create_it);
@@ -174,9 +189,31 @@ extern List *build_join_pathkeys(PlannerInfo *root,
 					RelOptInfo *joinrel,
 					JoinType jointype,
 					List *outer_pathkeys);
+
+extern DistributionKey *cdb_make_distkey_for_expr(PlannerInfo  *root,
+						  Node *expr, Oid opfamily /* hash opfamily */);
+extern EquivalenceClass *
+cdb_pull_up_eclass(PlannerInfo    *root,
+					EquivalenceClass *eclass,
+                    Relids          relids,
+                    List           *targetlist,
+                    List           *newvarlist,
+                    Index           newrelid);
+
+extern List *make_pathkeys_for_groupclause(PlannerInfo *root,
+										   List *groupclause,
+										   List *tlist);
+extern List *make_pathkeys_for_groupclause_noncanonical(PlannerInfo *root,
+										   List *groupclause,
+										   List *tlist);
 extern List *make_pathkeys_for_sortclauses(PlannerInfo *root,
 							  List *sortclauses,
 							  List *tlist);
+extern void make_distribution_exprs_for_groupclause(PlannerInfo *root,
+										List *groupclause, List *tlist,
+										List **partition_dist_pathkeys,
+										List **partition_dist_exprs,
+										List **partition_dist_opfamilies);
 extern void initialize_mergeclause_eclasses(PlannerInfo *root,
 								RestrictInfo *restrictinfo);
 extern void update_mergeclause_eclasses(PlannerInfo *root,
@@ -197,5 +234,6 @@ extern List *truncate_useless_pathkeys(PlannerInfo *root,
 						  RelOptInfo *rel,
 						  List *pathkeys);
 extern bool has_useful_pathkeys(PlannerInfo *root, RelOptInfo *rel);
+extern bool pathkey_is_redundant(PathKey *new_pathkey, List *pathkeys);
 
 #endif   /* PATHS_H */

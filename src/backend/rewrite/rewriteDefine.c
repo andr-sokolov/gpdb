@@ -42,6 +42,9 @@
 #include "utils/syscache.h"
 #include "utils/tqual.h"
 
+#include "catalog/oid_dispatch.h"
+#include "cdb/cdbdisp_query.h"
+#include "cdb/cdbvars.h"
 
 static void checkRuleResultList(List *targetList, TupleDesc resultDesc,
 					bool isSelect, bool requireColumnNameMatch);
@@ -197,9 +200,18 @@ DefineRule(RuleStmt *stmt, const char *queryString)
 	List	   *actions;
 	Node	   *whereClause;
 	Oid			relId;
+	Oid			result;
+	RuleStmt   *copyStmt;
 
 	/* Parse analysis. */
-	transformRuleStmt(stmt, queryString, &actions, &whereClause);
+	if (Gp_role == GP_ROLE_EXECUTE)
+	{
+		/* ... unless we are in a segment where the analysis is already done */
+		actions = stmt->actions;
+		whereClause = stmt->whereClause;
+	}
+	else
+		transformRuleStmt(stmt, queryString, &actions, &whereClause);
 
 	/*
 	 * Find and lock the relation.  Lock level should match
@@ -208,13 +220,29 @@ DefineRule(RuleStmt *stmt, const char *queryString)
 	relId = RangeVarGetRelid(stmt->relation, AccessExclusiveLock, false);
 
 	/* ... and execute */
-	return DefineQueryRewrite(stmt->rulename,
+	result = DefineQueryRewrite(stmt->rulename,
 							  relId,
 							  whereClause,
 							  stmt->event,
 							  stmt->instead,
 							  stmt->replace,
 							  actions);
+
+	/* ... and dispatch if necessary */
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		copyStmt = copyObject(stmt);
+		copyStmt->actions = actions;
+		copyStmt->whereClause = whereClause;
+		CdbDispatchUtilityStatement((Node *) copyStmt,
+									DF_CANCEL_ON_ERROR |
+									DF_WITH_SNAPSHOT |
+									DF_NEED_TWO_PHASE,
+									GetAssignedOidsForDispatch(),
+									NULL);
+	}
+
+	return result;
 }
 
 
@@ -421,6 +449,12 @@ DefineQueryRewrite(char *rulename,
 			HeapScanDesc scanDesc;
 			Snapshot	snapshot;
 
+			/* In GPDB, also forbid turning AO tables or external tables into views. */
+			if (!RelationIsHeap(event_relation))
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("cannot convert non-heap table \"%s\" to a view",
+								RelationGetRelationName(event_relation))));
 			snapshot = RegisterSnapshot(GetLatestSnapshot());
 			scanDesc = heap_beginscan(event_relation, snapshot, 0, NULL);
 			if (heap_getnext(scanDesc, ForwardScanDirection) != NULL)
@@ -541,6 +575,8 @@ DefineQueryRewrite(char *rulename,
 		/* drop storage while table still looks like a table  */
 		RelationDropStorage(event_relation);
 		DeleteSystemAttributeTuples(event_relid);
+		/* delete distribution policy record */
+		GpPolicyRemove(event_relid);
 
 		/*
 		 * Drop the toast table if any.  (This won't take care of updating the
@@ -577,8 +613,8 @@ DefineQueryRewrite(char *rulename,
 
 		/*
 		 * Fix pg_class entry to look like a normal view's, including setting
-		 * the correct relkind and removal of reltoastrelid of the toast table
-		 * we potentially removed above.
+		 * the correct relkind/relstorage and removal of reltoastrelid of the
+		 * toast table we potentially removed above.
 		 */
 		classTup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(event_relid));
 		if (!HeapTupleIsValid(classTup))
@@ -592,6 +628,7 @@ DefineQueryRewrite(char *rulename,
 		classForm->reltoastrelid = InvalidOid;
 		classForm->relhasindex = false;
 		classForm->relkind = RELKIND_VIEW;
+		classForm->relstorage = RELSTORAGE_VIRTUAL;
 		classForm->relhasoids = false;
 		classForm->relhaspkey = false;
 		classForm->relfrozenxid = InvalidTransactionId;

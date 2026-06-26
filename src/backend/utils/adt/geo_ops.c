@@ -204,7 +204,9 @@ pair_decode(char *str, float8 *x, float8 *y, char **s)
 static int
 pair_encode(float8 x, float8 y, char *str)
 {
-	int			ndig = DBL_DIG + extra_float_digits;
+	// dummy assignment to bypass gcc bug on SPARC
+	volatile int ndig = (int) (x + y);
+	ndig = DBL_DIG + extra_float_digits;
 
 	if (ndig < 1)
 		ndig = 1;
@@ -1782,8 +1784,8 @@ point_in(PG_FUNCTION_ARGS)
 {
 	char	   *str = PG_GETARG_CSTRING(0);
 	Point	   *point;
-	double		x,
-				y;
+	double		x = 0,
+				y = 0;
 	char	   *s;
 
 	if (!pair_decode(str, &x, &y, &s) || (*s != '\0'))

@@ -19,6 +19,7 @@
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/objectaccess.h"
+#include "catalog/oid_dispatch.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_language.h"
 #include "catalog/pg_namespace.h"
@@ -40,6 +41,9 @@
 #include "utils/syscache.h"
 #include "utils/tqual.h"
 
+#include "cdb/cdbvars.h"
+#include "cdb/cdbdisp_query.h"
+
 
 typedef struct
 {
@@ -60,8 +64,8 @@ static PLTemplate *find_language_template(const char *languageName);
  * CREATE PROCEDURAL LANGUAGE
  * ---------------------------------------------------------------------
  */
-Oid
-CreateProceduralLanguage(CreatePLangStmt *stmt)
+static Oid
+CreateProceduralLanguage_internal(CreatePLangStmt *stmt)
 {
 	PLTemplate *pltemplate;
 	Oid			handlerOid,
@@ -82,8 +86,10 @@ CreateProceduralLanguage(CreatePLangStmt *stmt)
 		 * Give a notice if we are ignoring supplied parameters.
 		 */
 		if (stmt->plhandler)
-			ereport(NOTICE,
-					(errmsg("using pg_pltemplate information instead of CREATE LANGUAGE parameters")));
+			if (Gp_role != GP_ROLE_EXECUTE)
+				ereport(NOTICE,
+						(errmsg("using pg_pltemplate information instead of "
+								"CREATE LANGUAGE parameters")));
 
 		/*
 		 * Check permission
@@ -126,6 +132,7 @@ CreateProceduralLanguage(CreatePLangStmt *stmt)
 										 BOOTSTRAP_SUPERUSERID,
 										 ClanguageId,
 										 F_FMGR_C_VALIDATOR,
+										 InvalidOid, /* describeFuncOid */
 										 pltemplate->tmplhandler,
 										 pltemplate->tmpllibrary,
 										 false, /* isAgg */
@@ -141,7 +148,9 @@ CreateProceduralLanguage(CreatePLangStmt *stmt)
 										 NIL,
 										 PointerGetDatum(NULL),
 										 1,
-										 0);
+										 0,
+										 PRODATAACCESS_NONE,
+										 PROEXECLOCATION_ANY);
 		}
 
 		/*
@@ -163,6 +172,7 @@ CreateProceduralLanguage(CreatePLangStmt *stmt)
 											BOOTSTRAP_SUPERUSERID,
 											ClanguageId,
 											F_FMGR_C_VALIDATOR,
+											InvalidOid, /* describeFuncOid */
 											pltemplate->tmplinline,
 											pltemplate->tmpllibrary,
 											false,		/* isAgg */
@@ -178,7 +188,10 @@ CreateProceduralLanguage(CreatePLangStmt *stmt)
 											NIL,
 											PointerGetDatum(NULL),
 											1,
-											0);
+											0,
+											PRODATAACCESS_NONE,
+											PROEXECLOCATION_ANY);
+
 			}
 		}
 		else
@@ -203,6 +216,7 @@ CreateProceduralLanguage(CreatePLangStmt *stmt)
 										 BOOTSTRAP_SUPERUSERID,
 										 ClanguageId,
 										 F_FMGR_C_VALIDATOR,
+										 InvalidOid, /* describeFuncOid */
 										 pltemplate->tmplvalidator,
 										 pltemplate->tmpllibrary,
 										 false, /* isAgg */
@@ -218,7 +232,9 @@ CreateProceduralLanguage(CreatePLangStmt *stmt)
 										 NIL,
 										 PointerGetDatum(NULL),
 										 1,
-										 0);
+										 0,
+										 PRODATAACCESS_NONE,
+										 PROEXECLOCATION_ANY);
 			}
 		}
 		else
@@ -266,6 +282,7 @@ CreateProceduralLanguage(CreatePLangStmt *stmt)
 			 */
 			if (funcrettype == OPAQUEOID)
 			{
+				if (Gp_role != GP_ROLE_EXECUTE)
 				ereport(WARNING,
 						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 						 errmsg("changing return type of function %s from \"opaque\" to \"language_handler\"",
@@ -304,6 +321,26 @@ CreateProceduralLanguage(CreatePLangStmt *stmt)
 								handlerOid, inlineOid,
 								valOid, stmt->pltrusted);
 	}
+}
+
+Oid
+CreateProceduralLanguage(CreatePLangStmt *stmt)
+{
+	Oid			result;
+
+	result = CreateProceduralLanguage_internal(stmt);
+
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									GetAssignedOidsForDispatch(),
+									NULL);
+	}
+
+	return result;
 }
 
 /*
@@ -453,7 +490,7 @@ find_language_template(const char *languageName)
 	ScanKeyInit(&key,
 				Anum_pg_pltemplate_tmplname,
 				BTEqualStrategyNumber, F_NAMEEQ,
-				NameGetDatum(languageName));
+				CStringGetDatum(languageName));
 	scan = systable_beginscan(rel, PLTemplateNameIndexId, true,
 							  NULL, 1, &key);
 

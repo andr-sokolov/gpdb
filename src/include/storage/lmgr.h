@@ -43,6 +43,8 @@ extern void UnlockRelationId(LockRelId *relid, LOCKMODE lockmode);
 extern void UnlockRelationOid(Oid relid, LOCKMODE lockmode);
 
 extern void LockRelation(Relation relation, LOCKMODE lockmode);
+extern LockAcquireResult LockRelationNoWait(Relation relation, LOCKMODE lockmode);
+
 extern bool ConditionalLockRelation(Relation relation, LOCKMODE lockmode);
 extern void UnlockRelation(Relation relation, LOCKMODE lockmode);
 extern bool LockHasWaitersRelation(Relation relation, LOCKMODE lockmode);
@@ -53,6 +55,10 @@ extern void UnlockRelationIdForSession(LockRelId *relid, LOCKMODE lockmode);
 /* Lock a relation for extension */
 extern void LockRelationForExtension(Relation relation, LOCKMODE lockmode);
 extern void UnlockRelationForExtension(Relation relation, LOCKMODE lockmode);
+
+/* Lock a relation for Append-Only segment files. */
+extern LockAcquireResult LockRelationAppendOnlySegmentFile(RelFileNode *relFileNode, int32 segno, LOCKMODE lockmode, bool dontWait);
+extern void UnlockRelationAppendOnlySegmentFile(RelFileNode *relFileNode, int32 segno, LOCKMODE lockmode);
 
 /* Lock a page (currently only used within indexes) */
 extern void LockPage(Relation relation, BlockNumber blkno, LOCKMODE lockmode);
@@ -96,4 +102,11 @@ extern void UnlockSharedObjectForSession(Oid classid, Oid objid, uint16 objsubid
 /* Describe a locktag for error messages */
 extern void DescribeLockTag(StringInfo buf, const LOCKTAG *tag);
 
+/* Knowledge about which locktags describe temp objects */
+extern bool LockTagIsTemp(const LOCKTAG *tag);
+
+extern bool CondUpgradeRelLock(Oid relid);
+
+extern void GxactLockTableInsert(DistributedTransactionId xid);
+extern void GxactLockTableWait(DistributedTransactionId xid);
 #endif   /* LMGR_H */

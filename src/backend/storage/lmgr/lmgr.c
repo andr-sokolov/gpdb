@@ -22,7 +22,15 @@
 #include "miscadmin.h"
 #include "storage/lmgr.h"
 #include "storage/procarray.h"
+#include "storage/proc.h"
 #include "utils/inval.h"
+#include "utils/guc.h"
+#include "utils/memutils.h"
+
+#include "access/heapam.h"
+#include "catalog/namespace.h"
+#include "cdb/cdbvars.h"
+#include "utils/lsyscache.h"        /* CDB: get_rel_namespace() */
 
 
 /*
@@ -216,6 +224,35 @@ LockRelation(Relation relation, LOCKMODE lockmode)
 }
 
 /*
+ *		LockRelationNoWait
+ *
+ * Similar to LockReation, except that it is not waiting
+ * for the lock if it is not available.
+ *
+ */
+LockAcquireResult
+LockRelationNoWait(Relation relation, LOCKMODE lockmode)
+{
+	LOCKTAG		tag;
+	LockAcquireResult res;
+
+	SET_LOCKTAG_RELATION(tag,
+						 relation->rd_lockInfo.lockRelId.dbId,
+						 relation->rd_lockInfo.lockRelId.relId);
+
+	res = LockAcquire(&tag, lockmode, false, true);
+
+	/*
+	 * Now that we have the lock, check for invalidation messages; see notes
+	 * in LockRelationOid.
+	 */
+	if (res != LOCKACQUIRE_ALREADY_HELD)
+		AcceptInvalidationMessages();
+
+	return res;
+}
+
+/*
  *		ConditionalLockRelation
  *
  * This is a convenience routine for acquiring an additional lock on an
@@ -358,6 +395,33 @@ UnlockRelationForExtension(Relation relation, LOCKMODE lockmode)
 
 	LockRelease(&tag, lockmode, false);
 }
+
+LockAcquireResult
+LockRelationAppendOnlySegmentFile(RelFileNode *relFileNode, int32 segno, LOCKMODE lockmode, bool dontWait)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_RELATION_APPENDONLY_SEGMENT_FILE(tag,
+						 relFileNode->dbNode,
+						 relFileNode->relNode,
+						 segno);
+
+	return LockAcquire(&tag, lockmode, false, dontWait);
+}
+
+void
+UnlockRelationAppendOnlySegmentFile(RelFileNode *relFileNode, int32 segno, LOCKMODE lockmode)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_RELATION_APPENDONLY_SEGMENT_FILE(tag,
+						 relFileNode->dbNode,
+						 relFileNode->relNode,
+						 segno);
+
+	LockRelease(&tag, lockmode, false);
+}
+
 
 /*
  *		LockPage
@@ -529,6 +593,30 @@ XactLockTableWait(TransactionId xid, Relation rel, ItemPointer ctid,
 	bool		first = true;
 
 	/*
+	 * Concurrent update and delete will wait on segment when GDD is enabled (or
+	 * the corner case that utility mode delete|update in segment which does not
+	 * hold gxid), need to report the waited transactions to QD to make sure the
+	 * they have the same transaction order on the master.
+	 */
+	if (Gp_role == GP_ROLE_EXECUTE)
+	{
+		MemoryContext oldContext;
+		DistributedTransactionId gxid = LocalXidGetDistributedXid(xid);
+
+		if (gxid != InvalidDistributedTransactionId)
+		{
+			/*
+			 * allocate waitGxids in TopMemoryContext since it's used in
+			 * 'commit prepared' and the TopTransactionContext has been delete
+			 * after 'prepare'
+			 */
+			oldContext = MemoryContextSwitchTo(TopMemoryContext);
+			MyTmGxactLocal->waitGxids = lappend_int(MyTmGxactLocal->waitGxids, gxid);
+			MemoryContextSwitchTo(oldContext);
+		}
+	}
+
+	/*
 	 * If an operation is specified, set up our verbose error context
 	 * callback.
 	 */
@@ -584,6 +672,45 @@ XactLockTableWait(TransactionId xid, Relation rel, ItemPointer ctid,
 
 	if (oper != XLTW_None)
 		error_context_stack = callback.previous;
+}
+
+/*
+ *		GxactLockTableInsert
+ *
+ * CDB: a copy of XactLockTableInsert
+ * Insert a lock showing that the given distributed transaction ID is running
+ */
+void
+GxactLockTableInsert(DistributedTransactionId gxid)
+{
+	LOCKTAG		tag;
+
+	Assert(Gp_role == GP_ROLE_DISPATCH);
+
+	SET_LOCKTAG_DISTRIB_TRANSACTION(tag, gxid);
+
+	(void) LockAcquire(&tag, ExclusiveLock, false, false);
+}
+
+/*
+ *		GxactLockTableWait
+ *
+ * CDB: a copy of XactLockTableWait, no need to take care of sub-transaction.
+ * Wait for the specified distributed transaction to commit or abort.
+ */
+void
+GxactLockTableWait(DistributedTransactionId gxid)
+{
+	LOCKTAG		tag;
+
+	Assert(gxid != InvalidDistributedTransactionId);
+	Assert(Gp_role == GP_ROLE_DISPATCH);
+
+	SET_LOCKTAG_DISTRIB_TRANSACTION(tag, gxid);
+
+	(void) LockAcquire(&tag, ShareLock, false, false);
+
+	LockRelease(&tag, ShareLock, false);
 }
 
 /*
@@ -910,9 +1037,26 @@ DescribeLockTag(StringInfo buf, const LOCKTAG *tag)
 							 tag->locktag_field2,
 							 tag->locktag_field1);
 			break;
+		case LOCKTAG_RELATION_APPENDONLY_SEGMENT_FILE:
+			appendStringInfo(buf,
+							 _("segment file %u of appendonly relation %u of database %u"),
+							 tag->locktag_field3,
+							 tag->locktag_field2,
+							 tag->locktag_field1);
+			break;
+		case LOCKTAG_RESOURCE_QUEUE:
+			appendStringInfo(buf,
+							 _("resource queue %u"),
+							 tag->locktag_field1);
+			break;
 		case LOCKTAG_TRANSACTION:
 			appendStringInfo(buf,
 							 _("transaction %u"),
+							 tag->locktag_field1);
+			break;
+		case LOCKTAG_DISTRIB_TRANSACTION:
+			appendStringInfo(buf,
+							 _("distributed transaction %u"),
 							 tag->locktag_field1);
 			break;
 		case LOCKTAG_VIRTUALTRANSACTION:
@@ -950,4 +1094,74 @@ DescribeLockTag(StringInfo buf, const LOCKTAG *tag)
 							 (int) tag->locktag_type);
 			break;
 	}
+}
+
+/*
+ * LockTagIsTemp
+ *		Determine whether a locktag is for a lock on a temporary object
+ *
+ * In PostgreSQL, 2PC cannot deal with temporary objects. Commit
+ * f3032cbe377ecc570989e1bd2fe1aea455c12cc3 replace this method with global
+ * variable MyXactAccessedTempRel, so it's no longer needed.
+ *
+ * However, GPDB supports 2PC with temporary objects. Hence, it still relies
+ * on this method to check certain LOCKTAG is on temporary object or not, so
+ * that GPDB can skip the lock information in `TwoPhaseRecordOnDisk` for the
+ * temporary objects. That's to prevent replay redundant lock acquiring and
+ * releasing during `xact_redo()` on non-existent temporary objects.
+ */
+bool
+LockTagIsTemp(const LOCKTAG *tag)
+{
+	switch (tag->locktag_type)
+	{
+		case LOCKTAG_RELATION:
+		case LOCKTAG_RELATION_EXTEND:
+		case LOCKTAG_PAGE:
+		case LOCKTAG_TUPLE:
+		case LOCKTAG_RELATION_APPENDONLY_SEGMENT_FILE:
+			/* check for lock on a temp relation */
+			/* field1 is dboid, field2 is reloid for all of these */
+			if ((Oid) tag->locktag_field1 == InvalidOid)
+				return false;	/* shared, so not temp */
+			if (isTempNamespace(get_rel_namespace((Oid) tag->locktag_field2)))
+				return true;
+			break;
+		case LOCKTAG_TRANSACTION:
+			/* there are no temp transactions */
+			break;
+		case LOCKTAG_OBJECT:
+			/* there are currently no non-table temp objects */
+			break;
+		case LOCKTAG_USERLOCK:
+		case LOCKTAG_ADVISORY:
+			/* assume these aren't temp */
+			break;
+	}
+	return false;				/* default case */
+}
+
+/*
+ * Because of the current disign of AO table's visibility map,
+ * we have to keep upgrading locks for AO table.
+ */
+bool
+CondUpgradeRelLock(Oid relid)
+{
+	Relation rel;
+	bool upgrade = false;
+
+	if (!gp_enable_global_deadlock_detector)
+		return true;
+
+	rel = try_relation_open(relid, NoLock, false);
+
+	if (!rel)
+		return false;
+
+	upgrade = false;
+
+	relation_close(rel, NoLock);
+
+	return upgrade;
 }

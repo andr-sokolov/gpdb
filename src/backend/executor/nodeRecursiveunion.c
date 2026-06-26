@@ -246,7 +246,7 @@ ExecInitRecursiveUnion(RecursiveUnion *node, EState *estate, int eflags)
 	 * initialize child nodes
 	 */
 	outerPlanState(rustate) = ExecInitNode(outerPlan(node), estate, eflags);
-	innerPlanState(rustate) = ExecInitNode(innerPlan(node), estate, eflags);
+	innerPlanState(rustate) = ExecInitNode(innerPlan(node), estate, eflags | EXEC_FLAG_REWIND);
 
 	/*
 	 * If hashing, precompute fmgr lookup data for inner loop, and create the
@@ -274,8 +274,10 @@ void
 ExecEndRecursiveUnion(RecursiveUnionState *node)
 {
 	/* Release tuplestores */
-	tuplestore_end(node->working_table);
-	tuplestore_end(node->intermediate_table);
+	if (node->working_table != NULL)
+		tuplestore_end(node->working_table);
+	if (node->intermediate_table != NULL)
+		tuplestore_end(node->intermediate_table);
 
 	/* free subsidiary stuff including hashtable */
 	if (node->tempContext)
@@ -335,4 +337,14 @@ ExecReScanRecursiveUnion(RecursiveUnionState *node)
 	node->intermediate_empty = true;
 	tuplestore_clear(node->working_table);
 	tuplestore_clear(node->intermediate_table);
+}
+
+void
+ExecSquelchRecursiveUnion(RecursiveUnionState *node)
+{
+	tuplestore_clear(node->working_table);
+	tuplestore_clear(node->intermediate_table);
+
+	ExecSquelchNode(outerPlanState(node));
+	ExecSquelchNode(innerPlanState(node));
 }

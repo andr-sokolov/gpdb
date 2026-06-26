@@ -69,6 +69,7 @@ typedef enum DependencyType
 	DEPENDENCY_NORMAL = 'n',
 	DEPENDENCY_AUTO = 'a',
 	DEPENDENCY_INTERNAL = 'i',
+	DEPENDENCY_INTERNAL_AUTO = 'I',
 	DEPENDENCY_EXTENSION = 'e',
 	DEPENDENCY_PIN = 'p'
 } DependencyType;
@@ -257,5 +258,9 @@ extern void dropDatabaseDependencies(Oid databaseId);
 extern void shdepDropOwned(List *relids, DropBehavior behavior);
 
 extern void shdepReassignOwned(List *relids, Oid newrole);
+
+extern void checkDependencies(const ObjectAddresses *objects,
+							  const char *msg,
+							  const char *hint);
 
 #endif   /* DEPENDENCY_H */

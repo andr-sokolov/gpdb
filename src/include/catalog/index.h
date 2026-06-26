@@ -14,18 +14,22 @@
 #ifndef INDEX_H
 #define INDEX_H
 
+#include "access/relscan.h"     /* Relation, Snapshot */
+#include "catalog/objectaddress.h"
+#include "executor/tuptable.h"  /* TupTableSlot */
 #include "nodes/execnodes.h"
 
+struct EState;                  /* #include "nodes/execnodes.h" */
 
 #define DEFAULT_INDEX_TYPE	"btree"
 
-/* Typedef for callback function for IndexBuildHeapScan */
+/* Typedef for callback function for IndexBuildScan */
 typedef void (*IndexBuildCallback) (Relation index,
-												HeapTuple htup,
-												Datum *values,
-												bool *isnull,
-												bool tupleIsAlive,
-												void *state);
+									ItemPointer tupleId,
+									Datum *values,
+									bool *isnull,
+									bool tupleIsAlive,
+									void *state);
 
 /* Action code for index_set_state_flags */
 typedef enum
@@ -37,6 +41,9 @@ typedef enum
 } IndexStateFlagsAction;
 
 
+
+extern bool relationHasPrimaryKey(Relation rel);
+extern bool relationHasUniqueIndex(Relation rel);
 extern void index_check_primary_key(Relation heapRel,
 						IndexInfo *indexInfo,
 						bool is_alter_table);
@@ -44,6 +51,8 @@ extern void index_check_primary_key(Relation heapRel,
 extern Oid index_create(Relation heapRelation,
 			 const char *indexRelationName,
 			 Oid indexRelationId,
+			 Oid parentIndexRelid,
+			 Oid parentConstraintId,
 			 Oid relFileNode,
 			 IndexInfo *indexInfo,
 			 List *indexColNames,
@@ -60,10 +69,12 @@ extern Oid index_create(Relation heapRelation,
 			 bool allow_system_table_mods,
 			 bool skip_build,
 			 bool concurrent,
-			 bool is_internal);
+			 bool is_internal,
+			 Oid *constraintId);
 
-extern void index_constraint_create(Relation heapRelation,
+extern ObjectAddress index_constraint_create(Relation heapRelation,
 						Oid indexRelationId,
+						Oid parentConstraintId,
 						IndexInfo *indexInfo,
 						const char *constraintName,
 						char constraintType,
@@ -81,11 +92,19 @@ extern IndexInfo *BuildIndexInfo(Relation index);
 
 extern IndexInfo *BuildDummyIndexInfo(Relation index);
 
+extern bool CompareIndexInfo(IndexInfo *info1, IndexInfo *info2,
+				 Oid *collations1, Oid *collations2,
+				 Oid *opfamilies1, Oid *opfamilies2,
+				 AttrNumber *attmap, int maplen);
+
 extern void FormIndexDatum(IndexInfo *indexInfo,
 			   TupleTableSlot *slot,
-			   EState *estate,
+			   struct EState *estate,
 			   Datum *values,
 			   bool *isnull);
+
+extern Oid setNewRelfilenodeToOid(Relation relation, TransactionId freezeXid,
+					   Oid newrelfilenode);
 
 extern void index_build(Relation heapRelation,
 			Relation indexRelation,
@@ -93,12 +112,12 @@ extern void index_build(Relation heapRelation,
 			bool isprimary,
 			bool isreindex);
 
-extern double IndexBuildHeapScan(Relation heapRelation,
-				   Relation indexRelation,
-				   IndexInfo *indexInfo,
-				   bool allow_sync,
-				   IndexBuildCallback callback,
-				   void *callback_state);
+extern double IndexBuildScan(Relation parentRelation,
+					Relation indexRelation,
+					IndexInfo *indexInfo,
+					bool allow_sync,
+					IndexBuildCallback callback,
+					void *callback_state);
 
 extern void validate_index(Oid heapId, Oid indexId, Snapshot snapshot);
 
@@ -116,5 +135,7 @@ extern bool reindex_relation(Oid relid, int flags);
 extern bool ReindexIsProcessingHeap(Oid heapOid);
 extern bool ReindexIsProcessingIndex(Oid indexOid);
 extern Oid	IndexGetRelation(Oid indexId, bool missing_ok);
+
+extern void IndexSetParentIndex(Relation idx, Oid parentOid);
 
 #endif   /* INDEX_H */

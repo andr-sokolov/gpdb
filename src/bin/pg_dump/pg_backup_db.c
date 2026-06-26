@@ -30,7 +30,7 @@ static const char *modulename = gettext_noop("archiver (db)");
 
 static void _check_database_version(ArchiveHandle *AH);
 static PGconn *_connectDB(ArchiveHandle *AH, const char *newdbname, const char *newUser);
-static void notice_processor(void *arg, const char *message);
+static void notice_processor(void *arg __attribute__((unused)), const char *message);
 
 static void
 _check_database_version(ArchiveHandle *AH)
@@ -152,8 +152,8 @@ _connectDB(ArchiveHandle *AH, const char *reqdb, const char *requser)
 
 	do
 	{
-		const char *keywords[7];
-		const char *values[7];
+		const char *keywords[8];
+		const char *values[8];
 
 		keywords[0] = "host";
 		values[0] = PQhost(AH->connection);
@@ -242,7 +242,8 @@ ConnectDatabase(Archive *AHX,
 				const char *pghost,
 				const char *pgport,
 				const char *username,
-				enum trivalue prompt_password)
+				enum trivalue prompt_password,
+				bool binary_upgrade)
 {
 	ArchiveHandle *AH = (ArchiveHandle *) AHX;
 	char	   *password;
@@ -267,8 +268,8 @@ ConnectDatabase(Archive *AHX,
 	 */
 	do
 	{
-		const char *keywords[7];
-		const char *values[7];
+		const char *keywords[8];
+		const char *values[8];
 
 		keywords[0] = "host";
 		values[0] = pghost;
@@ -282,8 +283,18 @@ ConnectDatabase(Archive *AHX,
 		values[4] = dbname;
 		keywords[5] = "fallback_application_name";
 		values[5] = progname;
-		keywords[6] = NULL;
-		values[6] = NULL;
+		if (binary_upgrade)
+		{
+			keywords[6] = "options";
+			values[6] = "-c gp_session_role=utility";
+			keywords[7] = NULL;
+			values[7] = NULL;
+		}
+		else
+		{
+			keywords[6] = NULL;
+			values[6] = NULL;
+		}
 
 		new_pass = false;
 		AH->connection = PQconnectdbParams(keywords, values, true);
@@ -379,7 +390,7 @@ GetConnection(Archive *AHX)
 }
 
 static void
-notice_processor(void *arg, const char *message)
+notice_processor(void *arg __attribute__((unused)), const char *message)
 {
 	write_msg(NULL, "%s", message);
 }

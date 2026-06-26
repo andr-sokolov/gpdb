@@ -44,6 +44,13 @@ extern int	postmaster_alive_fds[2];
 #define POSTMASTER_FD_OWN		1		/* kept open by postmaster only */
 #endif
 
+#define POSTMASTER_IN_STARTUP_MSG "the database system is starting up"
+#define POSTMASTER_IN_RECOVERY_MSG "the database system is in recovery mode"
+#define POSTMASTER_IN_RECOVERY_DETAIL_MSG "last replayed record at"
+/* gpstate must be updated if this message changes */
+#define POSTMASTER_MIRROR_VERSION_DETAIL_MSG "- VERSION:"
+
+extern const char *progname;
 extern PGDLLIMPORT const char *progname;
 
 extern void PostmasterMain(int argc, char *argv[]) __attribute__((noreturn));
@@ -54,6 +61,8 @@ extern int	MaxLivePostmasterChildren(void);
 extern int	GetNumShmemAttachedBgworkers(void);
 extern bool PostmasterMarkPIDForWorkerNotify(int);
 
+extern void ResetMirrorReadyFlag(void);
+
 #ifdef EXEC_BACKEND
 extern pid_t postmaster_forkexec(int argc, char *argv[]);
 extern void SubPostmasterMain(int argc, char *argv[]) __attribute__((noreturn));
@@ -61,6 +70,16 @@ extern void SubPostmasterMain(int argc, char *argv[]) __attribute__((noreturn));
 extern Size ShmemBackendArraySize(void);
 extern void ShmemBackendArrayAllocation(void);
 #endif
+
+extern void load_auxiliary_libraries(void);
+extern bool amAuxiliaryBgWorker(void);
+extern bool IsUnderMasterDispatchMode(void);
+
+#ifdef ENABLE_IC_PROXY
+# define IC_PROXY_NUM_BGWORKER 1
+#else  /* ENABLE_IC_PROXY */
+# define IC_PROXY_NUM_BGWORKER 0
+#endif  /* ENABLE_IC_PROXY */
 
 /*
  * Note: MAX_BACKENDS is limited to 2^23-1 because inval.c stores the
@@ -70,5 +89,6 @@ extern void ShmemBackendArrayAllocation(void);
  * GUC check hooks and in RegisterBackgroundWorker().
  */
 #define MAX_BACKENDS	0x7fffff
+#define MaxPMAuxProc	(6 + IC_PROXY_NUM_BGWORKER)
 
 #endif   /* _POSTMASTER_H */

@@ -229,7 +229,13 @@ StrategyGetBuffer(BufferAccessStrategy strategy, bool *lock_held)
 			 * infinite loop.
 			 */
 			UnlockBufHdr(buf);
-			elog(ERROR, "no unpinned buffers available");
+            ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_RESOURCES),
+                            errmsg("Unable to allocate database I/O buffer; "
+                                   "no unpinned buffers available.  "
+                                   "(shared_buffers=%d)", NBuffers),
+                            errhint("The shared_buffers setting may need to "
+                                    "be increased.")
+                            ));
 		}
 		UnlockBufHdr(buf);
 	}

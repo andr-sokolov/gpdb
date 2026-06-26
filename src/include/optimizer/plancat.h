@@ -31,6 +31,14 @@ extern void get_relation_info(PlannerInfo *root, Oid relationObjectId,
 extern void estimate_rel_size(Relation rel, int32 *attr_widths,
 				  BlockNumber *pages, double *tuples, double *allvisfrac);
 
+extern void cdb_estimate_rel_size(RelOptInfo   *relOptInfo,
+							  Relation      rel,
+							  int32        *attr_widths,
+							  BlockNumber  *pages,
+							  double       *tuples,
+							  double       *allvisfrac);
+extern double cdb_estimate_partitioned_numtuples(Relation rel);
+
 extern int32 get_relation_data_width(Oid relid, int32 *attr_widths);
 
 extern bool relation_excluded_by_constraints(PlannerInfo *root,
@@ -52,5 +60,10 @@ extern Selectivity join_selectivity(PlannerInfo *root,
 				 Oid inputcollid,
 				 JoinType jointype,
 				 SpecialJoinInfo *sjinfo);
+
+extern void cdb_default_stats_warning_for_table(Oid reloid);
+
+#define DEFAULT_EXTERNAL_TABLE_PAGES 1000
+#define DEFAULT_INTERNAL_TABLE_PAGES 100
 
 #endif   /* PLANCAT_H */

@@ -16,17 +16,22 @@
 
 #include "access/xact.h"
 #include "catalog/catalog.h"
+#include "storage/dbdirnode.h"
 #include "storage/sinval.h"
 #include "utils/timestamp.h"
 
 
-static void
+static char*
 xact_desc_commit(StringInfo buf, xl_xact_commit *xlrec)
 {
 	int			i;
 	TransactionId *subxacts;
+	SharedInvalidationMessage *msgs;
+	DbDirNode *deldbs;
 
 	subxacts = (TransactionId *) &xlrec->xnodes[xlrec->nrels];
+	msgs = (SharedInvalidationMessage *) &subxacts[xlrec->nsubxacts];
+	deldbs = (DbDirNode *) &(msgs[xlrec->nmsgs]);
 
 	appendStringInfoString(buf, timestamptz_to_str(xlrec->xact_time));
 
@@ -35,7 +40,11 @@ xact_desc_commit(StringInfo buf, xl_xact_commit *xlrec)
 		appendStringInfoString(buf, "; rels:");
 		for (i = 0; i < xlrec->nrels; i++)
 		{
-			char	   *path = relpathperm(xlrec->xnodes[i], MAIN_FORKNUM);
+			BackendId  backendId = xlrec-> xnodes[i].isTempRelation ?
+								  TempRelBackendId : InvalidBackendId;
+			char	   *path = relpathbackend(xlrec->xnodes[i].node,
+											  backendId,
+											  MAIN_FORKNUM);
 
 			appendStringInfo(buf, " %s", path);
 			pfree(path);
@@ -49,10 +58,6 @@ xact_desc_commit(StringInfo buf, xl_xact_commit *xlrec)
 	}
 	if (xlrec->nmsgs > 0)
 	{
-		SharedInvalidationMessage *msgs;
-
-		msgs = (SharedInvalidationMessage *) &subxacts[xlrec->nsubxacts];
-
 		if (XactCompletionRelcacheInitFileInval(xlrec->xinfo))
 			appendStringInfo(buf, "; relcache init file inval dbid %u tsid %u",
 							 xlrec->dbId, xlrec->tsId);
@@ -80,6 +85,47 @@ xact_desc_commit(StringInfo buf, xl_xact_commit *xlrec)
 				appendStringInfo(buf, " unknown id %d", msg->id);
 		}
 	}
+	if (xlrec->distribTimeStamp != 0 || xlrec->distribXid != InvalidDistributedTransactionId)
+		appendStringInfo(buf, " gid = %u-%.10u", xlrec->distribTimeStamp, xlrec->distribXid);
+	if (xlrec->ndeldbs > 0)
+	{
+		appendStringInfoString(buf, "; deldbs:");
+		for (i = 0; i < xlrec->ndeldbs; i++)
+		{
+			char *path =
+					 GetDatabasePath(deldbs[i].database, deldbs[i].tablespace);
+
+			appendStringInfo(buf, " %s", path);
+			pfree(path);
+		}
+	}
+
+	/*
+-	 * MPP: Return end of regular commit information.
+	 */
+	return (char *) &deldbs[xlrec->ndeldbs];
+}
+
+static void
+xact_desc_distributed_commit(StringInfo buf, xl_xact_commit *xlrec)
+{
+	TMGXACT_LOG *gxact_log;
+
+	/*
+	 * We put the global transaction information last, so call the regular xact
+	 * commit routine.
+	 */
+	gxact_log = (TMGXACT_LOG *) xact_desc_commit(buf, xlrec);
+
+	appendStringInfo(buf, " gid = %s, gxid = %u",
+					 gxact_log->gid, gxact_log->gxid);
+}
+
+static void
+xact_desc_distributed_forget(StringInfo buf, xl_xact_distributed_forget *xlrec)
+{
+	appendStringInfo(buf, " gid = %s, gxid = %u",
+					 xlrec->gxact_log.gid, xlrec->gxact_log.gxid);
 }
 
 static void
@@ -100,7 +146,12 @@ xact_desc_commit_compact(StringInfo buf, xl_xact_commit_compact *xlrec)
 static void
 xact_desc_abort(StringInfo buf, xl_xact_abort *xlrec)
 {
-	int			i;
+	int				i;
+	TransactionId	*xacts;
+	DbDirNode		*deldbs;
+
+	xacts = (TransactionId *) &xlrec->xnodes[xlrec->nrels];
+	deldbs = (DbDirNode *) &(xacts[xlrec->nsubxacts]);
 
 	appendStringInfoString(buf, timestamptz_to_str(xlrec->xact_time));
 	if (xlrec->nrels > 0)
@@ -108,7 +159,11 @@ xact_desc_abort(StringInfo buf, xl_xact_abort *xlrec)
 		appendStringInfoString(buf, "; rels:");
 		for (i = 0; i < xlrec->nrels; i++)
 		{
-			char	   *path = relpathperm(xlrec->xnodes[i], MAIN_FORKNUM);
+			BackendId  backendId = xlrec-> xnodes[i].isTempRelation ?
+								  TempRelBackendId : InvalidBackendId;
+			char	   *path = relpathbackend(xlrec->xnodes[i].node,
+											  backendId,
+											  MAIN_FORKNUM);
 
 			appendStringInfo(buf, " %s", path);
 			pfree(path);
@@ -116,12 +171,21 @@ xact_desc_abort(StringInfo buf, xl_xact_abort *xlrec)
 	}
 	if (xlrec->nsubxacts > 0)
 	{
-		TransactionId *xacts = (TransactionId *)
-		&xlrec->xnodes[xlrec->nrels];
-
 		appendStringInfoString(buf, "; subxacts:");
 		for (i = 0; i < xlrec->nsubxacts; i++)
 			appendStringInfo(buf, " %u", xacts[i]);
+	}
+	if (xlrec->ndeldbs > 0)
+	{
+		appendStringInfoString(buf, "; deldbs:");
+		for (i = 0; i < xlrec->ndeldbs; i++)
+		{
+			char *path =
+					 GetDatabasePath(deldbs[i].database, deldbs[i].tablespace);
+
+			appendStringInfo(buf, " %s", path);
+			pfree(path);
+		}
 	}
 }
 
@@ -137,9 +201,10 @@ xact_desc_assignment(StringInfo buf, xl_xact_assignment *xlrec)
 }
 
 void
-xact_desc(StringInfo buf, uint8 xl_info, char *rec)
+xact_desc(StringInfo buf, XLogRecord *record)
 {
-	uint8		info = xl_info & ~XLR_INFO_MASK;
+	uint8		info = record->xl_info & ~XLR_INFO_MASK;
+	char		*rec = XLogRecGetData(record);
 
 	if (info == XLOG_XACT_COMMIT_COMPACT)
 	{
@@ -172,6 +237,9 @@ xact_desc(StringInfo buf, uint8 xl_info, char *rec)
 
 		appendStringInfo(buf, "commit prepared %u: ", xlrec->xid);
 		xact_desc_commit(buf, &xlrec->crec);
+
+		appendStringInfo(buf, " gid = %u-%.10u", xlrec->distribTimeStamp, xlrec->distribXid);
+		appendStringInfo(buf, " gxid = %u", xlrec->distribXid);
 	}
 	else if (info == XLOG_XACT_ABORT_PREPARED)
 	{
@@ -191,6 +259,20 @@ xact_desc(StringInfo buf, uint8 xl_info, char *rec)
 		 */
 		appendStringInfo(buf, "xid assignment xtop %u: ", xlrec->xtop);
 		xact_desc_assignment(buf, xlrec);
+	}
+	else if (info == XLOG_XACT_DISTRIBUTED_COMMIT)
+	{
+		xl_xact_commit *xlrec = (xl_xact_commit *) rec;
+
+		appendStringInfo(buf, "distributed commit ");
+		xact_desc_distributed_commit(buf, xlrec);
+	}
+	else if (info == XLOG_XACT_DISTRIBUTED_FORGET)
+	{
+		xl_xact_distributed_forget *xlrec = (xl_xact_distributed_forget *) rec;
+
+		appendStringInfo(buf, "distributed forget ");
+		xact_desc_distributed_forget(buf, xlrec);
 	}
 	else
 		appendStringInfoString(buf, "UNKNOWN");

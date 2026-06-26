@@ -53,6 +53,7 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlog_internal.h"
+#include "access/xlogutils.h"
 
 #include "catalog/pg_type.h"
 #include "commands/dbcommands.h"
@@ -85,6 +86,10 @@
 #include "utils/resowner.h"
 #include "utils/timeout.h"
 #include "utils/timestamp.h"
+#include "utils/faultinjector.h"
+
+#include "cdb/cdbvars.h"
+#include "replication/gp_replication.h"
 
 /*
  * Maximum data payload in a WAL data message.  Must be >= XLOG_BLCKSZ.
@@ -113,6 +118,11 @@ bool		am_db_walsender = false;	/* Connected to a database? */
 int			max_wal_senders = 0;	/* the maximum number of concurrent walsenders */
 int			wal_sender_timeout = 60 * 1000;		/* maximum time to send one
 												 * WAL data message */
+// GPDB_93_MERGE_FIXME: This was XLogSegsPerFile. But I don't understand why.
+// What was so special about crossing the xlogid boundary? I kept the old
+// value, and maybe it's a suitable one, but it should probably be just a
+// constant like '64' or something.
+int			repl_catchup_within_range = ((uint32) 0xffffffff) / XLogSegSize;
 
 /*
  * State for WalSndWakeupRequest
@@ -175,6 +185,8 @@ static bool streamingDoneReceiving;
 
 /* Are we there yet? */
 static bool WalSndCaughtUp = false;
+static bool WalSndCaughtUpWithinRange = false;
+
 
 /* Flags set by signal handlers for later service in main loop */
 static volatile sig_atomic_t got_SIGUSR2 = false;
@@ -213,6 +225,7 @@ static void ProcessStandbyMessage(void);
 static void ProcessStandbyReplyMessage(void);
 static void ProcessStandbyHSFeedbackMessage(void);
 static void ProcessRepliesIfAny(void);
+static const char *WalSndGetStateString(WalSndState state);
 static void WalSndKeepalive(bool requestReply);
 static void WalSndKeepaliveIfNecessary(void);
 static void WalSndCheckTimeOut(void);
@@ -222,6 +235,9 @@ static void WalSndWriteData(LogicalDecodingContext *ctx, XLogRecPtr lsn, Transac
 static XLogRecPtr WalSndWaitForWal(XLogRecPtr loc);
 
 static void XLogRead(char *buf, XLogRecPtr startptr, Size count);
+
+static void WalSndSetCaughtupWithinRange(bool catchup_within_range);
+static bool WalSndIsCatchupWithinRange(XLogRecPtr currRecPtr, XLogRecPtr catchupRecPtr);
 
 
 /* Initialize walsender process before entering the main command loop */
@@ -235,6 +251,8 @@ InitWalSender(void)
 
 	/* Set up resource owner */
 	CurrentResourceOwner = ResourceOwnerCreate(NULL, "walsender top-level resource owner");
+
+	SIMPLE_FAULT_INJECTOR("initialize_wal_sender");
 
 	/*
 	 * Let postmaster know that we're a WAL sender. Once we've declared us as
@@ -329,6 +347,13 @@ IdentifySystem(void)
 	snprintf(tli, sizeof(tli), "%u", ThisTimeLineID);
 
 	snprintf(xpos, sizeof(xpos), "%X/%X", (uint32) (logptr >> 32), (uint32) logptr);
+
+	elogif(debug_walrepl_snd, LOG,
+			"walsnd identifysystem -- "
+			"SysId = %s, "
+			"ThisTimelineID = %s, "
+			"XLog InsertRecPtr = %s will be sent.",
+			sysid, tli, xpos);
 
 	if (MyDatabaseId != InvalidOid)
 	{
@@ -524,6 +549,13 @@ StartReplication(StartReplicationCmd *cmd)
 	XLogRecPtr	FlushPtr;
 
 	/*
+	 * Create FTSReplicationStatus for current application if not created before.
+	 * This is only called for GPDB primary-mirror replication.
+	 */
+	if (MyWalSnd->is_for_gp_walreceiver)
+		FTSReplicationStatusCreateIfNotExist(application_name);
+
+	/*
 	 * We assume here that we're logging enough information in the WAL for
 	 * log-shipping, since this is checked in PostmasterMain().
 	 *
@@ -539,6 +571,7 @@ StartReplication(StartReplicationCmd *cmd)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 (errmsg("cannot use a logical replication slot for physical replication"))));
+		MyReplicationSlot->walsnd = MyWalSnd;
 	}
 
 	/*
@@ -762,6 +795,12 @@ logical_read_xlog_page(XLogReaderState *state, XLogRecPtr targetPagePtr, int req
 	XLogRecPtr	flushptr;
 	int			count;
 
+	XLogReadDetermineTimeline(state, targetPagePtr, reqLen);
+	sendTimeLineIsHistoric = (state->currTLI != ThisTimeLineID);
+	sendTimeLine = state->currTLI;
+	sendTimeLineValidUpto = state->currTLIValidUntil;
+	sendTimeLineNextTLI = state->nextTLI;
+
 	/* make sure we have enough WAL available */
 	flushptr = WalSndWaitForWal(targetPagePtr + reqLen);
 
@@ -978,10 +1017,6 @@ StartLogicalReplication(StartReplicationCmd *cmd)
 	pq_sendint(&buf, 0, 2);
 	pq_endmessage(&buf);
 	pq_flush();
-
-	/* setup state for XLogReadPage */
-	sendTimeLineIsHistoric = false;
-	sendTimeLine = ThisTimeLineID;
 
 	/*
 	 * Initialize position to the last ack'ed one, then the xlog records begin
@@ -1494,6 +1529,10 @@ ProcessRepliesIfAny(void)
 				 * 'X' means that the standby is closing down the socket.
 				 */
 			case 'X':
+				elogif(debug_walrepl_snd, LOG,
+						"walsnd processreply -- "
+						"Received 'X' as first character in reply from standby. "
+						"Standby is closing down the socket, hence exiting.");
 				proc_exit(0);
 
 			default:
@@ -1621,6 +1660,13 @@ ProcessStandbyReplyMessage(void)
 		walsnd->apply = applyPtr;
 		SpinLockRelease(&walsnd->mutex);
 	}
+
+	/*
+	 * Set xlogCleanUpTo to flush point so that the old
+	 * xlog seg files can be cleaned up-to this point
+	 * Refer to the description of xlogCleanUpTo
+	 */
+	WalSndSetXLogCleanUpTo(flushPtr);
 
 	if (!am_cascading_walsender)
 		SyncRepReleaseWaiters();
@@ -1858,6 +1904,8 @@ WalSndLoop(WalSndSendDataCallback send_data)
 	 */
 	for (;;)
 	{
+		SIMPLE_FAULT_INJECTOR("wal_sender_loop");
+
 		/*
 		 * Emergency bailout if postmaster has died.  This is to avoid the
 		 * necessity for manual cleanup of all postmaster children.
@@ -1901,9 +1949,20 @@ WalSndLoop(WalSndSendDataCallback send_data)
 		else
 			WalSndCaughtUp = false;
 
+		/*
+		 * Set caught up within range if not already done. Once we catch
+		 * up within range we never go back.
+		 */
+		if (!MyWalSnd->caughtup_within_range && WalSndCaughtUpWithinRange)
+			WalSndSetCaughtupWithinRange(true);
+
+		Assert(!WalSndCaughtUp || WalSndCaughtUpWithinRange);
+
 		/* Try to flush pending output to the client */
 		if (pq_flush_if_writable() != 0)
 			WalSndShutdown();
+
+		SIMPLE_FAULT_INJECTOR("wal_sender_after_caughtup_within_range");
 
 		/* If nothing remains to be sent right now ... */
 		if (WalSndCaughtUp && !pq_is_send_pending())
@@ -2017,10 +2076,15 @@ InitWalSenderSlot(void)
 			walsnd->flush = InvalidXLogRecPtr;
 			walsnd->apply = InvalidXLogRecPtr;
 			walsnd->state = WALSNDSTATE_STARTUP;
+			/* Will be decided in hand-shake */
+			walsnd->xlogCleanUpTo = InvalidXLogRecPtr;
+			walsnd->caughtup_within_range = false;
 			SpinLockRelease(&walsnd->mutex);
 			/* don't need the lock anymore */
 			OwnLatch((Latch *) &walsnd->latch);
 			MyWalSnd = (WalSnd *) walsnd;
+			walsnd->is_for_gp_walreceiver =
+				(strcmp(application_name, GP_WALRECEIVER_APPNAME) == 0);
 
 			break;
 		}
@@ -2044,6 +2108,43 @@ WalSndKill(int code, Datum arg)
 
 	Assert(walsnd != NULL);
 
+	/* Only track failure for GPDB primary-mirror replication */
+	if (MyWalSnd->is_for_gp_walreceiver)
+		FTSReplicationStatusMarkDisconnectForReplication(application_name);
+
+	if (IS_QUERY_DISPATCHER())
+	{
+		/*
+		 * Acquire the SyncRepLock here to avoid any race conditions
+		 * that may occur when the WAL sender is waking up waiting backends in the
+		 * sync-rep queue just before its exit and a new backend comes in
+		 * to wait in the queue due to the fact that WAL sender is still alive.
+		 * Refer to the use of SyncRepLock in SyncRepWaitForLSN()
+		 */
+		LWLockAcquire(SyncRepLock, LW_EXCLUSIVE);
+		{
+			/* Release any waiting backends in the sync-rep queue */
+			SyncRepWakeQueue(true, SYNC_REP_WAIT_WRITE);
+			SyncRepWakeQueue(true, SYNC_REP_WAIT_FLUSH);
+
+			SpinLockAcquire(&MyWalSnd->mutex);
+
+			/* xlog can get freed without the WAL sender worry */
+			MyWalSnd->xlogCleanUpTo = InvalidXLogRecPtr;
+
+			/* Mark WalSnd struct no longer in use. */
+			MyWalSnd->pid = 0;
+
+			SpinLockRelease(&MyWalSnd->mutex);
+
+			DisownLatch(&MyWalSnd->latch);
+		}
+		LWLockRelease(SyncRepLock);
+		/* WalSnd struct isn't mine anymore */
+		MyWalSnd = NULL;
+		return;
+	}
+
 	/*
 	 * Clear MyWalSnd first; then disown the latch.  This is so that signal
 	 * handlers won't try to touch the latch after it's no longer ours.
@@ -2052,11 +2153,10 @@ WalSndKill(int code, Datum arg)
 
 	DisownLatch(&walsnd->latch);
 
-	/*
-	 * Mark WalSnd struct no longer in use. Assume that no lock is required
-	 * for this.
-	 */
+	SpinLockAcquire(&walsnd->mutex);
+	/* Mark WalSnd struct as no longer being in use. */
 	walsnd->pid = 0;
+	SpinLockRelease(&walsnd->mutex);
 }
 
 /*
@@ -2078,7 +2178,6 @@ XLogRead(char *buf, XLogRecPtr startptr, Size count)
 	Size		nbytes;
 	XLogSegNo	segno;
 
-retry:
 	p = buf;
 	recptr = startptr;
 	nbytes = count;
@@ -2142,6 +2241,7 @@ retry:
 			sendFile = BasicOpenFile(path, O_RDONLY | PG_BINARY, 0);
 			if (sendFile < 0)
 			{
+				WalSndCtl->error = WALSNDERROR_WALREAD;
 				/*
 				 * If the file is not found, assume it's because the standby
 				 * asked for a too old WAL segment that has already been
@@ -2165,11 +2265,15 @@ retry:
 		if (sendOff != startoff)
 		{
 			if (lseek(sendFile, (off_t) startoff, SEEK_SET) < 0)
+			{
+				WalSndCtl->error = WALSNDERROR_WALREAD;
+
 				ereport(ERROR,
 						(errcode_for_file_access(),
 				  errmsg("could not seek in log segment %s to offset %u: %m",
 						 XLogFileNameP(curFileTimeLine, sendSegNo),
 						 startoff)));
+			}
 			sendOff = startoff;
 		}
 
@@ -2182,6 +2286,7 @@ retry:
 		readbytes = read(sendFile, p, segbytes);
 		if (readbytes <= 0)
 		{
+			WalSndCtl->error = WALSNDERROR_WALREAD;
 			ereport(ERROR,
 					(errcode_for_file_access(),
 					 errmsg("could not read from log segment %s, offset %u, length %lu: %m",
@@ -2205,33 +2310,19 @@ retry:
 	 * already have been overwritten with new WAL records.
 	 */
 	XLByteToSeg(startptr, segno);
-	CheckXLogRemoved(segno, ThisTimeLineID);
 
-	/*
-	 * During recovery, the currently-open WAL file might be replaced with the
-	 * file of the same name retrieved from archive. So we always need to
-	 * check what we read was valid after reading into the buffer. If it's
-	 * invalid, we try to open and read the file again.
-	 */
-	if (am_cascading_walsender)
+	PG_TRY();
 	{
-		/* use volatile pointer to prevent code rearrangement */
-		volatile WalSnd *walsnd = MyWalSnd;
-		bool		reload;
-
-		SpinLockAcquire(&walsnd->mutex);
-		reload = walsnd->needreload;
-		walsnd->needreload = false;
-		SpinLockRelease(&walsnd->mutex);
-
-		if (reload && sendFile >= 0)
-		{
-			close(sendFile);
-			sendFile = -1;
-
-			goto retry;
-		}
+		CheckXLogRemoved(segno, ThisTimeLineID);
 	}
+	PG_CATCH();
+	{
+		WalSndCtl->error = WALSNDERROR_WALREAD;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	WalSndCtl->error = WALSNDERROR_NONE;
 }
 
 /*
@@ -2255,6 +2346,28 @@ XLogSendPhysical(void)
 	/* If requested switch the WAL sender to the stopping state. */
 	if (got_STOPPING)
 		WalSndSetState(WALSNDSTATE_STOPPING);
+
+#ifdef FAULT_INJECTOR
+		/* the walsender skip send WAL to the mirror . */
+		if (SIMPLE_FAULT_INJECTOR("walsnd_skip_send") == FaultInjectorTypeSkip)
+		{
+			if (!WalSndCaughtUp)
+			{
+				/*
+				 * If we have not caugh up, we must wait here.  Otherwise, the
+				 * walsender process keeps spinning the main loop and the csv
+				 * logs are filled with "fault triggered" messages so much that
+				 * in the CI, the disk filled up to 100% within a short time.
+				 */
+				int			wakeEvents;
+
+				wakeEvents = WL_LATCH_SET | WL_POSTMASTER_DEATH | WL_TIMEOUT;
+				WaitLatchOrSocket(&MyWalSnd->latch, wakeEvents,
+								  MyProcPort->sock, 1000);
+			}
+			return;
+		}
+#endif
 
 	if (streamingDoneSending)
 	{
@@ -2388,6 +2501,13 @@ XLogSendPhysical(void)
 	if (SendRqstPtr <= sentPtr)
 	{
 		WalSndCaughtUp = true;
+		WalSndCaughtUpWithinRange = true;
+
+		elogif(debug_walrepl_snd, LOG,
+				"walsnd xlogSend -- "
+				"SendRqstPtr equals sentPtr (%X/%X). Nothing to read from "
+				"xlog. Setting caughtup and caughtup_within_range before return.",
+			   (uint32) (sentPtr >> 32), (uint32) sentPtr);
 		return;
 	}
 
@@ -2456,6 +2576,10 @@ XLogSendPhysical(void)
 
 	sentPtr = endptr;
 
+	/* See if we're within catchup range */
+	if (!WalSndCaughtUpWithinRange)
+		WalSndCaughtUpWithinRange = WalSndIsCatchupWithinRange(sentPtr, SendRqstPtr);
+
 	/* Update shared memory status */
 	{
 		/* use volatile pointer to prevent code rearrangement */
@@ -2475,6 +2599,21 @@ XLogSendPhysical(void)
 				 (uint32) (sentPtr >> 32), (uint32) sentPtr);
 		set_ps_display(activitymsg, false);
 	}
+
+	elogif(debug_walrepl_snd, LOG,
+			"walsnd xlogsend -- "
+			"Latest xlog flush location on master (SendRqstPtr) = %X/%X, "
+			"Start xLog read location(startptr) = %X/%X, "
+			"Actual read end xLog location (endptr) = %X/%X, "
+			"Bytes Read = %d, "
+			"Caughtup within range = %s, "
+			"Fully Caughtup = %s.",
+		   (uint32)(SendRqstPtr >> 32), (uint32) SendRqstPtr,
+		   (uint32) (startptr >> 32), (uint32) startptr,
+		   (uint32) (endptr >> 32), (uint32) endptr,
+			(int)nbytes,
+			WalSndCaughtUpWithinRange ? "true" : "false",
+			WalSndCaughtUp ? "true" : "false");
 
 	return;
 }
@@ -2679,6 +2818,13 @@ WalSndLastCycleHandler(SIGNAL_ARGS)
 	errno = save_errno;
 }
 
+static void
+WalSndCrashHandler(SIGNAL_ARGS)
+{
+	StandardHandlerForSigillSigsegvSigbus_OnMainThread("walsender",
+														PASS_SIGNAL_ARGS);
+}
+
 /* Set up signal handlers */
 void
 WalSndSignals(void)
@@ -2701,6 +2847,17 @@ WalSndSignals(void)
 	pqsignal(SIGTTOU, SIG_DFL);
 	pqsignal(SIGCONT, SIG_DFL);
 	pqsignal(SIGWINCH, SIG_DFL);
+
+#ifdef SIGILL
+	pqsignal(SIGILL, WalSndCrashHandler);
+#endif
+#ifdef SIGSEGV
+	pqsignal(SIGSEGV, WalSndCrashHandler);
+#endif
+#ifdef SIGBUS
+	pqsignal(SIGBUS, WalSndCrashHandler);
+#endif
+
 }
 
 /* Report shared-memory space needed by WalSndShmemInit */
@@ -2756,6 +2913,60 @@ WalSndWakeup(void)
 
 	for (i = 0; i < max_wal_senders; i++)
 		SetLatch(&WalSndCtl->walsnds[i].latch);
+}
+
+/*
+ * Signal walsender to move to stopping state.
+ *
+ * Same as WalSndInitStopping except it stops one specific walsender
+ */
+void
+WalSndInitStoppingOneWalSender(WalSnd *walsnd)
+{
+	pid_t		pid;
+
+	Assert (walsnd != NULL);
+
+	SpinLockAcquire(&walsnd->mutex);
+	pid = walsnd->pid;
+	SpinLockRelease(&walsnd->mutex);
+
+	if (pid == 0)
+		return;
+
+	SendProcSignal(pid, PROCSIG_WALSND_INIT_STOPPING, InvalidBackendId);
+	return;
+}
+
+/*
+ * Wait the WAL senders have quit or reached the stopping state. 
+ *
+ * Same as WalSndWaitStopping except it waits for one specific walsender
+ */
+void
+WalSndWaitStoppingOneWalSender(WalSnd *walsnd)
+{
+	WalSndState state;
+
+	Assert(walsnd != NULL);
+
+	for (;;)
+	{
+		SpinLockAcquire(&walsnd->mutex);
+		if (walsnd->pid == 0)
+		{
+			SpinLockRelease(&walsnd->mutex);
+			return;
+		}
+		state = walsnd->state;
+		SpinLockRelease(&walsnd->mutex);
+
+		/* safe to leave if confirmation is done the WAL sender */
+		if (state == WALSNDSTATE_STOPPING)
+			return;
+
+		pg_usleep(10000L);		/* wait for 10 msec */
+	}
 }
 
 /*
@@ -2841,9 +3052,23 @@ WalSndSetState(WalSndState state)
 	if (walsnd->state == state)
 		return;
 
+	elogif(debug_walrepl_snd, LOG,
+			"walsnd state -- Setting the WAL sender state to %s.",
+			WalSndGetStateString(state));
+
 	SpinLockAcquire(&walsnd->mutex);
 	walsnd->state = state;
 	SpinLockRelease(&walsnd->mutex);
+
+	/*
+	 * If the walsender is not for GPDB primary-mirror replication,
+	 * skip failure stats.
+	 */
+	if (!walsnd->is_for_gp_walreceiver)
+		return;
+
+	/* Update WAL replication status. */
+	FTSReplicationStatusUpdateForWalState(application_name, state);
 }
 
 /*
@@ -2869,6 +3094,152 @@ WalSndGetStateString(WalSndState state)
 	return "UNKNOWN";
 }
 
+/* Set the caught_within_range value for this WAL sender */
+static void
+WalSndSetCaughtupWithinRange(bool caughtup_within_range)
+{
+	/* use volatile pointer to prevent code rearrangement */
+	volatile WalSnd *walsnd = MyWalSnd;
+
+	Assert(am_walsender);
+
+	elogif(debug_walrepl_snd, LOG,
+			"Setting the WAL sender caughtup_within_range attribute to %s.",
+			caughtup_within_range ? "true" : "false");
+
+	SpinLockAcquire(&walsnd->mutex);
+	walsnd->caughtup_within_range = caughtup_within_range;
+	SpinLockRelease(&walsnd->mutex);
+}
+
+
+/*
+ * Set xlogCleanUpTo in WAL sender
+ * This helps checkpoint creation process to limit
+ * old xlog seg file cleanup
+ */
+void
+WalSndSetXLogCleanUpTo(XLogRecPtr xlogPtr)
+{
+	/* use volatile pointer to prevent code rearrangement */
+	volatile WalSnd *walsnd = MyWalSnd;
+
+	Assert(am_walsender);
+
+	elogif(debug_walrepl_snd, LOG,
+			"walsnd xlog cleanupto -- "
+			"Setting the WAL sender xlogCleanUpto attribute to %X/%X.",
+		   (uint32) (xlogPtr >> 32), (uint32) xlogPtr);
+
+	SpinLockAcquire(&walsnd->mutex);
+	walsnd->xlogCleanUpTo = xlogPtr;
+	SpinLockRelease(&walsnd->mutex);
+}
+
+/*
+ * Retrieve the walsnd_xlogCleanUpTo value.
+ *
+ * We compare current value of walsnd_xlogCleanUpTo
+ * with the ones for each active walsender and find out the
+ * XLogRecPtr which is min of all but greater than the
+ * current value of walsnd_xlogCleanUpTo.
+ *
+ * If no walsender is active, InvalidXLogRecPtr is returned.
+ */
+XLogRecPtr
+WalSndCtlGetXLogCleanUpTo()
+{
+	int i = 0;
+	bool	active_walsnd = false;
+	bool	first_active_wal_snd= true;
+	XLogRecPtr	min_xlogCleanUpTo = InvalidXLogRecPtr;
+
+	for (i = 0; i < max_wal_senders; i++)
+	{
+		/* use volatile pointer to prevent code rearrangement */
+		volatile WalSnd *walsnd = &WalSndCtl->walsnds[i];
+
+		SpinLockAcquire(&walsnd->mutex);
+		if (walsnd->pid != 0)
+		{
+			active_walsnd = true;
+
+			/*
+			 * If the WAL sender has not set its own xlogCleannUpTo
+			 * we don't bother looking at it
+			 */
+			if (XLogRecPtrIsInvalid(walsnd->xlogCleanUpTo))
+			{
+				SpinLockRelease(&walsnd->mutex);
+				continue;
+			}
+
+			if (first_active_wal_snd)
+			{
+				min_xlogCleanUpTo = walsnd->xlogCleanUpTo;
+				first_active_wal_snd = false;
+			}
+			else
+			{
+				if (walsnd->xlogCleanUpTo < min_xlogCleanUpTo)
+					min_xlogCleanUpTo = walsnd->xlogCleanUpTo;
+			}
+		}
+		SpinLockRelease(&walsnd->mutex);
+	}
+
+	/* No active walsender found, return invalid record ptr. */
+	if (!active_walsnd)
+		return InvalidXLogRecPtr;
+
+	/*
+	 * we can't return XLogRecPtr smaller than walsnd_xlogCleanUpTo
+	 * because for e.g the checkpoint creation process may have read it
+	 * already and used it to clean xlog seg files up to that point.
+	 */
+	if (WalSndCtl->walsnd_xlogCleanUpTo < min_xlogCleanUpTo)
+		WalSndCtl->walsnd_xlogCleanUpTo = min_xlogCleanUpTo;
+
+	elogif(debug_walrepl_snd, LOG,
+			"Current requested common WAL sender XLogCleanUpTo is %X/%X.",
+		   (uint32) (WalSndCtl->walsnd_xlogCleanUpTo >> 32),
+		   (uint32) WalSndCtl->walsnd_xlogCleanUpTo);
+
+	return WalSndCtl->walsnd_xlogCleanUpTo;
+}
+
+/*
+ * This functions helps to find out if this walsender has caught up
+ * within the range defined by the user. This helps backends to decide
+ * if they should start waiting for sync-rep while the WAL sender is
+ * still in catchup mode. Refer syncrep.c for some more insight
+ */
+static bool
+WalSndIsCatchupWithinRange(XLogRecPtr currRecPtr, XLogRecPtr catchupRecPtr)
+{
+	uint64		curr_logSegNo, catchup_logSegNo;
+	uint32		segDist;
+
+	Assert(!XLogRecPtrIsInvalid(currRecPtr));
+	Assert(!XLogRecPtrIsInvalid(catchupRecPtr));
+	Assert(am_walsender);
+
+	/* Best case */
+	if (catchupRecPtr < currRecPtr)
+		return true;
+
+	XLByteToSeg(currRecPtr, curr_logSegNo);
+	XLByteToSeg(catchupRecPtr, catchup_logSegNo);
+
+	/* Find the distance between the curr and catchup seg files */
+	segDist = catchup_logSegNo - curr_logSegNo;
+
+	/* If the distance between the seg files is within range, we're good */
+	if (segDist <= repl_catchup_within_range)
+		return true;
+
+	return false;
+}
 
 /*
  * Returns activity of walsenders, including pids and xlog locations sent to

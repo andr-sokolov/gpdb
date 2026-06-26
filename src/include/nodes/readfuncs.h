@@ -24,6 +24,22 @@ extern char *debackslash(char *token, int length);
 extern void *nodeRead(char *token, int tok_len);
 
 /*
+ * nodeReadSkip
+ *    Skips next item (a token, list or subtree).
+ */
+void
+nodeReadSkip(void);
+
+/*
+ * pg_strtok_peek_fldname
+ *    Peeks at the token that will be returned by the next call to
+ *    pg_strtok.  Returns true if the token is, case-sensitively,
+ *          :fldname
+ */
+bool
+pg_strtok_peek_fldname(const char *fldname);
+
+/*-------------------------------------------------------------------------
  * prototypes for functions in readfuncs.c
  */
 extern Node *parseNodeString(void);

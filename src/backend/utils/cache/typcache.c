@@ -64,6 +64,7 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
+#include "cdb/cdbvars.h"
 
 
 /* The main type cache hashtable searched by lookup_type_cache */
@@ -120,7 +121,9 @@ static HTAB *RecordCacheHash = NULL;
 
 static TupleDesc *RecordCacheArray = NULL;
 static int32 RecordCacheArrayLen = 0;	/* allocated length of array */
-static int32 NextRecordTypmod = 0;		/* number of entries used */
+int32 NextRecordTypmod = 0;		/* number of entries used */
+
+static void TypeCacheRelCallback(Datum arg, Oid relid);
 
 static void load_typcache_tupdesc(TypeCacheEntry *typentry);
 static void load_rangetype_info(TypeCacheEntry *typentry);
@@ -885,7 +888,7 @@ assign_record_type_typmod(TupleDesc tupDesc)
 	foreach(l, recentry->tupdescs)
 	{
 		entDesc = (TupleDesc) lfirst(l);
-		if (equalTupleDescs(tupDesc, entDesc))
+		if (equalTupleDescs(tupDesc, entDesc, true))
 		{
 			tupDesc->tdtypmod = entDesc->tdtypmod;
 			return;
@@ -991,6 +994,34 @@ TypeCacheRelCallback(Datum arg, Oid relid)
 	}
 }
 
+
+/*
+ * build_tuple_node_list
+ *
+ * Wrap TupleDesc with TupleDescNode. Return all record type in record cache.
+ */
+List *
+build_tuple_node_list(int start)
+{
+	List *transientTypeList = NIL;
+	int i = start;
+
+	if (NextRecordTypmod == 0)
+		return transientTypeList;
+
+	for (; i < NextRecordTypmod; i++)
+	{
+		TupleDesc tmp = RecordCacheArray[i];
+
+		TupleDescNode *node = palloc0(sizeof(TupleDescNode));
+		node->type = T_TupleDescNode;
+		node->natts = tmp->natts;
+		node->tuple = CreateTupleDescCopy(tmp);
+		transientTypeList = lappend(transientTypeList, node);
+	}
+
+	return transientTypeList;
+}
 
 /*
  * Check if given OID is part of the subset that's sortable by comparisons

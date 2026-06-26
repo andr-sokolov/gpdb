@@ -1902,8 +1902,8 @@ CREATE VIEW tables AS
            CAST(nt.nspname AS sql_identifier) AS user_defined_type_schema,
            CAST(t.typname AS sql_identifier) AS user_defined_type_name,
 
-           CAST(CASE WHEN c.relkind = 'r' OR
-                          (c.relkind IN ('v', 'f') AND
+           CAST(CASE WHEN (c.relkind = 'r' AND c.relstorage <> 'x') OR
+                          (c.relkind IN ('v', 'f', 'r') AND
                            -- 1 << CMD_INSERT
                            pg_relation_is_updatable(c.oid, false) & 8 = 8)
                 THEN 'YES' ELSE 'NO' END AS yes_or_no) AS is_insertable_into,

@@ -119,10 +119,20 @@ pg_mkdir_p(char *path, int omode)
 		if (last)
 			(void) umask(oumask);
 
-		/* check for pre-existing directory */
-		if (stat(path, &sb) == 0)
+		if (mkdir(path, last ? omode : S_IRWXU | S_IRWXG | S_IRWXO) == 0)
 		{
-			if (!S_ISDIR(sb.st_mode))
+			/* path does not pre-exist and is successfully created */
+		}
+		else if (errno == EEXIST)
+		{
+			/* path exists, double check it is a dir */
+
+			if (stat(path, &sb) < 0)
+			{
+				retval = -1;
+				break;
+			}
+			else if (!S_ISDIR(sb.st_mode))
 			{
 				if (last)
 					errno = EEXIST;
@@ -132,7 +142,7 @@ pg_mkdir_p(char *path, int omode)
 				break;
 			}
 		}
-		else if (mkdir(path, last ? omode : S_IRWXU | S_IRWXG | S_IRWXO) < 0)
+		else
 		{
 			retval = -1;
 			break;
