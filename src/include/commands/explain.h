@@ -39,6 +39,7 @@ typedef struct ExplainState
 	bool		analyze;		/* print actual times */
 	bool		costs;			/* print estimated costs */
 	bool		buffers;		/* print buffer usage */
+	bool		dxl;			/* CDB: print DXL */
 	bool		timing;			/* print detailed node timing */
 	bool		summary;		/* print total planning and execution timing */
 	ExplainFormat format;		/* output format */
@@ -48,6 +49,12 @@ typedef struct ExplainState
 	List	   *rtable_names;	/* alias names for RTEs */
 	int			indent;			/* current indentation level */
 	ExplainStateExtra *extra;	/* pointer to additional data */
+
+    /* CDB */
+    struct CdbExplain_ShowStatCtx  *showstatctx;    /* EXPLAIN ANALYZE info */
+    Slice          *currentSlice;   /* slice whose nodes we are visiting */
+
+	PlanState  *parentPlanState;
 } ExplainState;
 
 /* Hook for plugins to get control in ExplainOneQuery() */
@@ -98,4 +105,11 @@ extern void ExplainPropertyLong(const char *qlabel, long value,
 extern void ExplainPropertyFloat(const char *qlabel, double value, int ndigits,
 					 ExplainState *es);
 
-#endif   /* EXPLAIN_H */
+extern void ExplainOpenGroup(const char *objtype, const char *labelname,
+				 bool labeled, ExplainState *es);
+extern void ExplainCloseGroup(const char *objtype, const char *labelname,
+				  bool labeled, ExplainState *es);
+
+extern void ExplainPrintExecStatsEnd(ExplainState *es, QueryDesc *queryDesc);
+
+#endif							/* EXPLAIN_H */

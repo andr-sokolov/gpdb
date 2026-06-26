@@ -365,7 +365,7 @@ pgwin32_is_junction(char *path)
  * to update this field.
  */
 int
-pgwin32_safestat(const char *path, struct stat * buf)
+pgwin32_safestat(const char *path, struct stat *buf)
 {
 	int			r;
 	WIN32_FILE_ATTRIBUTE_DATA attr;
@@ -373,6 +373,16 @@ pgwin32_safestat(const char *path, struct stat * buf)
 	r = stat(path, buf);
 	if (r < 0)
 		return r;
+
+	// MPP-24774: just return if path refer to a windows named pipe file.
+	// no need to get size of a windows named pipe file
+	if (strlen(path) >2)
+	{
+		if (path[0] == '\\' && path[1] == '\\')
+		{
+			return r;
+		}
+	}
 
 	if (!GetFileAttributesEx(path, GetFileExInfoStandard, &attr))
 	{

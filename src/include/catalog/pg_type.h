@@ -225,6 +225,18 @@ CATALOG(pg_type,1247) BKI_BOOTSTRAP BKI_ROWTYPE_OID(71) BKI_SCHEMA_MACRO
 #endif
 } FormData_pg_type;
 
+/* GPDB added foreign key definitions for gpcheckcat. */
+FOREIGN_KEY(typnamespace REFERENCES pg_namespace(oid));
+FOREIGN_KEY(typowner REFERENCES pg_authid(oid));
+FOREIGN_KEY(typrelid REFERENCES pg_class(oid));
+FOREIGN_KEY(typinput REFERENCES pg_proc(oid));
+FOREIGN_KEY(typoutput REFERENCES pg_proc(oid));
+FOREIGN_KEY(typreceive REFERENCES pg_proc(oid));
+FOREIGN_KEY(typsend REFERENCES pg_proc(oid));
+FOREIGN_KEY(typanalyze REFERENCES pg_proc(oid));
+FOREIGN_KEY(typmodin REFERENCES pg_proc(oid));
+FOREIGN_KEY(typmodout REFERENCES pg_proc(oid));
+
 /* ----------------
  *		Form_pg_type corresponds to a pointer to a row with
  *		the format of pg_type relation.
@@ -358,11 +370,17 @@ DATA(insert OID = 142 ( xml		   PGNSP PGUID -1 f b U f t \054 0 0 143 xml_in xml
 DESCR("XML content");
 #define XMLOID 142
 DATA(insert OID = 143 ( _xml	   PGNSP PGUID -1 f b A f t \054 0 142 0 array_in array_out array_recv array_send - - array_typanalyze i x f 0 -1 0 0 _null_ _null_ _null_ ));
-DATA(insert OID = 199 ( _json	   PGNSP PGUID -1 f b A f t \054 0 114 0 array_in array_out array_recv array_send - - array_typanalyze i x f 0 -1 0 0 _null_ _null_ _null_ ));
 
 DATA(insert OID = 194 ( pg_node_tree	PGNSP PGUID -1 f b S f t \054 0 0 0 pg_node_tree_in pg_node_tree_out pg_node_tree_recv pg_node_tree_send - - - i x f 0 -1 0 100 _null_ _null_ _null_ ));
 DESCR("string representing an internal node tree");
 #define PGNODETREEOID	194
+
+DATA(insert OID = 199 ( _json	   PGNSP PGUID -1 f b A f t \054 0 114 0 array_in array_out array_recv array_send - - array_typanalyze i x f 0 -1 0 0 _null_ _null_ _null_ ));
+
+DATA(insert OID = 7198 (	complex	   PGNSP PGUID 16 f b N f t \054 0 0	7199 complex_in complex_out complex_recv complex_send - - - d p f 0 -1 0 0 _null_ _null_ _null_ ));
+DESCR("double-precision floating point complex number, 16-byte storage");
+#define COMPLEXOID 7198
+DATA(insert OID = 7199 (	_complex	   PGNSP PGUID -1 f b A f t \054 0 7198 0 array_in array_out array_recv array_send - - - d x f 0 -1 0 0 _null_ _null_ _null_ ));
 
 /* OIDS 200 - 299 */
 
@@ -462,6 +480,7 @@ DATA(insert OID = 1013 (  _oidvector PGNSP PGUID -1 f b A f t \054 0	30 0 array_
 DATA(insert OID = 1014 (  _bpchar	 PGNSP PGUID -1 f b A f t \054 0 1042 0 array_in array_out array_recv array_send bpchartypmodin bpchartypmodout array_typanalyze i x f 0 -1 0 100 _null_ _null_ _null_ ));
 DATA(insert OID = 1015 (  _varchar	 PGNSP PGUID -1 f b A f t \054 0 1043 0 array_in array_out array_recv array_send varchartypmodin varchartypmodout array_typanalyze i x f 0 -1 0 100 _null_ _null_ _null_ ));
 DATA(insert OID = 1016 (  _int8		 PGNSP PGUID -1 f b A f t \054 0	20 0 array_in array_out array_recv array_send - - array_typanalyze d x f 0 -1 0 0 _null_ _null_ _null_ ));
+#define INT8ARRAYOID		1016
 DATA(insert OID = 1017 (  _point	 PGNSP PGUID -1 f b A f t \054 0 600 0 array_in array_out array_recv array_send - - array_typanalyze d x f 0 -1 0 0 _null_ _null_ _null_ ));
 DATA(insert OID = 1018 (  _lseg		 PGNSP PGUID -1 f b A f t \054 0 601 0 array_in array_out array_recv array_send - - array_typanalyze d x f 0 -1 0 0 _null_ _null_ _null_ ));
 DATA(insert OID = 1019 (  _path		 PGNSP PGUID -1 f b A f t \054 0 602 0 array_in array_out array_recv array_send - - array_typanalyze d x f 0 -1 0 0 _null_ _null_ _null_ ));
@@ -469,6 +488,7 @@ DATA(insert OID = 1020 (  _box		 PGNSP PGUID -1 f b A f t \073 0 603 0 array_in 
 DATA(insert OID = 1021 (  _float4	 PGNSP PGUID -1 f b A f t \054 0 700 0 array_in array_out array_recv array_send - - array_typanalyze i x f 0 -1 0 0 _null_ _null_ _null_ ));
 #define FLOAT4ARRAYOID 1021
 DATA(insert OID = 1022 (  _float8	 PGNSP PGUID -1 f b A f t \054 0 701 0 array_in array_out array_recv array_send - - array_typanalyze d x f 0 -1 0 0 _null_ _null_ _null_ ));
+#define FLOAT8ARRAYOID 1022
 DATA(insert OID = 1023 (  _abstime	 PGNSP PGUID -1 f b A f t \054 0 702 0 array_in array_out array_recv array_send - - array_typanalyze i x f 0 -1 0 0 _null_ _null_ _null_ ));
 DATA(insert OID = 1024 (  _reltime	 PGNSP PGUID -1 f b A f t \054 0 703 0 array_in array_out array_recv array_send - - array_typanalyze i x f 0 -1 0 0 _null_ _null_ _null_ ));
 DATA(insert OID = 1025 (  _tinterval PGNSP PGUID -1 f b A f t \054 0 704 0 array_in array_out array_recv array_send - - array_typanalyze i x f 0 -1 0 0 _null_ _null_ _null_ ));
@@ -683,6 +703,14 @@ DATA(insert OID = 3115 ( fdw_handler	PGNSP PGUID  4 t p P f t \054 0 0 0 fdw_han
 DATA(insert OID = 3831 ( anyrange		PGNSP PGUID  -1 f p P f t \054 0 0 0 anyrange_in anyrange_out - - - - - d x f 0 -1 0 0 _null_ _null_ _null_ ));
 #define ANYRANGEOID		3831
 
+DATA(insert OID = 7053 ( anytable		PGNSP PGUID -1 f p P f t \054 0	0 0 anytable_in anytable_out - - - - - d x f 0 -1 0 0 _null_ _null_ _null_ ));
+DESCR("Represents a generic TABLE value expression");
+#define ANYTABLEOID     7053
+
+/* hyperloglog */
+DATA(insert OID = 7157 ( gp_hyperloglog_estimator		PGNSP PGUID -1 f b X f t \054 0    0 7165 gp_hyperloglog_in gp_hyperloglog_out - - - - - i x f 0 -1 0 0 _null_ _null_ _null_ ));
+DESCR("gp_hyperloglog_estimator’s internal bytea representation for hyperloglog counter");
+DATA(insert OID = 7165 ( _gp_hyperloglog_estimator		PGNSP PGUID -1 f b A f t \054 0	7157 0 array_in array_out array_recv array_send - - - i x f 0 -1 0 0 _null_ _null_ _null_ ));
 
 /*
  * macros
@@ -718,5 +746,9 @@ DATA(insert OID = 3831 ( anyrange		PGNSP PGUID  -1 f p P f t \054 0 0 0 anyrange
 	 (typid) == ANYNONARRAYOID || \
 	 (typid) == ANYENUMOID || \
 	 (typid) == ANYRANGEOID)
+
+/* Is a type OID suitable for describe callback functions? */
+#define TypeSupportsDescribe(typid)  \
+	((typid) == RECORDOID)
 
 #endif   /* PG_TYPE_H */

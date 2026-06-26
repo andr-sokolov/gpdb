@@ -7,6 +7,7 @@
 subdir = src/backend/utils/adt
 top_builddir = ../../../..
 include $(top_builddir)/src/Makefile.global
+override CPPFLAGS := -I$(libpq_srcdir) $(CPPFLAGS)
 
 # seems to be required for some date/time stuff 1999/07/22 bjm
 ifeq "$(findstring alpha,$(host_cpu))" "alpha"
@@ -37,5 +38,10 @@ OBJS = acl.o arrayfuncs.o array_selfuncs.o array_typanalyze.o \
 	windowfuncs.o xid.o xml.o
 
 like.o: like.c like_match.c
+
+# GPDB additions
+OBJS +=	complex_type.o gp_dump_oids.o gp_optimizer_functions.o \
+	gp_partition_functions.o interpolate.o matrix.o \
+	pivot.o
 
 include $(top_srcdir)/src/backend/common.mk

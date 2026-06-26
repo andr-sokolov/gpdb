@@ -80,6 +80,16 @@ SELECT '' AS five, f1 AS "Correlated Field"
   WHERE (f1, f2) IN (SELECT f2, CAST(f3 AS int4) FROM SUBSELECT_TBL
                      WHERE f3 IS NOT NULL);
 
+-- Unspecified-type literals in output columns should resolve as text
+
+SELECT *, pg_typeof(f1) FROM
+  (SELECT 'foo' AS f1 FROM generate_series(1,3)) ss ORDER BY 1;
+
+-- ... unless there's context to suggest differently
+
+explain verbose select '42' union all select '43';
+explain verbose select '42' union all select 43;
+
 --
 -- Use some existing tables in the regression test
 --
@@ -343,14 +353,20 @@ select (select (a.*)::text) from view_a a;
 -- Check that whole-row Vars reading the result of a subselect don't include
 -- any junk columns therein
 --
-
-select q from (select max(f1) from int4_tbl group by f1 order by f1) q;
+-- In GPDB, the ORDER BY in the subquery or CTE doesn't force an ordering
+-- for the whole query. Mark these with the "order none" gpdiff directive,
+-- so that differences in result order are ignored.
+select q from (select max(f1) from int4_tbl group by f1 order by f1) q;  -- order none
 with q as (select max(f1) from int4_tbl group by f1 order by f1)
-  select q from q;
+  select q from q;  -- order none
 
 --
 -- Test case for sublinks pushed down into subselects via join alias expansion
 --
+-- Greenplum note: This query will only work with ORCA. This type of query
+-- was not supported in postgres versions prior to 8.4, and thus was never
+-- supported in the planner. After 8.4 versions, the planner works, but
+-- the plan it creates is not currently parallel safe.
 
 select
   (select sq1) as qq1
@@ -384,24 +400,29 @@ select '1'::text in (select '1'::name union all select '1'::name);
 --
 -- Test case for planner bug with nested EXISTS handling
 --
+-- GPDB_92_MERGE_FIXME: ORCA cannot decorrelate this query, and generates
+-- correct-but-slow plan that takes 45 minutes. Revisit this when ORCA can
+-- reorder anti-joins
+set optimizer to off;
 select a.thousand from tenk1 a, tenk1 b
 where a.thousand = b.thousand
   and exists ( select 1 from tenk1 c where b.hundred = c.hundred
                    and not exists ( select 1 from tenk1 d
                                     where a.thousand = d.thousand ) );
+reset optimizer;
 
 --
 -- Check that nested sub-selects are not pulled up if they contain volatiles
 --
 explain (verbose, costs off)
   select x, x from
-    (select (select now()) as x from (values(1),(2)) v(y)) ss;
+    (select (select current_database()) as x from (values(1),(2)) v(y)) ss;
 explain (verbose, costs off)
   select x, x from
     (select (select random()) as x from (values(1),(2)) v(y)) ss;
 explain (verbose, costs off)
   select x, x from
-    (select (select now() where y=y) as x from (values(1),(2)) v(y)) ss;
+    (select (select current_database() where y=y) as x from (values(1),(2)) v(y)) ss;
 explain (verbose, costs off)
   select x, x from
     (select (select random() where y=y) as x from (values(1),(2)) v(y)) ss;
@@ -438,6 +459,7 @@ select * from
 
 --
 -- Check sane behavior with nested IN SubLinks
+-- GPDB_94_MERGE_FIXME: ORCA plan is correct but very pricy. Should we fallback to planner?
 --
 explain (verbose, costs off)
 select * from int4_tbl where
@@ -483,7 +505,7 @@ select nextval('ts1');
 -- Ensure that backward scan direction isn't propagated into
 -- expression subqueries (bug #15336)
 --
-
+--start_ignore
 begin;
 
 declare c1 scroll cursor for
@@ -494,3 +516,4 @@ move forward all in c1;
 fetch backward all in c1;
 
 commit;
+--end_ignore

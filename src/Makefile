@@ -21,7 +21,6 @@ SUBDIRS = \
 	backend/snowball \
 	include \
 	interfaces \
-	backend/replication/libpqwalreceiver \
 	bin \
 	pl \
 	makefiles \
@@ -74,7 +73,6 @@ coverage:
 	$(MAKE) -C backend/utils/mb/conversion_procs $@
 	$(MAKE) -C backend/snowball $@
 	$(MAKE) -C interfaces $@
-	$(MAKE) -C backend/replication/libpqwalreceiver $@
 	$(MAKE) -C bin $@
 	$(MAKE) -C pl $@
 

@@ -1525,7 +1525,7 @@ ReorderBufferCommit(ReorderBuffer *rb, TransactionId xid,
 					/*
 					 * Mapped catalog tuple without data, emitted while
 					 * catalog table was in the process of being rewritten. We
-					 * can fail to look up the relfilenode, because the the
+					 * can fail to look up the relfilenode, because the
 					 * relmapper has no "historic" view, in contrast to normal
 					 * the normal catalog during decoding. Thus repeated
 					 * rewrites can cause a lookup failure. That's OK because
@@ -3318,7 +3318,9 @@ restart:
 	 */
 	if (ent == NULL && !updated_mapping)
 	{
-		UpdateLogicalMappings(tuplecid_data, htup->t_tableOid, snapshot);
+		/* GPDB_94_MERGE_FIXME: t_tableOid has been removed in GPDB. Does this work
+		 * at all without it? */
+		UpdateLogicalMappings(tuplecid_data, InvalidOid /* was htup->t_tableOid */, snapshot);
 		/* now check but don't update for a mapping again */
 		updated_mapping = true;
 		goto restart;

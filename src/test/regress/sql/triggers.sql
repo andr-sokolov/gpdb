@@ -533,7 +533,7 @@ DROP TABLE trigger_test;
 -- Test use of row comparisons on OLD/NEW
 --
 
-CREATE TABLE trigger_test (f1 int, f2 text, f3 text);
+CREATE TABLE trigger_test (dkey int, f1 int, f2 text, f3 text);
 
 -- this is the obvious (and wrong...) way to compare rows
 CREATE FUNCTION mytrigger() RETURNS trigger LANGUAGE plpgsql as $$
@@ -550,8 +550,8 @@ CREATE TRIGGER t
 BEFORE UPDATE ON trigger_test
 FOR EACH ROW EXECUTE PROCEDURE mytrigger();
 
-INSERT INTO trigger_test VALUES(1, 'foo', 'bar');
-INSERT INTO trigger_test VALUES(2, 'baz', 'quux');
+INSERT INTO trigger_test VALUES(0, 1, 'foo', 'bar');
+INSERT INTO trigger_test VALUES(0, 2, 'baz', 'quux');
 
 UPDATE trigger_test SET f3 = 'bar';
 UPDATE trigger_test SET f3 = NULL;
@@ -593,7 +593,7 @@ CREATE TABLE serializable_update_tab (
 	id int,
 	filler  text,
 	description text
-);
+) distributed by (filler);
 
 CREATE TRIGGER serializable_update_trig BEFORE UPDATE ON serializable_update_tab
 	FOR EACH ROW EXECUTE PROCEDURE serializable_update_trig();
@@ -817,10 +817,11 @@ DROP VIEW main_view;
 
 --
 -- Test triggers on a join view
+-- GPDB ignore this test: don't support modifications on views.
 --
 CREATE TABLE country_table (
     country_id        serial primary key,
-    country_name    text unique not null,
+    country_name    text not null,
     continent        text not null
 );
 
@@ -1008,6 +1009,7 @@ DROP TABLE country_table;
 
 
 -- Test pg_trigger_depth()
+-- GPDB ignore this test: execute insert in trigger function
 
 create table depth_a (id int not null primary key);
 create table depth_b (id int not null primary key);

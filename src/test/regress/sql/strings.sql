@@ -3,6 +3,23 @@
 -- Test various data entry syntaxes.
 --
 
+-- create required tables
+CREATE TABLE CHAR_STRINGS_TBL(f1 char(4));
+INSERT INTO CHAR_STRINGS_TBL (f1) VALUES ('a'),
+('ab'),
+('abcd'),
+('abcd    ');
+
+CREATE TABLE VARCHAR_STRINGS_TBL(f1 varchar(4));
+INSERT INTO VARCHAR_STRINGS_TBL (f1) VALUES ('a'),
+('ab'),
+('abcd'),
+('abcd    ');
+
+CREATE TABLE TEXT_STRINGS_TBL (f1 text);
+INSERT INTO TEXT_STRINGS_TBL VALUES ('doh!'),
+('hi de ho neighbor');
+
 -- SQL string continuation syntax
 -- E021-03 character string literals
 SELECT 'first line'
@@ -15,6 +32,27 @@ SELECT 'first line'
 ' - next line' /* this comment is not allowed here */
 ' - third line'
 	AS "Illegal comment within continuation";
+
+-- bytea
+SET bytea_output TO hex;
+SELECT E'\\xDeAdBeEf'::bytea;
+SELECT E'\\x De Ad Be Ef '::bytea;
+SELECT E'\\xDeAdBeE'::bytea;
+SELECT E'\\xDeAdBeEx'::bytea;
+SELECT E'\\xDe00BeEf'::bytea;
+SELECT E'DeAdBeEf'::bytea;
+SELECT E'De\\000dBeEf'::bytea;
+SELECT E'De\123dBeEf'::bytea;
+SELECT E'De\\123dBeEf'::bytea;
+SELECT E'De\\678dBeEf'::bytea;
+
+SET bytea_output TO escape;
+SELECT E'\\xDeAdBeEf'::bytea;
+SELECT E'\\x De Ad Be Ef '::bytea;
+SELECT E'\\xDe00BeEf'::bytea;
+SELECT E'DeAdBeEf'::bytea;
+SELECT E'De\\000dBeEf'::bytea;
+SELECT E'De\\123dBeEf'::bytea;
 
 -- Unicode escapes
 SET standard_conforming_strings TO on;
@@ -69,25 +107,25 @@ SELECT E'De\\123dBeEf'::bytea;
 -- E021-10 implicit casting among the character data types
 --
 
-SELECT CAST(f1 AS text) AS "text(char)" FROM CHAR_TBL;
+SELECT CAST(f1 AS text) AS "text(char)" FROM CHAR_STRINGS_TBL;
 
-SELECT CAST(f1 AS text) AS "text(varchar)" FROM VARCHAR_TBL;
+SELECT CAST(f1 AS text) AS "text(varchar)" FROM VARCHAR_STRINGS_TBL;
 
 SELECT CAST(name 'namefield' AS text) AS "text(name)";
 
 -- since this is an explicit cast, it should truncate w/o error:
-SELECT CAST(f1 AS char(10)) AS "char(text)" FROM TEXT_TBL;
+SELECT CAST(f1 AS char(10)) AS "char(text)" FROM TEXT_STRINGS_TBL;
 -- note: implicit-cast case is tested in char.sql
 
-SELECT CAST(f1 AS char(20)) AS "char(text)" FROM TEXT_TBL;
+SELECT CAST(f1 AS char(20)) AS "char(text)" FROM TEXT_STRINGS_TBL;
 
-SELECT CAST(f1 AS char(10)) AS "char(varchar)" FROM VARCHAR_TBL;
+SELECT CAST(f1 AS char(10)) AS "char(varchar)" FROM VARCHAR_STRINGS_TBL;
 
 SELECT CAST(name 'namefield' AS char(10)) AS "char(name)";
 
-SELECT CAST(f1 AS varchar) AS "varchar(text)" FROM TEXT_TBL;
+SELECT CAST(f1 AS varchar) AS "varchar(text)" FROM TEXT_STRINGS_TBL;
 
-SELECT CAST(f1 AS varchar) AS "varchar(char)" FROM CHAR_TBL;
+SELECT CAST(f1 AS varchar) AS "varchar(char)" FROM CHAR_STRINGS_TBL;
 
 SELECT CAST(name 'namefield' AS varchar) AS "varchar(name)";
 
@@ -338,6 +376,40 @@ SELECT text 'text' || char(20) ' and characters' AS "Concat text to char";
 
 SELECT text 'text' || varchar ' and varchar' AS "Concat text to varchar";
 
+-- Test "unknown" from sub queries - MPP-2510
+select foo || 'bar'::text from (select 'bar' as foo) a;
+select foo || 'bar'::text from (select 'bar'::text as foo) a;
+select * from ( select 'a' as a) x join (select 'b' as b) y on a=b;
+
+-- Test "unknown" with typmod MPP-2658
+create table unknown_test (v varchar(20), n numeric(20, 2), t timestamp(2));
+insert into unknown_test select '100', '123.23', '2008-01-01 11:11:11';
+select 'foo'::varchar(10) || bar from (select 'bar' as bar) moo;
+select '123'::numeric(4,1) + bar from (select '123' as bar) baz;
+drop table unknown_test;
+
+-- Test nested "unknown"s from MPP-2689
+select 'foo'::text || foo from ( select foo from (select 4.5, foo from ( select
+1, 'foo' as foo) a ) b ) c;
+select 'foo'::text || foo from ( select foo from
+ (select foo || bar as foo from ( select 'bar' as bar, 'foo' as foo) a ) b ) c;
+create domain u_d as text;
+prepare p1 as select $1::u_d || foo from (select 'foo' as foo) a;
+prepare p2 as select 'foo' || foo
+from (select $1::u_d || bar as foo from (select 'bar' as bar) a ) b;
+
+select 'a' as a, 'b' as b, 'c' as c, 1 as d union select * from (select 'a' as a, 'b' as b, 'c' as c, 1 as d)d;
+select * from (select 'a' as a, 'b' as b, 'c' as c, 1 as d)d union select 'a' as a, 'b' as b, 'c' as c, 1 as d;
+
+-- Make sure we can convert unknown to other useful types (MPP-4298)
+create table t as select j as a, 'abc' as i from
+generate_series(1, 10) j;
+select * from t order by a;
+alter table t alter i type int; -- should fail
+alter table t alter i type text; -- should work
+select * from t order by a;
+drop table t;
+
 --
 -- test substr with toasted text values
 --
@@ -376,16 +448,16 @@ DROP TABLE toasttest;
 --
 CREATE TABLE toasttest(f1 bytea);
 
-insert into toasttest values(decode(repeat('1234567890',10000),'escape'));
-insert into toasttest values(decode(repeat('1234567890',10000),'escape'));
+insert into toasttest values("decode"(repeat('1234567890',10000),'escape'));
+insert into toasttest values(pg_catalog.decode(repeat('1234567890',10000),'escape'));
 
 --
 -- Ensure that some values are uncompressed, to test the faster substring
 -- operation used in that case
 --
 alter table toasttest alter column f1 set storage external;
-insert into toasttest values(decode(repeat('1234567890',10000),'escape'));
-insert into toasttest values(decode(repeat('1234567890',10000),'escape'));
+insert into toasttest values("decode"(repeat('1234567890',10000),'escape'));
+insert into toasttest values(pg_catalog.decode(repeat('1234567890',10000),'escape'));
 
 -- If the starting position is zero or less, then return from the start of the string
 -- adjusting the length to be consistent with the "negative start" per SQL.
@@ -522,6 +594,15 @@ set standard_conforming_strings = off;
 
 select 'a\\bcd' as f1, 'a\\b\'cd' as f2, 'a\\b\'''cd' as f3, 'abcd\\'   as f4, 'ab\\\'cd' as f5, '\\\\' as f6;
 
+--
+-- test unicode escape
+--
+select E'A\u0041' as f1, E'\u0127' as f2;
+select E'\u0000';
+select E'\udsfs';
+select E'\uD843\uE001';
+select E'\uDC01';
+select E'\uD834';
 
 --
 -- Additional string functions
@@ -562,3 +643,9 @@ SELECT btrim(E'\\000trim\\000'::bytea, ''::bytea);
 SELECT encode(overlay(E'Th\\000omas'::bytea placing E'Th\\001omas'::bytea from 2),'escape');
 SELECT encode(overlay(E'Th\\000omas'::bytea placing E'\\002\\003'::bytea from 8),'escape');
 SELECT encode(overlay(E'Th\\000omas'::bytea placing E'\\002\\003'::bytea from 5 for 3),'escape');
+
+
+-- Clean up GPDB-added tables
+DROP TABLE char_strings_tbl;
+DROP TABLE varchar_strings_tbl;
+DROP TABLE text_strings_tbl;

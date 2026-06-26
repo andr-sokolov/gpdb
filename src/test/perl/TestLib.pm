@@ -1,3 +1,10 @@
+# TestLib, low-level routines and actions regression tests.
+#
+# This module contains a set of routines dedicated to environment setup for
+# a PostgreSQL regression test run and includes some low-level routines
+# aimed at controlling command execution, logging and test functions. This
+# module should never depend on any other PostgreSQL regression test modules.
+
 package TestLib;
 
 use strict;
@@ -5,6 +12,15 @@ use warnings;
 
 use Config;
 use Exporter 'import';
+use File::Basename;
+use File::Spec;
+use File::Temp ();
+use IPC::Run;
+use SimpleTee;
+
+# specify a recent enough version of Test::More  to support the note() function
+use Test::More 0.82;
+
 our @EXPORT = qw(
   tempdir
   tempdir_short
@@ -26,6 +42,8 @@ our @EXPORT = qw(
   program_version_ok
   program_options_handling_ok
   command_like
+  command_warns_like
+  command_fails_like
   issues_sql_like
 
   $tmp_check
@@ -111,8 +129,6 @@ if ($ENV{PGPORT} < 1024 || $ENV{PGPORT} > 65535)
 #
 # Helper functions
 #
-
-
 sub tempdir
 {
 	return File::Temp::tempdir(
@@ -195,7 +211,8 @@ sub start_test_server
 	standard_initdb "$tempdir/pgdata";
 
 	$ret = system_log('pg_ctl', '-D', "$tempdir/pgdata", '-w', '-l',
-	  "$log_path/postmaster.log", '-o', "--log-statement=all",
+	  "$log_path/postmaster.log", '-o',
+	  "--log-statement=all -c gp_role=utility --gp_dbid=1 --gp_contentid=-1 --logging-collector=off",
 	  'start');
 
 	if ($ret != 0)
@@ -205,6 +222,7 @@ sub start_test_server
 		BAIL_OUT("pg_ctl failed");
 	}
 
+	$ENV{PGOPTIONS}      = '-c gp_session_role=utility';
 	$test_server_datadir = "$tempdir/pgdata";
 	$test_server_logfile = "$log_path/postmaster.log";
 }
@@ -213,7 +231,9 @@ sub restart_test_server
 {
 	print("### Restarting test server\n");
 	system_log('pg_ctl', '-D', $test_server_datadir, '-w', '-l',
-	  $test_server_logfile, 'restart');
+	  $test_server_logfile, '-o',
+	  "--log-statement=all -c gp_role=utility --gp_dbid=1 --gp_contentid=-1 --logging-collector=off",
+	  'restart');
 }
 
 END
@@ -236,10 +256,17 @@ sub psql
 	return $stdout;
 }
 
+sub system_log
+{
+	print("# Running: " . join(" ", @_) ."\n");
+	return system(@_);
+}
+
 sub slurp_dir
 {
 	my ($dir) = @_;
-	opendir(my $dh, $dir) or die;
+	opendir(my $dh, $dir)
+	  or die "could not opendir \"$dir\": $!";
 	my @direntries = readdir $dh;
 	closedir $dh;
 	return @direntries;
@@ -265,24 +292,48 @@ sub system_or_bail
 	}
 }
 
-sub system_log
-{
-	print("# Running: " . join(" ", @_) ."\n");
-	return system(@_);
-}
-
 sub run_log
 {
 	print("# Running: " . join(" ", @{$_[0]}) ."\n");
-	return run (@_);
+	return IPC::Run::run(@_);
 }
 
+sub issues_sql_like
+{
+	my ($cmd, $expected_sql, $test_name) = @_;
+	truncate $test_server_logfile, 0;
+	my $result = run_log($cmd);
+	ok($result, "@$cmd exit code 0");
+	my $log = slurp_file($test_server_logfile);
+	like($log, $expected_sql, "$test_name: SQL found in server log");
+}
+
+# Generate a string made of the given range of ASCII characters
+sub generate_ascii_string
+{
+	my ($from_char, $to_char) = @_;
+	my $res;
+
+	for my $i ($from_char .. $to_char)
+	{
+		$res .= sprintf("%c", $i);
+	}
+	return $res;
+}
+
+
+sub append_to_file
+{
+	my ($filename, $str) = @_;
+	open my $fh, ">>", $filename
+	  or die "could not write \"$filename\": $!";
+	print $fh $str;
+	close $fh;
+}
 
 #
 # Test functions
 #
-
-
 sub command_ok
 {
 	my ($cmd, $test_name) = @_;
@@ -360,14 +411,26 @@ sub command_like
 	like($stdout, $expected_stdout, "$test_name: matches");
 }
 
-sub issues_sql_like
+sub command_warns_like
 {
-	my ($cmd, $expected_sql, $test_name) = @_;
-	truncate $test_server_logfile, 0;
-	my $result = run_log($cmd);
+	my ($cmd, $expected_stderr, $test_name) = @_;
+	my ($stdout, $stderr);
+	print("# Running: " . join(" ", @{$cmd}) . "\n");
+	my $result = run $cmd, '>', \$stdout, '2>', \$stderr;
 	ok($result, "@$cmd exit code 0");
-	my $log = slurp_file($test_server_logfile);
-	like($log, $expected_sql, "$test_name: SQL found in server log");
+	like($stderr, $expected_stderr, "$test_name: matches.");
+}
+
+sub command_fails_like
+{
+	my ($cmd, $expected_stderr, $test_name) = @_;
+	my ($stdout, $stderr);
+
+	print("# Running: " . join(" ", @{$cmd}) . "\n");
+	my $result = run $cmd, '>', \$stdout, '2>', \$stderr;
+
+	ok(!$result, "expected failure: got @$cmd exit code 0");
+	like($stderr, $expected_stderr, "$test_name: not match expected stderr");
 }
 
 1;

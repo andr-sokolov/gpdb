@@ -5,3 +5,24 @@
 /tmp_check/
 /results/
 /log/
+
+# Configure-generated files
+/GPTest.pm
+
+
+# ignore test tablespaces
+/testtablespace_default_tablespace/
+/testtablespace_temp_tablespace/
+
+twophase_pqexecparams
+
+data/wet_csv?.tbl
+data/wet_text?.tbl
+data/wet_syntax?.tbl
+data/wet_execute.tbl
+
+regression.diffs
+regression.out
+
+stdin
+stdout

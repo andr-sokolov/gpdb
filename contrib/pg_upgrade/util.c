@@ -14,8 +14,11 @@
 
 #include <signal.h>
 
+#include "greenplum/pg_upgrade_greenplum.h"
 
 LogOpts		log_opts;
+
+static step_timer timer;
 
 /*
  * report_status()
@@ -68,6 +71,12 @@ prep_status(const char *fmt,...)
 {
 	va_list		args;
 	char		message[MAX_STRING];
+
+	/*
+	 * If the start time is not set, it means a new step is being started.
+	 */
+	if (INSTR_TIME_IS_ZERO(timer.start_time))
+		INSTR_TIME_SET_CURRENT(timer.start_time);
 
 	va_start(args, fmt);
 	vsnprintf(message, sizeof(message), fmt, args);
@@ -133,6 +142,7 @@ pg_log_v(eLogType type, const char *fmt, va_list ap)
 		case PG_FATAL:
 			printf("\n%s", _(message));
 			printf("Failure, exiting\n");
+			close_progress();
 			exit(1);
 			break;
 
@@ -170,9 +180,7 @@ pg_fatal(const char *fmt,...)
 void
 check_ok(void)
 {
-	/* all seems well */
-	report_status(PG_REPORT, "ok");
-	fflush(stdout);
+	log_with_timing(&timer, "ok");
 }
 
 
@@ -445,6 +453,8 @@ getErrorText(void)
 {
 #ifdef WIN32
 	_dosmaperr(GetLastError());
+	/* _dosmaperr sets errno, so we copy errno here */
+	errNum = errno;
 #endif
 	return pg_strdup(strerror(errno));
 }
