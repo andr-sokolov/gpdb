@@ -1074,8 +1074,12 @@ spgRedoVacuumRedirect(XLogRecPtr lsn, XLogRecord *record)
 	}
 }
 
+/*
+ * GPDB: rm_redo and rm_desc of RmgrTable have different signature from upstream
+ * because xact_redo need different parameter
+ */
 void
-spg_redo(XLogRecPtr lsn, XLogRecord *record)
+spg_redo(XLogRecPtr beginLoc, XLogRecPtr lsn, XLogRecord *record)
 {
 	uint8		info = record->xl_info & ~XLR_INFO_MASK;
 	MemoryContext oldCxt;

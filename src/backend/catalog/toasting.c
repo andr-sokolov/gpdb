@@ -21,12 +21,14 @@
 #include "catalog/heap.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
+#include "catalog/oid_dispatch.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_type.h"
 #include "catalog/toasting.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
+#include "storage/lmgr.h"
 #include "storage/lock.h"
 #include "utils/builtins.h"
 #include "utils/rel.h"
@@ -36,9 +38,11 @@
 Oid			binary_upgrade_next_toast_pg_type_oid = InvalidOid;
 
 static void CheckAndCreateToastTable(Oid relOid, Datum reloptions,
-						 LOCKMODE lockmode, bool check);
+						 LOCKMODE lockmode, bool check,
+						 bool is_part_child, bool is_part_parent);
 static bool create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
-				   Datum reloptions, LOCKMODE lockmode, bool check);
+				   Datum reloptions, LOCKMODE lockmode, bool check,
+				   bool is_part_child, bool is_part_parent);
 static bool needs_toast_table(Relation rel);
 
 
@@ -53,34 +57,72 @@ static bool needs_toast_table(Relation rel);
  * We expect the caller to have verified that the relation is a table and have
  * already done any necessary permission checks.  Callers expect this function
  * to end with CommandCounterIncrement if it makes any changes.
+ *
+ * If 'is_create' is true, we are creating the toast table for a new table,
+ * rather than adding it to an existing one. The difference is that the
+ * caller is expected to already hold an AccessExclusiveLock, if we're
+ * creating a new table.
+ *
+ * If 'is_part_child' is true, we are creating a toast table for a non-root
+ * table in a partition hierarchy.  This determines if array type gets created
+ * for the table or not.  If 'is_part_parent' is true, then we are creating a
+ * toast table for a non-leaf table in a partition hierarchy.  This is used to
+ * determine the value of relfrozenxid for the toast table.  Non-leaf tables do
+ * not contain data, so their relfrozenxid need not interfere in database age
+ * computation.
  */
 void
-AlterTableCreateToastTable(Oid relOid, Datum reloptions, LOCKMODE lockmode)
+AlterTableCreateToastTable(Oid relOid, Datum reloptions, LOCKMODE lockmode,
+						   bool is_part_child, bool is_part_parent)
 {
-	CheckAndCreateToastTable(relOid, reloptions, lockmode, true);
+	CheckAndCreateToastTable(relOid, reloptions, lockmode, true,
+							 is_part_child, is_part_parent);
 }
 
 void
-NewHeapCreateToastTable(Oid relOid, Datum reloptions, LOCKMODE lockmode)
+NewHeapCreateToastTable(Oid relOid, Datum reloptions, LOCKMODE lockmode,
+							bool is_part_child, bool is_part_parent)
 {
-	CheckAndCreateToastTable(relOid, reloptions, lockmode, false);
+	CheckAndCreateToastTable(relOid, reloptions, lockmode, false,
+							 is_part_child, is_part_parent);
 }
 
 void
-NewRelationCreateToastTable(Oid relOid, Datum reloptions)
+NewRelationCreateToastTable(Oid relOid, Datum reloptions,
+							bool is_part_child, bool is_part_parent)
 {
-	CheckAndCreateToastTable(relOid, reloptions, AccessExclusiveLock, false);
+	LOCKMODE	lockmode;
+
+	/*
+	 * Grab a DDL-exclusive lock on the target table, since we'll update the
+	 * pg_class tuple.	This is redundant for all present users.  Tuple
+	 * toasting behaves safely in the face of a concurrent TOAST table add.
+	 *
+	 * When we're creating a new table, we should already hold an AccessExclusiveLock
+	 * on it. It may seem silly to acquire a *stronger* lock in that, case, but
+	 * the idea is that it's cheaper to hold an AccessExclusiveLock twice, rather
+	 * than both an AccessExlusiveLock and a ShareUpdateExclusiveLock.
+	 */
+	if (is_part_child)
+		lockmode = NoLock;
+	else
+		lockmode = AccessExclusiveLock;
+
+	CheckAndCreateToastTable(relOid, reloptions, AccessExclusiveLock, false,
+							 is_part_child, is_part_parent);
 }
 
 static void
-CheckAndCreateToastTable(Oid relOid, Datum reloptions, LOCKMODE lockmode, bool check)
+CheckAndCreateToastTable(Oid relOid, Datum reloptions, LOCKMODE lockmode, bool check,
+							bool is_part_child, bool is_part_parent)
 {
 	Relation	rel;
 
 	rel = heap_open(relOid, lockmode);
 
 	/* create_toast_table does all the work */
-	(void) create_toast_table(rel, InvalidOid, InvalidOid, reloptions, lockmode, check);
+	(void) create_toast_table(rel, InvalidOid, InvalidOid, reloptions, lockmode, check,
+							  is_part_child, is_part_parent);
 
 	heap_close(rel, NoLock);
 }
@@ -106,7 +148,8 @@ BootstrapToastTable(char *relName, Oid toastOid, Oid toastIndexOid)
 
 	/* create_toast_table does all the work */
 	if (!create_toast_table(rel, toastOid, toastIndexOid, (Datum) 0,
-							AccessExclusiveLock, false))
+							AccessExclusiveLock, false,
+							false, false))
 		elog(ERROR, "\"%s\" does not require a toast table",
 			 relName);
 
@@ -123,7 +166,8 @@ BootstrapToastTable(char *relName, Oid toastOid, Oid toastIndexOid)
  */
 static bool
 create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
-				   Datum reloptions, LOCKMODE lockmode, bool check)
+				   Datum reloptions, LOCKMODE lockmode, bool check,
+				   bool is_part_child, bool is_part_parent)
 {
 	Oid			relOid = RelationGetRelid(rel);
 	HeapTuple	reltup;
@@ -133,6 +177,7 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 	Relation	toast_rel;
 	Relation	class_rel;
 	Oid			toast_relid;
+	Oid			toast_idxid;
 	Oid			toast_typid = InvalidOid;
 	Oid			namespaceid;
 	char		toast_relname[NAMEDATALEN];
@@ -165,12 +210,28 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 	if (rel->rd_rel->reltoastrelid != InvalidOid)
 		return false;
 
+    /*
+     * Toast tables for regular relations go in pg_toast; those for temp
+     * relations go into the per-backend temp-toast-table namespace.
+     */
+    if (isTempOrToastNamespace(rel->rd_rel->relnamespace))
+        namespaceid = GetTempToastNamespace();
+    else
+        namespaceid = PG_TOAST_NAMESPACE;
+
+    /*
+     * Create the toast table name and its index name
+     */
+    snprintf(toast_relname, sizeof(toast_relname),
+             "pg_toast_%u", relOid);
+    snprintf(toast_idxname, sizeof(toast_idxname),
+             "pg_toast_%u_index", relOid);
+
 	/*
 	 * Check to see whether the table actually needs a TOAST table.
 	 */
 	if (!IsBinaryUpgrade)
 	{
-		/* Normal mode, normal check */
 		if (!needs_toast_table(rel))
 			return false;
 	}
@@ -194,9 +255,35 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 		 * problem that it might take up an OID that will conflict with some
 		 * old-cluster table we haven't seen yet.
 		 */
-		if (!OidIsValid(binary_upgrade_next_toast_pg_class_oid) ||
-			!OidIsValid(binary_upgrade_next_toast_pg_type_oid))
-			return false;
+		/*
+		 * In Greenplum, partitioned tables are created in a single CREATE
+		 * TABLE statement instead of each member table individually. The
+		 * Oid preassignments are all done before the CREATE TABLE, so we
+		 * can't use and reset a single oid variable, but instead we use them
+		 * as a reference counter. Await the actuall preassign all before we
+		 * decide whether to require a toast table or not.
+		 *
+		 * if (!OidIsValid(binary_upgrade_next_toast_pg_class_oid))
+		 *	!OidIsValid(binary_upgrade_next_toast_pg_type_oid))
+		 *	return false;
+		 */
+
+		/*
+		 * Check if there is a preassigned oid for the toast relation, bailout
+		 * if not.
+		 * When the default statistic target for a column is not the default, pg_dump
+		 * will dump an ALTER command to set the statistics for the
+		 * target column. Thus, during restore, it will come here to add a toast table
+		 * if required.
+		 *
+		 */
+        toastOid = GetPreassignedOidForRelation(namespaceid, toast_relname);
+        if (!OidIsValid(toastOid))
+            return false;
+
+        /* Use binary-upgrade override for pg_type.oid */
+        toast_typid = GetPreassignedOidForType(namespaceid, toast_relname, true);
+
 	}
 
 	/*
@@ -205,14 +292,6 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 	 */
 	if (check && lockmode != AccessExclusiveLock)
 		elog(ERROR, "AccessExclusiveLock required to add toast table.");
-
-	/*
-	 * Create the toast table and its index
-	 */
-	snprintf(toast_relname, sizeof(toast_relname),
-			 "pg_toast_%u", relOid);
-	snprintf(toast_idxname, sizeof(toast_idxname),
-			 "pg_toast_%u_index", relOid);
 
 	/* this is pretty painful...  need a tuple descriptor */
 	tupdesc = CreateTemplateTupleDesc(3, false);
@@ -238,22 +317,6 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 	tupdesc->attrs[1]->attstorage = 'p';
 	tupdesc->attrs[2]->attstorage = 'p';
 
-	/*
-	 * Toast tables for regular relations go in pg_toast; those for temp
-	 * relations go into the per-backend temp-toast-table namespace.
-	 */
-	if (isTempOrToastNamespace(rel->rd_rel->relnamespace))
-		namespaceid = GetTempToastNamespace();
-	else
-		namespaceid = PG_TOAST_NAMESPACE;
-
-	/* Use binary-upgrade override for pg_type.oid, if supplied. */
-	if (IsBinaryUpgrade && OidIsValid(binary_upgrade_next_toast_pg_type_oid))
-	{
-		toast_typid = binary_upgrade_next_toast_pg_type_oid;
-		binary_upgrade_next_toast_pg_type_oid = InvalidOid;
-	}
-
 	toast_relid = heap_create_with_catalog(toast_relname,
 										   namespaceid,
 										   rel->rd_rel->reltablespace,
@@ -263,17 +326,23 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 										   rel->rd_rel->relowner,
 										   tupdesc,
 										   NIL,
+										   /* relam */ InvalidOid,
 										   RELKIND_TOASTVALUE,
 										   rel->rd_rel->relpersistence,
+										   RELSTORAGE_HEAP,
 										   shared_relation,
 										   mapped_relation,
 										   true,
 										   0,
 										   ONCOMMIT_NOOP,
+										   NULL, /* CDB POLICY */
 										   reloptions,
 										   false,
 										   true,
-										   true);
+										   true,
+										   /* valid_opts */ false,
+										   /* is_part_child */ false,
+										   is_part_parent);
 	Assert(toast_relid != InvalidOid);
 
 	/* make the toast relation visible, else heap_open will fail */
@@ -319,16 +388,29 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 	coloptions[0] = 0;
 	coloptions[1] = 0;
 
-	index_create(toast_rel, toast_idxname, toastIndexOid, InvalidOid,
+	if (IsBinaryUpgrade)
+		toastIndexOid = GetPreassignedOidForRelation(namespaceid, toast_idxname);
+
+	toast_idxid = index_create(toast_rel, toast_idxname, toastIndexOid, InvalidOid,
+				 InvalidOid, InvalidOid,
 				 indexInfo,
 				 list_make2("chunk_id", "chunk_seq"),
 				 BTREE_AM_OID,
 				 rel->rd_rel->reltablespace,
 				 collationObjectId, classObjectId, coloptions, (Datum) 0,
 				 true, false, false, false,
-				 true, false, false, true);
-
+				 true, false, false, true, NULL);
 	heap_close(toast_rel, NoLock);
+
+	/*
+	 * If this is a partitioned child, we can unlock since the master is
+	 * already locked.
+	 */
+	if (is_part_child)
+	{
+		UnlockRelationOid(toast_relid, ShareLock);
+		UnlockRelationOid(toast_idxid, AccessExclusiveLock);
+	}
 
 	/*
 	 * Store the toast table's OID in the parent relation's pg_class row

@@ -13,10 +13,16 @@
 
 #include "access/rmgr.h"
 #include "access/xlogdefs.h"
-#include "datatype/timestamp.h"
+#include "access/xlogreader.h"
+#include "catalog/gp_segment_config.h"
+#include "catalog/pg_control.h"
 #include "lib/stringinfo.h"
 #include "storage/buf.h"
+#include "storage/fd.h"
 #include "utils/pg_crc.h"
+#include "utils/relcache.h"
+#include "cdb/cdbpublic.h"
+#include "datatype/timestamp.h"
 
 /*
  * The overall layout of an XLOG record is:
@@ -184,11 +190,14 @@ extern bool reachedConsistency;
 /* these variables are GUC parameters related to XLOG */
 extern int	CheckPointSegments;
 extern int	wal_keep_segments;
+extern int	max_slot_wal_keep_size_mb;
 extern int	XLOGbuffers;
 extern int	XLogArchiveTimeout;
 extern bool XLogArchiveMode;
 extern char *XLogArchiveCommand;
 extern bool EnableHotStandby;
+extern bool gp_keep_all_xlog;
+
 extern bool fullPageWrites;
 extern bool wal_log_hints;
 extern bool log_checkpoints;
@@ -282,7 +291,10 @@ typedef struct CheckpointStatsData
 extern CheckpointStatsData CheckpointStats;
 
 extern XLogRecPtr XLogInsert(RmgrId rmid, uint8 info, XLogRecData *rdata);
+extern XLogRecPtr XLogInsert_OverrideXid(RmgrId rmid, uint8 info, XLogRecData *rdata, TransactionId overrideXid);
+extern XLogRecPtr XLogLastInsertBeginLoc(void);
 extern bool XLogCheckBufferNeedsBackup(Buffer buffer);
+
 extern void XLogFlush(XLogRecPtr RecPtr);
 extern bool XLogBackgroundFlush(void);
 extern bool XLogNeedsFlush(XLogRecPtr RecPtr);
@@ -300,8 +312,10 @@ extern Buffer RestoreBackupBlock(XLogRecPtr lsn, XLogRecord *record,
 				   int block_index,
 				   bool get_cleanup_lock, bool keep_buffer);
 
-extern void xlog_redo(XLogRecPtr lsn, XLogRecord *record);
-extern void xlog_desc(StringInfo buf, uint8 xl_info, char *rec);
+extern void xlog_redo(XLogRecPtr beginLoc __attribute__((unused)), XLogRecPtr lsn __attribute__((unused)), XLogRecord *record);
+extern void xlog_desc(StringInfo buf, XLogRecord *record);
+
+extern void UnpackCheckPointRecord(struct XLogRecord *record, CheckpointExtendedRecord *ckptExtended);
 
 extern void issue_xlog_fsync(int fd, XLogSegNo segno);
 
@@ -332,6 +346,7 @@ extern void InitXLOGAccess(void);
 extern void CreateCheckPoint(int flags);
 extern bool CreateRestartPoint(int flags);
 extern void XLogPutNextOid(Oid nextOid);
+extern void XLogPutNextRelfilenode(Oid nextRelfilenode);
 extern XLogRecPtr XLogRestorePoint(const char *rpName);
 extern void UpdateFullPageWrites(void);
 extern XLogRecPtr GetRedoRecPtr(void);
@@ -340,6 +355,10 @@ extern XLogRecPtr GetFlushRecPtr(void);
 extern void GetNextXidAndEpoch(TransactionId *xid, uint32 *epoch);
 extern void RemovePromoteSignalFiles(void);
 
+extern void XLogGetRecoveryStart(char *callerStr, char *reasonStr, XLogRecPtr *redoCheckPointLoc, CheckPoint *redoCheckPoint);
+
+extern void HandleStartupProcInterrupts(void);
+extern void StartupProcessMain(void);
 extern bool CheckPromoteSignal(void);
 extern void WakeupRecovery(void);
 extern void SetWalWriterSleeping(bool sleeping);
@@ -357,4 +376,14 @@ extern void do_pg_abort_backup(void);
 #define BACKUP_LABEL_FILE		"backup_label"
 #define BACKUP_LABEL_OLD		"backup_label.old"
 
+/* Greenplum additions */
+extern List *XLogReadTimeLineHistory(TimeLineID targetTLI);
+extern bool IsStandbyMode(void);
+extern DBState GetCurrentDBState(void);
+extern XLogRecPtr last_xlog_replay_location(void);
+extern void wait_for_mirror(void);
+extern void wait_to_avoid_large_repl_lag(void);
+extern bool IsRoleMirror(void);
+extern void SignalPromote(void);
+extern void initialize_wal_bytes_written(void);
 #endif   /* XLOG_H */

@@ -60,6 +60,7 @@ extern void get_html_path(const char *my_exec_path, char *ret_path);
 extern void get_man_path(const char *my_exec_path, char *ret_path);
 extern bool get_home_path(char *ret_path);
 extern void get_parent_directory(char *path);
+extern char *gp_mkdtemp(char *template_path);
 
 /* common/pgfnames.c */
 extern char **pgfnames(const char *path);
@@ -88,6 +89,7 @@ extern void pgfnames_cleanup(char **filenames);
 	 IS_DIR_SEP((filename)[2])) \
 )
 #endif
+
 
 /* Portable locale initialization (in exec.c) */
 extern void set_pglocale_pgservice(const char *argv0, const char *app);
@@ -431,7 +433,12 @@ extern void srandom(unsigned int seed);
 /* thread.h */
 extern char *pqStrerror(int errnum, char *strerrbuf, size_t buflen);
 
-#ifndef WIN32
+#if !defined(WIN32) || defined(__CYGWIN__)
+// Obsolete -- use pqGetpwuid() instead.
+extern struct passwd * get_gp_passwdptr(void);
+#endif
+
+#if !defined(WIN32) || defined(__CYGWIN__)
 extern int pqGetpwuid(uid_t uid, struct passwd * resultbuf, char *buffer,
 		   size_t buflen, struct passwd ** result);
 #endif

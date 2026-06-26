@@ -3,6 +3,8 @@
  * view.c
  *	  use rewrite rules to construct views
  *
+ * Portions Copyright (c) 2006-2008, Greenplum inc
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -17,6 +19,8 @@
 #include "access/heapam.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
+#include "catalog/oid_dispatch.h"
+#include "catalog/pg_depend.h"
 #include "commands/defrem.h"
 #include "commands/tablecmds.h"
 #include "commands/view.h"
@@ -34,6 +38,10 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
+
+
+#include "cdb/cdbdisp_query.h"
+#include "cdb/cdbvars.h"
 
 
 static void checkViewTupleDesc(TupleDesc newdesc, TupleDesc olddesc);
@@ -72,6 +80,8 @@ DefineVirtualRelation(RangeVar *relation, List *tlist, bool replace,
 	CreateStmt *createStmt = makeNode(CreateStmt);
 	List	   *attrList;
 	ListCell   *t;
+
+	createStmt->ownerid = GetUserId();
 
 	/*
 	 * create a list of ColumnDef nodes based on the names and types of the
@@ -231,10 +241,13 @@ DefineVirtualRelation(RangeVar *relation, List *tlist, bool replace,
 		createStmt->relation = relation;
 		createStmt->tableElts = attrList;
 		createStmt->inhRelations = NIL;
+		createStmt->inhOids = NIL;
+		createStmt->parentOidCount = 0;
 		createStmt->constraints = NIL;
 		createStmt->options = options;
 		createStmt->oncommit = ONCOMMIT_NOOP;
 		createStmt->tablespacename = NULL;
+		createStmt->relKind = RELKIND_VIEW;
 		createStmt->if_not_exists = false;
 
 		/*
@@ -242,7 +255,7 @@ DefineVirtualRelation(RangeVar *relation, List *tlist, bool replace,
 		 * view, so we don't need more code to complain if "replace" is
 		 * false).
 		 */
-		relid = DefineRelation(createStmt, RELKIND_VIEW, InvalidOid);
+		relid = DefineRelation(createStmt, RELKIND_VIEW, InvalidOid, RELSTORAGE_VIRTUAL, false, true, NULL);
 		Assert(relid != InvalidOid);
 
 		/* Make the new view relation visible */
@@ -403,6 +416,7 @@ UpdateRangeTableOfViewParse(Oid viewOid, Query *viewParse)
 Oid
 DefineView(ViewStmt *stmt, const char *queryString)
 {
+	Query	   *viewParse_orig;
 	Query	   *viewParse;
 	Oid			viewOid;
 	RangeVar   *view;
@@ -415,9 +429,16 @@ DefineView(ViewStmt *stmt, const char *queryString)
 	 *
 	 * Since parse analysis scribbles on its input, copy the raw parse tree;
 	 * this ensures we don't corrupt a prepared statement, for example.
+	 *
+	 * GPDB: Parse analysis is only performed in the dispatcher, the segments
+	 * receive an already-analysed version from the dispatcher.
 	 */
-	viewParse = parse_analyze((Node *) copyObject(stmt->query),
-							  queryString, NULL, 0);
+	if (Gp_role != GP_ROLE_EXECUTE)
+		viewParse = parse_analyze((Node *) copyObject(stmt->query),
+								  queryString, NULL, 0);
+	else
+		viewParse = (Query *) stmt->query;
+	viewParse_orig = copyObject(viewParse);
 
 	/*
 	 * The grammar should ensure that the result is a single SELECT Query.
@@ -443,6 +464,17 @@ DefineView(ViewStmt *stmt, const char *queryString)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 		errmsg("views must not contain data-modifying statements in WITH")));
+
+	/*
+	 * Don't allow creating a view that contains dynamically typed functions.
+	 * We cannot guarantee that the future return type would be the same when
+	 * the view was used, as what it was now.
+	 */
+	if (viewParse->hasDynamicFunctions)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDETERMINATE_DATATYPE),
+				 errmsg("CREATE VIEW statements cannot include calls to "
+						"dynamically typed function")));
 
 	/*
 	 * If the user specified the WITH CHECK OPTION, add it to the list of
@@ -534,9 +566,10 @@ DefineView(ViewStmt *stmt, const char *queryString)
 		&& isQueryUsingTempRelation(viewParse))
 	{
 		view->relpersistence = RELPERSISTENCE_TEMP;
-		ereport(NOTICE,
-				(errmsg("view \"%s\" will be a temporary view",
-						view->relname)));
+		if (Gp_role != GP_ROLE_EXECUTE)
+			ereport(NOTICE,
+					(errmsg("view \"%s\" will be a temporary view",
+							view->relname)));
 	}
 
 	/*
@@ -547,6 +580,18 @@ DefineView(ViewStmt *stmt, const char *queryString)
 	 */
 	viewOid = DefineVirtualRelation(view, viewParse->targetList,
 									stmt->replace, stmt->options, viewParse);
+
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		ViewStmt *dispatchStmt = (ViewStmt *) copyObject(stmt);
+		dispatchStmt->query = (Node *) viewParse_orig;
+		CdbDispatchUtilityStatement((Node *) dispatchStmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									GetAssignedOidsForDispatch(),
+									NULL);
+	}
 
 	return viewOid;
 }

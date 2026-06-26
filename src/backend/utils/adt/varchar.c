@@ -649,7 +649,7 @@ varchartypmodout(PG_FUNCTION_ARGS)
  *****************************************************************************/
 
 /* "True" length (not counting trailing blanks) of a BpChar */
-static int
+static inline int
 bcTruelen(BpChar *arg)
 {
 	char	   *s = VARDATA_ANY(arg);
@@ -698,7 +698,6 @@ bpcharoctetlen(PG_FUNCTION_ARGS)
  * be careful to free working copies of toasted datums.  Most places don't
  * need to be so careful.
  *****************************************************************************/
-
 Datum
 bpchareq(PG_FUNCTION_ARGS)
 {
@@ -937,6 +936,15 @@ internal_bpchar_pattern_compare(BpChar *arg1, BpChar *arg2)
 	int			len1,
 				len2;
 
+	/*
+	 * Before we use VARDATA_SIZE, but we change it to use bcTruelen to
+	 * keep same bahavior with upstream. This bug doesn't exist before in
+	 * GPDB since IndexScan is not used for following query:
+	 * create table tbl(id int4, v char(10));
+	 * create index tbl_v_idx_bpchar on tbl using btree(v bpchar_pattern_ops);
+	 * insert into tbl values (1, 'abc');
+	 * select * from tbl where v = 'abc '::char(20);
+	 */
 	len1 = bcTruelen(arg1);
 	len2 = bcTruelen(arg2);
 

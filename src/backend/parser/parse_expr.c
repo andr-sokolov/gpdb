@@ -15,13 +15,16 @@
 
 #include "postgres.h"
 
+#include "catalog/namespace.h"
 #include "catalog/pg_type.h"
 #include "commands/dbcommands.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "optimizer/clauses.h"
 #include "optimizer/var.h"
 #include "parser/analyze.h"
+#include "parser/parse_agg.h"
 #include "parser/parse_clause.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_collate.h"
@@ -31,9 +34,12 @@
 #include "parser/parse_relation.h"
 #include "parser/parse_target.h"
 #include "parser/parse_type.h"
+#include "rewrite/rewriteManip.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/xml.h"
+
+#include "cdb/cdbhash.h"
 
 
 bool		Transform_null_equals = false;
@@ -56,6 +62,7 @@ static Node *transformSubLink(ParseState *pstate, SubLink *sublink);
 static Node *transformArrayExpr(ParseState *pstate, A_ArrayExpr *a,
 				   Oid array_type, Oid element_type, int32 typmod);
 static Node *transformRowExpr(ParseState *pstate, RowExpr *r);
+static Node *transformTableValueExpr(ParseState *pstate, TableValueExpr *t);
 static Node *transformCoalesceExpr(ParseState *pstate, CoalesceExpr *c);
 static Node *transformMinMaxExpr(ParseState *pstate, MinMaxExpr *m);
 static Node *transformXmlExpr(ParseState *pstate, XmlExpr *x);
@@ -67,6 +74,7 @@ static Node *transformWholeRowRef(ParseState *pstate, RangeTblEntry *rte,
 					 int location);
 static Node *transformIndirection(ParseState *pstate, Node *basenode,
 					 List *indirection);
+static Node *transformGroupingFunc(ParseState *pstate, GroupingFunc *gf);
 static Node *transformTypeCast(ParseState *pstate, TypeCast *tc);
 static Node *transformCollateClause(ParseState *pstate, CollateClause *c);
 static Node *make_row_comparison_op(ParseState *pstate, List *opname,
@@ -75,6 +83,7 @@ static Node *make_row_distinct_op(ParseState *pstate, List *opname,
 					 RowExpr *lrow, RowExpr *rrow, int location);
 static Expr *make_distinct_op(ParseState *pstate, List *opname,
 				 Node *ltree, Node *rtree, int location);
+static bool isWhenIsNotDistinctFromExpr(Node *warg);
 
 
 /*
@@ -283,6 +292,10 @@ transformExprRecurse(ParseState *pstate, Node *expr)
 			result = transformRowExpr(pstate, (RowExpr *) expr);
 			break;
 
+		case T_TableValueExpr:
+			result = transformTableValueExpr(pstate, (TableValueExpr *) expr);
+			break;
+
 		case T_CoalesceExpr:
 			result = transformCoalesceExpr(pstate, (CoalesceExpr *) expr);
 			break;
@@ -318,6 +331,78 @@ transformExprRecurse(ParseState *pstate, Node *expr)
 			result = transformCurrentOfExpr(pstate, (CurrentOfExpr *) expr);
 			break;
 
+		case T_GroupingFunc:
+			{
+				GroupingFunc *gf = (GroupingFunc *)expr;
+				result = transformGroupingFunc(pstate, gf);
+				break;
+			}
+
+		case T_PartitionBoundSpec:
+			{
+				PartitionBoundSpec *in = (PartitionBoundSpec *)expr;
+				PartitionRangeItem *ri;
+				List *out = NIL;
+				ListCell *lc;
+
+				if (in->partStart)
+				{
+					ri = (PartitionRangeItem *)in->partStart;
+
+					/* ALTER TABLE ... ADD PARTITION might feed
+					 * "pre-cooked" expressions into the boundspec for
+					 * range items (which are Lists) 
+					 */
+					{
+						Assert(IsA(in->partStart, PartitionRangeItem));
+
+						foreach(lc, ri->partRangeVal)
+						{
+							Node *n = lfirst(lc);
+							out = lappend(out, transformExpr(pstate, n,
+															 EXPR_KIND_PARTITION_EXPRESSION));
+						}
+						ri->partRangeVal = out;
+						out = NIL;
+					}
+				}
+				if (in->partEnd)
+				{
+					ri = (PartitionRangeItem *)in->partEnd;
+
+					/* ALTER TABLE ... ADD PARTITION might feed
+					 * "pre-cooked" expressions into the boundspec for
+					 * range items (which are Lists) 
+					 */
+					{
+						Assert(IsA(in->partEnd, PartitionRangeItem));
+						foreach(lc, ri->partRangeVal)
+						{
+							Node *n = lfirst(lc);
+							out = lappend(out, transformExpr(pstate, n,
+															 EXPR_KIND_PARTITION_EXPRESSION));
+						}
+						ri->partRangeVal = out;
+						out = NIL;
+					}
+				}
+				if (in->partEvery)
+				{
+					ri = (PartitionRangeItem *)in->partEvery;
+					Assert(IsA(in->partEvery, PartitionRangeItem));
+					foreach(lc, ri->partRangeVal)
+					{
+						Node *n = lfirst(lc);
+						out = lappend(out, transformExpr(pstate, n,
+														 EXPR_KIND_PARTITION_EXPRESSION));
+					}
+					ri->partRangeVal = out;
+				}
+
+				result = (Node *)in;
+			}
+			break;
+
 			/*********************************************
 			 * Quietly accept node types that may be presented when we are
 			 * called on an already-transformed tree.
@@ -330,7 +415,6 @@ transformExprRecurse(ParseState *pstate, Node *expr)
 		case T_Const:
 		case T_Param:
 		case T_Aggref:
-		case T_WindowFunc:
 		case T_ArrayRef:
 		case T_FuncExpr:
 		case T_OpExpr:
@@ -350,6 +434,8 @@ transformExprRecurse(ParseState *pstate, Node *expr)
 		case T_CoerceToDomain:
 		case T_CoerceToDomainValue:
 		case T_SetToDefault:
+		case T_GroupId:
+		case T_Integer:
 			{
 				result = (Node *) expr;
 				break;
@@ -1279,6 +1365,27 @@ transformFuncCall(ParseState *pstate, FuncCall *fn)
 							 fn->location);
 }
 
+/*
+ * Check if this is CASE x WHEN IS NOT DISTINCT FROM y:
+ * From the raw grammar output, we produce AEXPR_NOT expression
+ * 		which has the rhs = AEXPR_DISTINCT expression which has its lhs = NULL
+ */
+static bool
+isWhenIsNotDistinctFromExpr(Node *warg)
+{
+	if (IsA(warg, A_Expr))
+	{
+		A_Expr *top = (A_Expr *) warg;
+		if (top->kind == AEXPR_NOT && IsA(top->rexpr, A_Expr))
+		{
+			A_Expr *expr = (A_Expr *) top->rexpr;
+			if (expr->kind == AEXPR_DISTINCT && expr->lexpr == NULL)
+				return true;
+		}
+	}
+	return false;
+}
+
 static Node *
 transformCaseExpr(ParseState *pstate, CaseExpr *c)
 {
@@ -1345,11 +1452,36 @@ transformCaseExpr(ParseState *pstate, CaseExpr *c)
 		warg = (Node *) w->expr;
 		if (placeholder)
 		{
-			/* shorthand form was specified, so expand... */
-			warg = (Node *) makeSimpleA_Expr(AEXPR_OP, "=",
-											 (Node *) placeholder,
-											 warg,
-											 w->location);
+			/* 
+			 * CASE placeholder WHEN IS NOT DISTINCT FROM warg:
+			 * 		set: warg->rhs->lhs = placeholder
+			 */
+			if (isWhenIsNotDistinctFromExpr(warg))
+			{
+				/*
+				 * Make a copy before we change warg.
+				 * In transformation we don't want to change source (CaseExpr* Node).
+				 * Always create new node and do the transformation
+				 */
+				warg = copyObject(warg);
+				A_Expr *top  = (A_Expr *) warg;
+				A_Expr *expr = (A_Expr *) top->rexpr;
+				expr->lexpr = (Node *) placeholder;
+			}
+			else
+				warg = (Node *) makeSimpleA_Expr(AEXPR_OP, "=",
+													(Node *) placeholder,
+													 warg,
+													 w->location);
+		}
+		else
+		{
+			if (isWhenIsNotDistinctFromExpr(warg))
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("syntax error at or near \"NOT\""),
+						 errhint("Missing <operand> for \"CASE <operand> WHEN IS NOT DISTINCT FROM ...\""),
+						 parser_errposition(pstate, exprLocation((Node *) warg))));
 		}
 		neww->expr = (Expr *) transformExprRecurse(pstate, warg);
 
@@ -1487,6 +1619,13 @@ transformSubLink(ParseState *pstate, SubLink *sublink)
 		case EXPR_KIND_TRIGGER_WHEN:
 			err = _("cannot use subquery in trigger WHEN condition");
 			break;
+		case EXPR_KIND_PARTITION_EXPRESSION:
+			err = _("cannot use subquery in partition key expression");
+			break;
+
+		case EXPR_KIND_SCATTER_BY:
+			/* okay */
+			break;
 
 			/*
 			 * There is intentionally no default: case here, so that the
@@ -1507,7 +1646,7 @@ transformSubLink(ParseState *pstate, SubLink *sublink)
 	/*
 	 * OK, let's transform the sub-SELECT.
 	 */
-	qtree = parse_sub_analyze(sublink->subselect, pstate, NULL, false);
+	qtree = parse_sub_analyze(sublink->subselect, pstate, NULL, NULL);
 
 	/*
 	 * Check that we got something reasonable.  Many of these conditions are
@@ -1827,6 +1966,57 @@ transformRowExpr(ParseState *pstate, RowExpr *r)
 }
 
 static Node *
+transformTableValueExpr(ParseState *pstate, TableValueExpr *t)
+{
+	Query		*query;
+
+	/* If we already transformed this node, do nothing */
+	if (IsA(t->subquery, Query))
+		return (Node*) t;
+
+	/* 
+	 * Table Value Expressions are subselects that can occur as parameters to
+	 * functions.  One result of this is that this code shares a lot with
+	 * transformRangeSubselect due to the nature of subquery resolution.
+	 */
+	pstate->p_hasTblValueExpr = true;
+
+	/* Analyze and transform the subquery */
+	query = parse_sub_analyze(t->subquery, pstate, NULL, NULL);
+
+	query->isTableValueSelect = true;
+
+	/* 
+	 * Check that we got something reasonable.  Most of these conditions
+	 * are probably impossible given restrictions in the grammar.
+	 */
+	if (query == NULL || !IsA(query, Query))
+		elog(ERROR, "unexpected non-SELECT command in TableValueExpr");
+	if (query->commandType != CMD_SELECT)
+		elog(ERROR, "unexpected non-SELECT command in TableValueExpr");
+	if (query->utilityStmt != NULL &&
+		IsA(query->utilityStmt, CreateTableAsStmt))
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("subquery in TABLE value expression cannot have SELECT INTO"),
+				 parser_errposition(pstate, t->location)));
+	t->subquery = (Node*) query;
+
+	/*
+	 * Insist that the TABLE value expression does not contain references to the outer
+	 * range table, this would be an unsupported correlated TABLE value expression.
+	 */
+	if (contain_vars_of_level_or_above((Node *) query, 1))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
+				 errmsg("subquery in TABLE value expression may not refer "
+						"to relation of another query level"),
+				 parser_errposition(pstate, t->location)));
+
+	return (Node*) t;
+}
+
+static Node *
 transformCoalesceExpr(ParseState *pstate, CoalesceExpr *c)
 {
 	CoalesceExpr *newc = makeNode(CoalesceExpr);
@@ -2125,12 +2315,22 @@ transformCurrentOfExpr(ParseState *pstate, CurrentOfExpr *cexpr)
 {
 	int			sublevels_up;
 
+	/*
+	 * The target RTE must be simply updatable. If not, we error out
+	 * early here to avoid having to deal with error cases later:
+	 * rewriting/planning against views, for example.
+	 */
+	Assert(pstate->p_target_rangetblentry != NULL);
+	(void) isSimplyUpdatableRelation(pstate->p_target_rangetblentry->relid, false);
+
 	/* CURRENT OF can only appear at top level of UPDATE/DELETE */
 	Assert(pstate->p_target_rangetblentry != NULL);
 	cexpr->cvarno = RTERangeTablePosn(pstate,
 									  pstate->p_target_rangetblentry,
 									  &sublevels_up);
 	Assert(sublevels_up == 0);
+
+	cexpr->target_relid = pstate->p_target_rangetblentry->relid;
 
 	/*
 	 * Check to see if the cursor name matches a parameter of type REFCURSOR.
@@ -2204,6 +2404,29 @@ transformWholeRowRef(ParseState *pstate, RangeTblEntry *rte, int location)
 	markVarForSelectPriv(pstate, result, rte);
 
 	return (Node *) result;
+}
+
+static Node *
+transformGroupingFunc(ParseState *pstate, GroupingFunc *gf)
+{
+	List *targs = NIL;
+	ListCell *lc;
+	GroupingFunc *new_gf;
+
+	new_gf = makeNode(GroupingFunc);
+
+	/*
+	 * Transform the list of arguments.
+	 */
+	foreach (lc, gf->args)
+		targs = lappend(targs, transformExpr(pstate, (Node *)lfirst(lc),
+											 EXPR_KIND_GROUP_BY));
+
+	new_gf->args = targs;
+
+	new_gf->ngrpcols = gf->ngrpcols;
+
+	return (Node *)new_gf;
 }
 
 /*
@@ -2643,6 +2866,11 @@ ParseExprKindName(ParseExprKind exprKind)
 			return "EXECUTE";
 		case EXPR_KIND_TRIGGER_WHEN:
 			return "WHEN";
+		case EXPR_KIND_PARTITION_EXPRESSION:
+			return "PARTITION BY";
+
+		case EXPR_KIND_SCATTER_BY:
+			return "SCATTER BY";
 
 			/*
 			 * There is intentionally no default: case here, so that the

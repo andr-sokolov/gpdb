@@ -17,15 +17,18 @@
 #include <signal.h>
 #include <unistd.h>
 
+#include "cdb/cdbvars.h"
 #include "commands/async.h"
 #include "miscadmin.h"
 #include "replication/walsender.h"
 #include "storage/latch.h"
 #include "storage/ipc.h"
+#include "storage/latch.h"
 #include "storage/proc.h"
 #include "storage/shmem.h"
 #include "storage/sinval.h"
 #include "tcop/tcopprot.h"
+#include "utils/resgroup.h"
 
 
 /*
@@ -261,6 +264,30 @@ CheckProcSignal(ProcSignalReason reason)
 	return false;
 }
 
+bool
+AmIInSIGUSR1Handler(void)
+{
+	sigset_t oldset;
+	sigprocmask(SIG_BLOCK, NULL, &oldset);
+	return sigismember(&oldset, SIGUSR1);
+}
+
+/*
+ * Query-finish signal from QD.  The executor will deliverately try
+ * to finish execution as quickly as possible.
+ */
+static void
+QueryFinishHandler(void)
+{
+	/*
+	 * It might be too much to check Gp_role but just in case.
+	 */
+	if (!proc_exit_inprogress && Gp_role == GP_ROLE_EXECUTE)
+	{
+		QueryFinishPending = true;
+	}
+}
+
 /*
  * procsignal_sigusr1_handler - handle SIGUSR1 signal.
  */
@@ -274,6 +301,9 @@ procsignal_sigusr1_handler(SIGNAL_ARGS)
 
 	if (CheckProcSignal(PROCSIG_NOTIFY_INTERRUPT))
 		HandleNotifyInterrupt();
+
+	if (CheckProcSignal(PROCSIG_QUERY_FINISH))
+		QueryFinishHandler();
 
 	if (CheckProcSignal(PROCSIG_WALSND_INIT_STOPPING))
 		HandleWalSndInitStopping();
@@ -295,6 +325,9 @@ procsignal_sigusr1_handler(SIGNAL_ARGS)
 
 	if (CheckProcSignal(PROCSIG_RECOVERY_CONFLICT_BUFFERPIN))
 		RecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_BUFFERPIN);
+
+	if (CheckProcSignal(PROCSIG_RESOURCE_GROUP_MOVE_QUERY))
+		HandleMoveResourceGroup();
 
 	if (set_latch_on_sigusr1 && MyProc != NULL)
 		SetLatch(&MyProc->procLatch);

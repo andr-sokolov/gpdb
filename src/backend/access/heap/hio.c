@@ -33,7 +33,7 @@
  * Note - caller must hold BUFFER_LOCK_EXCLUSIVE on the buffer.
  */
 void
-RelationPutHeapTuple(Relation relation,
+RelationPutHeapTuple(Relation relation __attribute__((unused)),
 					 Buffer buffer,
 					 HeapTuple tuple)
 {

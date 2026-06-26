@@ -13,6 +13,7 @@
  */
 #include "postgres.h"
 
+#include "access/bufmask.h"
 #include "access/gist_private.h"
 #include "access/xlogutils.h"
 #include "utils/memutils.h"
@@ -326,7 +327,7 @@ gistRedoCreateIndex(XLogRecPtr lsn, XLogRecord *record)
 }
 
 void
-gist_redo(XLogRecPtr lsn, XLogRecord *record)
+gist_redo(XLogRecPtr beginLoc, XLogRecPtr lsn, XLogRecord *record)
 {
 	uint8		info = record->xl_info & ~XLR_INFO_MASK;
 	MemoryContext oldCxt;
@@ -355,6 +356,52 @@ gist_redo(XLogRecPtr lsn, XLogRecord *record)
 
 	MemoryContextSwitchTo(oldCxt);
 	MemoryContextReset(opCtx);
+}
+
+/*
+ * Mask a Gist page before running consistency checks on it.
+ */
+void
+gist_mask(char *pagedata, BlockNumber blkno)
+{
+	Page		page = (Page) pagedata;
+
+	mask_page_lsn_and_checksum(page);
+
+	mask_page_hint_bits(page);
+	mask_unused_space(page);
+
+	/*
+	 * NSN is nothing but a special purpose LSN. Hence, mask it for the same
+	 * reason as mask_page_lsn.
+	 */
+	PageXLogRecPtrSet(GistPageGetOpaque(page)->nsn, (uint64) MASK_MARKER);
+
+#if PG_VERSION_NUM >= 90100
+	/*
+	 * We update F_FOLLOW_RIGHT flag on the left child after writing WAL
+	 * record. Hence, mask this flag. See gistplacetopage() for details.
+	 */
+	GistMarkFollowRight(page);
+#endif
+
+	if (GistPageIsLeaf(page))
+	{
+		/*
+		 * In gist leaf pages, it is possible to modify the LP_FLAGS without
+		 * emitting any WAL record. Hence, mask the line pointer flags. See
+		 * gistkillitems() for details.
+		 */
+		mask_lp_flags(page);
+	}
+
+#if PG_VERSION_NUM >= 90600
+	/*
+	 * During gist redo, we never mark a page as garbage. Hence, mask it to
+	 * ignore any differences.
+	 */
+	GistClearPageHasGarbage(page);
+#endif
 }
 
 void

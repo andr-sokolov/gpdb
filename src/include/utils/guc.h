@@ -4,6 +4,8 @@
  * External declarations pertaining to backend/utils/misc/guc.c and
  * backend/utils/misc/guc-file.l
  *
+ * Portions Copyright (c) 2007-2010, Greenplum inc
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Copyright (c) 2000-2014, PostgreSQL Global Development Group
  * Written by Peter Eisentraut <peter_e@gmx.net>.
  *
@@ -16,6 +18,15 @@
 #include "nodes/parsenodes.h"
 #include "tcop/dest.h"
 #include "utils/array.h"
+
+#define MAX_AUTHENTICATION_TIMEOUT (600)
+#define MAX_PRE_AUTH_DELAY (60)
+/*
+ * One connection must be reserved for FTS to always able to probe
+ * primary. So, this acts as lower limit on reserved superuser connections on
+ * primaries.
+ */
+#define RESERVED_FTS_CONNECTIONS (1)
 
 
 /*
@@ -103,6 +114,7 @@ typedef enum
 	PGC_S_USER,					/* per-user setting */
 	PGC_S_DATABASE_USER,		/* per-user-and-database setting */
 	PGC_S_CLIENT,				/* from client connection request */
+	PGC_S_RESGROUP,				/* per-resgroup setting */
 	PGC_S_OVERRIDE,				/* special case to forcibly set default */
 	PGC_S_INTERACTIVE,			/* dividing line for error reporting */
 	PGC_S_TEST,					/* test per-database or per-user setting */
@@ -208,6 +220,23 @@ typedef enum
 #define GUC_NOT_WHILE_SEC_REST	0x8000	/* can't set if security restricted */
 #define GUC_DISALLOW_IN_AUTO_FILE	0x00010000	/* can't set in PG_AUTOCONF_FILENAME */
 
+/* GPDB speific */
+#define GUC_GPDB_NEED_SYNC     0x00020000  /* guc value is synced between master and primary */
+#define GUC_GPDB_NO_SYNC       0x00040000  /* guc value is not synced between master and primary */
+#define GUC_DISALLOW_USER_SET  0x00080000 /* Do not allow this GUC to be set by the user */
+
+#define GUC_UNIT_MB			   0x00100000 /* value is in metabytes */
+/* to avoid ABI change, add a new macro to include GUC_UNIT_MB*/
+#define GUC_UNIT_MEMORY_NEW	   (GUC_UNIT_MEMORY | GUC_UNIT_MB)
+
+/* GUC lists for gp_guc_list_show().  (List of struct config_generic) */
+extern List    *gp_guc_list_for_explain;
+extern List    *gp_guc_list_for_no_plan;
+
+/* Changed GUC which need to be pass to QE from QD */
+extern List *gp_guc_restore_list;
+extern bool gp_guc_need_restore;
+
 /* GUC vars that are actually declared in guc.c, rather than elsewhere */
 extern bool log_duration;
 extern bool Debug_print_plan;
@@ -215,10 +244,53 @@ extern bool Debug_print_parse;
 extern bool Debug_print_rewritten;
 extern bool Debug_pretty_print;
 
+extern bool dev_opt_unsafe_truncate_in_subtransaction;
+extern bool	Debug_print_full_dtm;
+extern bool	Debug_print_snapshot_dtm;
+extern bool Debug_disable_distributed_snapshot;
+extern bool Debug_abort_after_distributed_prepared;
+extern bool Debug_bitmap_print_insert;
+extern bool enable_checksum_on_tables;
+extern int  gp_max_local_distributed_cache;
+extern bool gp_local_distributed_cache_stats;
+extern bool gp_heap_require_relhasoids_match;
+extern bool	debug_xlog_record_read;
+extern bool Debug_cancel_print;
+extern bool	Debug_database_command_print;
+extern bool Debug_resource_group;
+extern bool gp_create_table_random_default_distribution;
+extern bool gp_allow_non_uniform_partitioning_ddl;
+extern bool gp_enable_exchange_default_partition;
+extern int  dtx_phase2_retry_count;
+
+/* WAL replication debug gucs */
+extern bool debug_walrepl_snd;
+extern bool debug_walrepl_syncrep;
+extern bool debug_walrepl_rcv;
+extern bool debug_basebackup;
+
+extern int rep_lag_avoidance_threshold;
+
+/* Latch mechanism debug GUCs */
+extern bool debug_latch;
+
+extern bool gp_maintenance_mode;
+extern bool gp_maintenance_conn;
+extern bool allow_segment_DML;
+extern bool gp_allow_rename_relation_without_lock;
+
+extern bool gp_ignore_window_exclude;
+
+extern bool gp_ignore_error_table;
+
+extern bool	Debug_dtm_action_primary;
+
+extern bool gp_log_optimization_time;
 extern bool log_parser_stats;
 extern bool log_planner_stats;
 extern bool log_executor_stats;
 extern bool log_statement_stats;
+extern bool log_dispatch_stats;
 extern bool log_btree_build_stats;
 
 extern PGDLLIMPORT bool check_function_bodies;
@@ -235,7 +307,44 @@ extern int	temp_file_limit;
 
 extern int	num_temp_buffers;
 
-extern char *data_directory;
+extern bool vmem_process_interrupt;
+extern bool execute_pruned_plan;
+
+extern bool gp_partitioning_dynamic_selection_log;
+extern int gp_max_partition_level;
+
+extern bool gp_perfmon_print_packet_info;
+
+extern bool gp_enable_relsize_collection;
+
+/* Debug DTM Action */
+typedef enum
+{
+	DEBUG_DTM_ACTION_NONE = 0,
+	DEBUG_DTM_ACTION_DELAY = 1,
+	DEBUG_DTM_ACTION_FAIL_BEGIN_COMMAND = 2,
+	DEBUG_DTM_ACTION_FAIL_END_COMMAND = 3,
+	DEBUG_DTM_ACTION_PANIC_BEGIN_COMMAND = 4,
+
+	DEBUG_DTM_ACTION_LAST = 4
+}	DebugDtmAction;
+
+/* Debug DTM Action */
+typedef enum
+{
+	DEBUG_DTM_ACTION_TARGET_NONE = 0,
+	DEBUG_DTM_ACTION_TARGET_PROTOCOL = 1,
+	DEBUG_DTM_ACTION_TARGET_SQL = 2,
+
+	DEBUG_DTM_ACTION_TARGET_LAST = 2
+}	DebugDtmActionTarget;
+
+extern int Debug_dtm_action;
+extern int Debug_dtm_action_target;
+extern int Debug_dtm_action_protocol;
+extern int Debug_dtm_action_segment;
+extern int Debug_dtm_action_nestinglevel;
+
 extern PGDLLIMPORT char *ConfigFileName;
 extern char *HbaFileName;
 extern char *IdentFileName;
@@ -243,9 +352,54 @@ extern char *external_pid_file;
 
 extern char *application_name;
 
+extern char *Debug_dtm_action_sql_command_tag;
+extern char *Debug_dtm_action_str;
+extern char *Debug_dtm_action_target_str;
+
+/* Enable check for compatibility of encoding and locale in createdb */
+extern bool gp_encoding_check_locale_compatibility;
+
 extern int	tcp_keepalives_idle;
 extern int	tcp_keepalives_interval;
 extern int	tcp_keepalives_count;
+
+extern int	gp_connection_send_timeout;
+
+extern bool create_restartpoint_on_ckpt_record_replay;
+
+extern char  *data_directory;
+
+/* GUCs for slice table*/
+extern int	gp_max_slices;
+
+/* Time based authentication GUC */
+extern char  *gp_auth_time_override_str;
+
+/* copy GUC */
+extern bool gp_enable_segment_copy_checking;
+
+extern int writable_external_table_bufsize;
+
+/* Enable passing of query constraints to external table providers */
+extern bool gp_external_enable_filter_pushdown;
+
+/* Enable the Global Deadlock Detector */
+extern bool gp_enable_global_deadlock_detector;
+
+typedef enum
+{
+	INDEX_CHECK_NONE,
+	INDEX_CHECK_SYSTEM,
+	INDEX_CHECK_ALL
+} IndexCheckType;
+
+extern IndexCheckType gp_indexcheck_insert;
+extern IndexCheckType gp_indexcheck_vacuum;
+
+/* Storage option names */
+#define SOPT_FILLFACTOR    "fillfactor"
+/* Max number of chars needed to hold value of a storage option. */
+#define MAX_SOPT_VALUE_LEN 15
 
 /*
  * Functions exported by guc.c
@@ -345,6 +499,7 @@ extern void GetConfigOptionByNum(int varnum, const char **values, bool *noshow);
 extern int	GetNumConfigOptions(void);
 
 extern void SetPGVariable(const char *name, List *args, bool is_local);
+extern void SetPGVariableOptDispatch(const char *name, List *args, bool is_local, bool gp_dispatch);
 extern void GetPGVariable(const char *name, DestReceiver *dest);
 extern TupleDesc GetPGVariableResultDesc(const char *name);
 
@@ -356,6 +511,19 @@ extern void ProcessGUCArray(ArrayType *array,
 extern ArrayType *GUCArrayAdd(ArrayType *array, const char *name, const char *value);
 extern ArrayType *GUCArrayDelete(ArrayType *array, const char *name);
 extern ArrayType *GUCArrayReset(ArrayType *array);
+
+extern void pg_timezone_abbrev_initialize(void);
+
+extern List *gp_guc_list_show(GucSource excluding, List *guclist);
+
+extern struct config_generic *find_option(const char *name,
+				bool create_placeholders, int elevel);
+
+extern bool select_gp_replication_config_files(const char *configdir, const char *progname);
+
+extern void set_gp_replication_config(const char *name, const char *value);
+
+extern bool parse_real(const char *value, double *result);
 
 #ifdef EXEC_BACKEND
 extern void write_nondefault_variables(GucContext context);
@@ -401,5 +569,27 @@ extern void assign_search_path(const char *newval, void *extra);
 /* in access/transam/xlog.c */
 extern bool check_wal_buffers(int *newval, void **extra, GucSource source);
 extern void assign_xlog_sync_method(int new_sync_method, void *extra);
+
+/* in cdb/cdbvars.c */
+extern bool check_gp_session_role(char **newval, void **extra, GucSource source);
+extern void assign_gp_session_role(const char *newval, void *extra);
+extern const char *show_gp_session_role(void);
+extern bool check_gp_role(char **newval, void **extra, GucSource source);
+extern void assign_gp_role(const char *newval, void *extra);
+extern const char *show_gp_role(void);
+extern void assign_gp_write_shared_snapshot(bool newval, void *extra);
+extern bool gpvars_check_gp_resource_manager_policy(char **newval, void **extra, GucSource source);
+extern void gpvars_assign_gp_resource_manager_policy(const char *newval, void *extra);
+extern const char *gpvars_show_gp_resource_manager_policy(void);
+extern const char *gpvars_assign_gp_resqueue_memory_policy(const char *newval, bool doit, GucSource source);
+extern const char *gpvars_show_gp_resqueue_memory_policy(void);
+extern bool gpvars_check_statement_mem(int *newval, void **extra, GucSource source);
+extern bool gpvars_check_gp_enable_gpperfmon(bool *newval, void **extra, GucSource source);
+extern bool gpvars_check_gp_gpperfmon_send_interval(int *newval, void **extra, GucSource source);
+extern int guc_name_compare(const char *namea, const char *nameb);
+extern void DispatchSyncPGVariable(struct config_generic * gconfig);
+
+
+extern StdRdOptions *defaultStdRdOptions(char relkind);
 
 #endif   /* GUC_H */
