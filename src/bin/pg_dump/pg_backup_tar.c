@@ -39,6 +39,7 @@
 #include <ctype.h>
 #include <limits.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 static void _ArchiveEntry(ArchiveHandle *AH, TocEntry *te);
 static void _StartData(ArchiveHandle *AH, TocEntry *te);
@@ -58,6 +59,8 @@ static void _StartBlobs(ArchiveHandle *AH, TocEntry *te);
 static void _StartBlob(ArchiveHandle *AH, TocEntry *te, Oid oid);
 static void _EndBlob(ArchiveHandle *AH, TocEntry *te, Oid oid);
 static void _EndBlobs(ArchiveHandle *AH, TocEntry *te);
+
+static FILE *newTempFile(void);
 
 #define K_STD_BUF_SIZE 1024
 
@@ -386,7 +389,7 @@ tarOpen(ArchiveHandle *AH, const char *filename, char mode)
 		old_umask = umask(S_IRWXG | S_IRWXO);
 
 #ifndef WIN32
-		tm->tmpFH = tmpfile();
+		tm->tmpFH = newTempFile();
 #else
 
 		/*
@@ -445,6 +448,107 @@ tarOpen(ArchiveHandle *AH, const char *filename, char mode)
 	tm->tarFH = ctx->tarFH;
 
 	return tm;
+}
+
+/*
+ * newTempFile - creates and opens a stream over a unlinked file.  This
+ * function provides an implmentation of the <stdio.h>/tmpfile() function
+ * that respects the TMPDIR variable.
+ */
+static FILE *
+newTempFile(void)
+{
+	int			count;
+	int			fd;
+	char	   *tmpdir;
+	struct stat buf;
+	char	   *tempFileName = NULL;
+	FILE	   *f = NULL;
+	static int	tmpdirChecked = 0;
+
+	/*
+	 * In some systems, the tempnam() function does't respect the value of the
+	 * TMPDIR environment variable.  To provide predictable operation of this
+	 * function, the value of TMPDIR is obtained and validated to provide it
+	 * as the first argument to tempnam().
+	 */
+	if ((tmpdir = getenv("TMPDIR")) != NULL)
+	{
+		if (!(stat(tmpdir, &buf) == 0 && S_ISDIR(buf.st_mode)))
+		{
+			if (!tmpdirChecked)
+			{
+				tmpdirChecked = 1;
+				write_msg(modulename, "TMPDIR value \"%s\" is not an existing directory; using system default\n", tmpdir);
+			}
+			tmpdir = NULL;
+		}
+	}
+
+	/*
+	 * Attempt to generate and open exclusively a new temporary file. Repeat
+	 * until a new file is opened exclusively or TMP_MAX attempts have failed.
+	 * This section of code largely mirrors what the mkstemp() function might
+	 * do given "${TMPDIR}/GPDB_XXXXXX" as an argument.  Why not just use
+	 * mkstemp()?  Because the different supported OSes have different
+	 * admonitions about which functions are preferred and Solaris prefers
+	 * tmpfile() over mkstemp().
+	 */
+	for (count = 0; count < TMP_MAX; count++)
+	{
+		free(tempFileName);
+
+		/*
+		 * Use of the tempnam() function generates a warning in GCC; the code
+		 * surrounding this use addresses the exposure of which the warning
+		 * informs.
+		 */
+		tempFileName = tempnam(tmpdir, "GPDB_");
+		if (tempFileName == NULL)
+		{
+			/* All name generation errors are fatal. */
+			return NULL;
+		}
+
+		/*
+		 * Create and open the file in exclusive mode with access limited to
+		 * the current user. If an "exists" error is returned, try another
+		 * file name; otherwise return the error.
+		 */
+		if ((fd = open(tempFileName, O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR)) < 0)
+		{
+			/* open() failed */
+			if (errno == EEXIST)
+			{
+				/* The temp file name is already in use; try again */
+				continue;
+			}
+
+			/* Error is considered fatal. */
+			if (tempFileName)
+				free(tempFileName);
+			return NULL;
+		}
+
+		break;
+	}
+
+	/*
+	 * We've created and opened a new file.  Make it temporary by unlinking
+	 * it; the file will exist only until the file descriptor is open.	This
+	 * code segment completes what tmpfile() would do.
+	 */
+	unlink(tempFileName);
+	free(tempFileName);
+
+	/* Now attempt to open a stream over the temporary file. */
+	if ((f = fdopen(fd, "w+b")) == NULL)
+	{
+		/* Can't open stream over file; all errors are fatal. */
+		close(fd);
+	}
+
+	return f;
 }
 
 static void

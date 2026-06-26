@@ -4,6 +4,8 @@
  *	  prototypes for functions in backend/catalog/heap.c
  *
  *
+ * Portions Copyright (c) 2005-2008, Greenplum inc
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -26,6 +28,14 @@ typedef struct RawColumnDefault
 
 typedef struct CookedConstraint
 {
+	/*
+	 * In PostgreSQL, this struct is only during CREATE TABLE processing, but
+	 * in GPDB, we create these in the QD and dispatch pre-built
+	 * CookedConstraints to the QE nodes, in the CreateStmt. That's why we
+	 * need to have a node tag and copy/out/read function support for this
+	 * in GPDB.
+	 */
+	NodeTag		type;
 	ConstrType	contype;		/* CONSTR_DEFAULT or CONSTR_CHECK */
 	char	   *name;			/* name, or NULL if none */
 	AttrNumber	attnum;			/* which attr (only for DEFAULT) */
@@ -33,6 +43,10 @@ typedef struct CookedConstraint
 	bool		skip_validation;	/* skip validation? (only for CHECK) */
 	bool		is_local;		/* constraint has local (non-inherited) def */
 	int			inhcount;		/* number of times constraint is inherited */
+	/*
+	 * Remember to update copy/out/read functions if new fields are added
+	 * here!
+	 */
 	bool		is_no_inherit;	/* constraint has local def and cannot be
 								 * inherited */
 } CookedConstraint;
@@ -43,32 +57,40 @@ extern Relation heap_create(const char *relname,
 			Oid relid,
 			Oid relfilenode,
 			TupleDesc tupDesc,
+			Oid relam,
 			char relkind,
 			char relpersistence,
+			char relstorage,
 			bool shared_relation,
 			bool mapped_relation,
 			bool allow_system_table_mods);
 
 extern Oid heap_create_with_catalog(const char *relname,
-						 Oid relnamespace,
-						 Oid reltablespace,
-						 Oid relid,
-						 Oid reltypeid,
-						 Oid reloftypeid,
-						 Oid ownerid,
-						 TupleDesc tupdesc,
-						 List *cooked_constraints,
-						 char relkind,
-						 char relpersistence,
-						 bool shared_relation,
-						 bool mapped_relation,
-						 bool oidislocal,
-						 int oidinhcount,
-						 OnCommitAction oncommit,
-						 Datum reloptions,
-						 bool use_user_acl,
-						 bool allow_system_table_mods,
-						 bool is_internal);
+									Oid relnamespace,
+									Oid reltablespace,
+									Oid relid,
+									Oid reltypeid,
+									Oid reloftypeid,
+									Oid ownerid,
+									TupleDesc tupdesc,
+									List *cooked_constraints,
+									Oid relam,
+									char relkind,
+									char relpersistence,
+									char relstorage,
+									bool shared_relation,
+									bool mapped_relation,
+									bool oidislocal,
+									int oidinhcount,
+									OnCommitAction oncommit,
+									const struct GpPolicy *policy,    /* MPP */
+									Datum reloptions,
+									bool use_user_acl,
+									bool allow_system_table_mods,
+									bool is_internal,
+									bool valid_opts,
+									bool is_part_child,
+									bool is_part_parent);
 
 extern void heap_create_init_fork(Relation rel);
 
@@ -98,6 +120,9 @@ extern List *AddRelationNewConstraints(Relation rel,
 						  bool allow_merge,
 						  bool is_local,
 						  bool is_internal);
+extern List *AddRelationConstraints(Relation rel,
+						  List *rawColDefaults,
+						  List *constraints);
 
 extern void StoreAttrDefault(Relation rel, AttrNumber attnum,
 				 Node *expr, bool is_internal);
@@ -130,5 +155,29 @@ extern void CheckAttributeType(const char *attname,
 				   Oid atttypid, Oid attcollation,
 				   List *containing_rowtypes,
 				   bool allow_system_table_mods);
+extern void SetRelationNumChecks(Relation rel, int numchecks);
 
+/* MPP-6929: metadata tracking */
+extern void MetaTrackAddObject(Oid		classid, 
+							   Oid		objoid, 
+							   Oid		relowner,
+							   char*	actionname,
+							   char*	subtype);
+extern void MetaTrackUpdObject(Oid		classid, 
+							   Oid		objoid, 
+							   Oid		relowner,
+							   char*	actionname,
+							   char*	subtype);
+extern void MetaTrackDropObject(Oid		classid, 
+								Oid		objoid);
+
+#define MetaTrackValidRelkind(relkind) \
+		(((relkind) == RELKIND_RELATION) \
+		|| ((relkind) == RELKIND_INDEX) \
+		|| ((relkind) == RELKIND_SEQUENCE) \
+		|| ((relkind) == RELKIND_VIEW)) 
+
+extern bool should_have_valid_relfrozenxid(char relkind,
+										   char relstorage,
+										   bool is_partition_parent);
 #endif   /* HEAP_H */

@@ -23,6 +23,7 @@
 #include "libpq/pqformat.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/float_utils.h"
 #include "utils/sortsupport.h"
 
 
@@ -43,23 +44,6 @@ static const uint32 nan[2] = {0xffffffff, 0x7fffffff};
 /* not sure what the following should be, but better to make it over-sufficient */
 #define MAXFLOATWIDTH	64
 #define MAXDOUBLEWIDTH	128
-
-/*
- * check to see if a float4/8 val has underflowed or overflowed
- */
-#define CHECKFLOATVAL(val, inf_is_valid, zero_is_valid)			\
-do {															\
-	if (isinf(val) && !(inf_is_valid))							\
-		ereport(ERROR,											\
-				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),	\
-		  errmsg("value out of range: overflow")));				\
-																\
-	if ((val) == 0.0 && !(zero_is_valid))						\
-		ereport(ERROR,											\
-				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),	\
-		 errmsg("value out of range: underflow")));				\
-} while(0)
-
 
 /* ========== USER I/O ROUTINES ========== */
 
@@ -390,8 +374,9 @@ float8in(PG_FUNCTION_ARGS)
 {
 	char	   *num = PG_GETARG_CSTRING(0);
 	char	   *orig_num;
-	double		val;
+	long double val;
 	char	   *endptr;
+	bool 		literal_inf = true;
 
 	/*
 	 * endptr points to the first character _after_ the sequence we recognized
@@ -415,7 +400,7 @@ float8in(PG_FUNCTION_ARGS)
 					orig_num)));
 
 	errno = 0;
-	val = strtod(num, &endptr);
+	val = strtold(num, &endptr);
 
 	/* did we not see anything that looks like a double? */
 	if (endptr == num || errno != 0)
@@ -437,7 +422,7 @@ float8in(PG_FUNCTION_ARGS)
 			val = get_float8_nan();
 			endptr = num + 3;
 		}
-		else if (pg_strncasecmp(num, "Infinity", 8) == 0)
+		else if (pg_strncasecmp(num, "Infinity", 8) == 0 || pg_strncasecmp(num, "+Infinity", 9) == 0)
 		{
 			val = get_float8_infinity();
 			endptr = num + 8;
@@ -512,9 +497,32 @@ float8in(PG_FUNCTION_ARGS)
 			 errmsg("invalid input syntax for type double precision: \"%s\"",
 					orig_num)));
 
-	CHECKFLOATVAL(val, true, true);
+	/*
+	 * strtod does not support values from 1e-323 to 1e-308 for double datatype in rhel6
+	 * due to changes in glibc. In order to overcome this issue we use strtold to parse
+	 * the string and store it in long double so that we get higher precision. We check if
+	 * this value is within allowed range for double using the below two checks:- 
+	 *
+	 * 1) Overflow - When we try to store a value > 1e308 in a double datatype, it gets represented 
+	 * internally as "inf". Hence in order to check for overflow, we use the isinf() method in order
+	 * to check if (double) val has overflowed. But "inf" is a legitimate value for float8, hence if the
+	 * user entered "inf"/"Infinity" we allow it. Otherwise we treat it as overflow.
+	 *
+	 * 2) Underflow - When we try to store a value < 1e-323, it gets converted to a 0.0. But "0.0" is a 
+	 * legitimate value allowed by float8 datatype. Hence we examine if the val is > 0 or < 0 with higher 
+	 * precision (as long double). Again, 0.0 is allowed for float8. If the user entered 0.0, val will be 0.0
+	 * in both higher precision and when rounded down and we allow it. Otherwise in higher precision, 
+	 * val will be > 0 or < 0 and when rounded down to double it will be 0 which is treated as underflow.
+	 */
 
-	PG_RETURN_FLOAT8(val);
+	if ( pg_strncasecmp(num, "Infinity", 8) != 0  && pg_strncasecmp(num, "-Infinity", 9) != 0 &&\
+		 pg_strncasecmp(num, "Inf", 3) != 0 && pg_strncasecmp(num, "-Inf", 4) != 0 &&\
+		 pg_strncasecmp(num, "+Infinity", 9) != 0 && pg_strncasecmp(num, "+Inf", 4) != 0 )
+		literal_inf = false;
+
+	CHECKFLOATVAL((double) val, literal_inf, !(val > 0 || val < 0));
+
+	PG_RETURN_FLOAT8((double) val);
 }
 
 /*
@@ -1650,6 +1658,14 @@ dcos(PG_FUNCTION_ARGS)
 	PG_RETURN_FLOAT8(result);
 }
 
+/*
+ * cosh
+ */
+Datum
+dcosh(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_FLOAT8(cosh(PG_GETARG_FLOAT8(0)));
+}
 
 /*
  *		dcot			- returns the cotangent of arg1 (radians)
@@ -1693,6 +1709,11 @@ dsin(PG_FUNCTION_ARGS)
 	PG_RETURN_FLOAT8(result);
 }
 
+Datum
+dsinh(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_FLOAT8(sinh(PG_GETARG_FLOAT8(0)));
+}
 
 /*
  *		dtan			- returns the tangent of arg1 (radians)
@@ -1714,6 +1735,11 @@ dtan(PG_FUNCTION_ARGS)
 	PG_RETURN_FLOAT8(result);
 }
 
+Datum
+dtanh(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_FLOAT8(tanh(PG_GETARG_FLOAT8(0)));
+}
 
 /*
  *		degrees		- returns degrees converted from radians
@@ -1828,6 +1854,50 @@ check_float8_array(ArrayType *transarray, const char *caller, int n)
 		ARR_ELEMTYPE(transarray) != FLOAT8OID)
 		elog(ERROR, "%s: expected %d-element float8 array", caller, n);
 	return (float8 *) ARR_DATA_PTR(transarray);
+}
+
+/*
+ * float8_combine
+ *
+ * An aggregate combine function used to combine two 3 fields
+ * aggregate transition data into a single transition data.
+ * This function is used only in two stage aggregation and
+ * shouldn't be called outside aggregate context.
+ */
+Datum
+float8_combine(PG_FUNCTION_ARGS)
+{
+	ArrayType  *transarray1 = PG_GETARG_ARRAYTYPE_P(0);
+	ArrayType  *transarray2 = PG_GETARG_ARRAYTYPE_P(1);
+	float8	   *transvalues1;
+	float8	   *transvalues2;
+	float8		N,
+				sumX,
+				sumX2;
+
+	if (!AggCheckCallContext(fcinfo, NULL))
+		elog(ERROR, "aggregate function called in non-aggregate context");
+
+	transvalues1 = check_float8_array(transarray1, "float8_combine", 3);
+	N = transvalues1[0];
+	sumX = transvalues1[1];
+	sumX2 = transvalues1[2];
+
+	transvalues2 = check_float8_array(transarray2, "float8_combine", 3);
+
+	N += transvalues2[0];
+	sumX += transvalues2[1];
+	CHECKFLOATVAL(sumX, isinf(transvalues1[1]) || isinf(transvalues2[1]),
+				  true);
+	sumX2 += transvalues2[2];
+	CHECKFLOATVAL(sumX2, isinf(transvalues1[2]) || isinf(transvalues2[2]),
+				  true);
+
+	transvalues1[0] = N;
+	transvalues1[1] = sumX;
+	transvalues1[2] = sumX2;
+
+	PG_RETURN_ARRAYTYPE_P(transarray1);
 }
 
 Datum
@@ -2156,6 +2226,69 @@ float8_regr_accum(PG_FUNCTION_ARGS)
 		PG_RETURN_ARRAYTYPE_P(result);
 	}
 }
+
+/*
+ * float8_regr_combine
+ *
+ * An aggregate combine function used to combine two 6 fields
+ * aggregate transition data into a single transition data.
+ * This function is used only in two stage aggregation and
+ * shouldn't be called outside aggregate context.
+ */
+Datum
+float8_regr_combine(PG_FUNCTION_ARGS)
+{
+	ArrayType  *transarray1 = PG_GETARG_ARRAYTYPE_P(0);
+	ArrayType  *transarray2 = PG_GETARG_ARRAYTYPE_P(1);
+	float8	   *transvalues1;
+	float8	   *transvalues2;
+	float8		N,
+				sumX,
+				sumX2,
+				sumY,
+				sumY2,
+				sumXY;
+
+	if (!AggCheckCallContext(fcinfo, NULL))
+		elog(ERROR, "aggregate function called in non-aggregate context");
+
+	transvalues1 = check_float8_array(transarray1, "float8_regr_combine", 6);
+	N = transvalues1[0];
+	sumX = transvalues1[1];
+	sumX2 = transvalues1[2];
+	sumY = transvalues1[3];
+	sumY2 = transvalues1[4];
+	sumXY = transvalues1[5];
+
+	transvalues2 = check_float8_array(transarray2, "float8_regr_combine", 6);
+
+	N += transvalues2[0];
+	sumX += transvalues2[1];
+	CHECKFLOATVAL(sumX, isinf(transvalues1[1]) || isinf(transvalues2[1]),
+				  true);
+	sumX2 += transvalues2[2];
+	CHECKFLOATVAL(sumX2, isinf(transvalues1[2]) || isinf(transvalues2[2]),
+				  true);
+	sumY += transvalues2[3];
+	CHECKFLOATVAL(sumY, isinf(transvalues1[3]) || isinf(transvalues2[3]),
+				  true);
+	sumY2 += transvalues2[4];
+	CHECKFLOATVAL(sumY2, isinf(transvalues1[4]) || isinf(transvalues2[4]),
+				  true);
+	sumXY += transvalues2[5];
+	CHECKFLOATVAL(sumXY, isinf(transvalues1[5]) || isinf(transvalues2[5]),
+				  true);
+
+	transvalues1[0] = N;
+	transvalues1[1] = sumX;
+	transvalues1[2] = sumX2;
+	transvalues1[3] = sumY;
+	transvalues1[4] = sumY2;
+	transvalues1[5] = sumXY;
+
+	PG_RETURN_ARRAYTYPE_P(transarray1);
+}
+
 
 Datum
 float8_regr_sxx(PG_FUNCTION_ARGS)

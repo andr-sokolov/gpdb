@@ -998,7 +998,7 @@ spin_delay(void)
 
 /* Blow up if we didn't have any way to do spinlocks */
 #ifndef HAS_TEST_AND_SET
-#error PostgreSQL does not have native spinlock support on this platform.  To continue the compilation, rerun configure using --disable-spinlocks.  However, performance will be poor.  Please report this to pgsql-bugs@postgresql.org.
+#error Greenplum does not have native spinlock support on this platform.  To continue the compilation, rerun configure using --disable-spinlocks.  However, performance will be poor.  Please report this to bugs@greenplum.org.
 #endif
 
 
@@ -1062,6 +1062,7 @@ extern int	tas(volatile slock_t *lock);		/* in port/.../tas.s, or
 #define TAS_SPIN(lock)	TAS(lock)
 #endif	 /* TAS_SPIN */
 
+extern slock_t dummy_spinlock;
 
 /*
  * Platform-independent out-of-line support routines
@@ -1072,6 +1073,6 @@ extern int s_lock(volatile slock_t *lock, const char *file, int line);
 #define DEFAULT_SPINS_PER_DELAY  100
 
 extern void set_spins_per_delay(int shared_spins_per_delay);
-extern int	update_spins_per_delay(int shared_spins_per_delay);
+extern int	recompute_spins_per_delay(int shared_spins_per_delay);
 
 #endif	 /* S_LOCK_H */

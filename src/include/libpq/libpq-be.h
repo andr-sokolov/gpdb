@@ -54,6 +54,7 @@
 #undef SECURITY_WIN32
 
 #ifndef ENABLE_GSS
+#ifndef GSS_BUFFER_DESC_DEFINED
 /*
  * Define a fake structure compatible with GSSAPI on Unix.
  */
@@ -62,6 +63,8 @@ typedef struct
 	void	   *value;
 	int			length;
 } gss_buffer_desc;
+#define GSS_BUFFER_DESC_DEFINED
+#endif
 #endif
 #endif   /* ENABLE_SSPI */
 
@@ -73,7 +76,7 @@ typedef struct
 typedef enum CAC_state
 {
 	CAC_OK, CAC_STARTUP, CAC_SHUTDOWN, CAC_RECOVERY, CAC_TOOMANY,
-	CAC_WAITBACKUP
+	CAC_WAITBACKUP, CAC_MIRROR_READY
 } CAC_state;
 
 
@@ -91,11 +94,6 @@ typedef struct
 #endif
 } pg_gssinfo;
 #endif
-
-/*
- * SSL renegotiations
- */
-extern int	ssl_renegotiation_limit;
 
 /*
  * This is used by the postmaster in its communication with frontends.  It
@@ -193,6 +191,7 @@ typedef struct Port
 	char	   *peer_cn;
 	unsigned long count;
 #endif
+	char	   *diff_options;
 } Port;
 
 

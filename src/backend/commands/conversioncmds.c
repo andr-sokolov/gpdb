@@ -18,6 +18,7 @@
 #include "access/htup_details.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
+#include "catalog/oid_dispatch.h"
 #include "catalog/pg_conversion.h"
 #include "catalog/pg_conversion_fn.h"
 #include "catalog/pg_type.h"
@@ -30,6 +31,9 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
+
+#include "cdb/cdbvars.h"
+#include "cdb/cdbdisp_query.h"
 
 /*
  * CREATE CONVERSION
@@ -111,6 +115,19 @@ CreateConversionCommand(CreateConversionStmt *stmt)
 	 * All seem ok, go ahead (possible failure would be a duplicate conversion
 	 * name)
 	 */
-	return ConversionCreate(conversion_name, namespaceId, GetUserId(),
-							from_encoding, to_encoding, funcoid, stmt->def);
+	Oid			convOid;
+	convOid = ConversionCreate(conversion_name, namespaceId, GetUserId(),
+							   from_encoding, to_encoding, funcoid, stmt->def);
+					 
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									GetAssignedOidsForDispatch(),
+									NULL);
+	}
+
+	return convOid;
 }

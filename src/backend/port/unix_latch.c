@@ -54,6 +54,7 @@
 #include "storage/latch.h"
 #include "storage/pmsignal.h"
 #include "storage/shmem.h"
+#include "utils/guc.h"
 
 /* Are we currently in WaitLatch? The signal handler would like to know. */
 static volatile sig_atomic_t waiting = false;
@@ -154,7 +155,8 @@ OwnLatch(volatile Latch *latch)
 
 	/* sanity check */
 	if (latch->owner_pid != 0)
-		elog(ERROR, "latch already owned");
+		elog(ERROR, "latch already owned by pid %d (is_set: %d)",
+			 latch->owner_pid, (int) latch->is_set);
 
 	latch->owner_pid = MyProcPid;
 }
@@ -253,6 +255,8 @@ WaitLatchOrSocket(volatile Latch *latch, int wakeEvents, pgsocket sock,
 		tv.tv_usec = (cur_timeout % 1000L) * 1000L;
 		tvp = &tv;
 #endif
+
+		cur_timeout = timeout;
 	}
 	else
 	{
@@ -283,6 +287,9 @@ WaitLatchOrSocket(volatile Latch *latch, int wakeEvents, pgsocket sock,
 		if ((wakeEvents & WL_LATCH_SET) && latch->is_set)
 		{
 			result |= WL_LATCH_SET;
+
+			elogif(debug_latch, LOG,
+					"latch wait -- Latch is set. No need to wait now.");
 
 			/*
 			 * Leave loop immediately, avoid blocking again. We don't attempt
@@ -320,6 +327,9 @@ WaitLatchOrSocket(volatile Latch *latch, int wakeEvents, pgsocket sock,
 			pfds[nfds].revents = 0;
 			nfds++;
 		}
+
+		elogif(debug_latch, LOG,
+				"latch wait -- poll() timeout set to %d", (int)cur_timeout);
 
 		/* Sleep */
 		rc = poll(pfds, nfds, (int) cur_timeout);
@@ -513,9 +523,15 @@ SetLatch(volatile Latch *latch)
 
 	/* Quick exit if already set */
 	if (latch->is_set)
+	{
+		elogif(debug_latch, LOG, "latch set -- Latch for process (pid %u) is already set.",
+									latch->owner_pid);
 		return;
+	}
 
 	latch->is_set = true;
+	elogif(debug_latch, LOG, "latch set -- Latch for process (pid %u) is now set.",
+								latch->owner_pid);
 
 	/*
 	 * See if anyone's waiting for the latch. It can be the current process if
@@ -540,14 +556,23 @@ SetLatch(volatile Latch *latch)
 	 */
 	owner_pid = latch->owner_pid;
 	if (owner_pid == 0)
+	{
+		elogif(debug_latch, LOG, "latch set -- Owner_pid of latch is 0. No process to signal.");
 		return;
+	}
 	else if (owner_pid == MyProcPid)
 	{
 		if (waiting)
+		{
 			sendSelfPipeByte();
+			elogif(debug_latch, LOG, "latch set -- Sent a byte to self pipe.");
+		}
 	}
 	else
+	{
 		kill(owner_pid, SIGUSR1);
+		elogif(debug_latch, LOG, "latch set -- Sent SIGUSR1 to process, pid %u.",owner_pid);
+	}
 }
 
 /*
@@ -571,6 +596,8 @@ ResetLatch(volatile Latch *latch)
 	 * For the moment, callers must supply their own synchronization of flag
 	 * variables (see latch.h).
 	 */
+
+	elogif(debug_latch, LOG, "latch reset -- Latch is now reset for process (pid %u).", latch->owner_pid);
 }
 
 /*
@@ -587,7 +614,9 @@ void
 latch_sigusr1_handler(void)
 {
 	if (waiting)
+	{
 		sendSelfPipeByte();
+	}
 }
 
 /* Send one byte to the self-pipe, to wake up WaitLatch */
@@ -644,9 +673,15 @@ drainSelfPipe(void)
 		if (rc < 0)
 		{
 			if (errno == EAGAIN || errno == EWOULDBLOCK)
+			{
+				elogif(debug_latch, LOG, "latch drainpipe -- pipe read() returned empty.");
 				break;			/* the pipe is empty */
+			}
 			else if (errno == EINTR)
+			{
+				elogif(debug_latch, LOG, "latch drainpipe --pipe read() was interrupted.");
 				continue;		/* retry */
+			}
 			else
 			{
 				waiting = false;
@@ -661,6 +696,7 @@ drainSelfPipe(void)
 		else if (rc < sizeof(buf))
 		{
 			/* we successfully drained the pipe; no need to read() again */
+			elogif(debug_latch, LOG, "latch drainpipe -- pipe read() was successful.");
 			break;
 		}
 		/* else buffer wasn't big enough, so read again */

@@ -21,6 +21,7 @@
 #define XLOG_DBASE_CREATE		0x00
 #define XLOG_DBASE_DROP			0x10
 
+
 typedef struct xl_dbase_create_rec_old
 {
 	/* Records copying of a single subdirectory incl. contents */
@@ -62,9 +63,8 @@ extern Oid	AlterDatabaseOwner(const char *dbname, Oid newOwnerId);
 extern Oid	get_database_oid(const char *dbname, bool missingok);
 extern char *get_database_name(Oid dbid);
 
-extern void dbase_redo(XLogRecPtr lsn, XLogRecord *rptr);
-extern void dbase_desc(StringInfo buf, uint8 xl_info, char *rec);
+extern void dbase_redo(XLogRecPtr beginLoc  __attribute__((unused)), XLogRecPtr lsn  __attribute__((unused)), XLogRecord *rptr);
+extern void dbase_desc(StringInfo buf, XLogRecord *record);
 
 extern void check_encoding_locale_matches(int encoding, const char *collate, const char *ctype);
-
 #endif   /* DBCOMMANDS_H */

@@ -336,8 +336,8 @@ extern const pg_enc2gettext pg_enc2gettext_tbl[];
  * pg_wchar stuff
  */
 typedef int (*mb2wchar_with_len_converter) (const unsigned char *from,
-														pg_wchar *to,
-														int len);
+													pg_wchar *to,
+													int len);
 
 typedef int (*wchar2mb_with_len_converter) (const pg_wchar *from,
 														unsigned char *to,
@@ -488,6 +488,8 @@ extern unsigned char *pg_do_encoding_conversion(unsigned char *src, int len,
 
 extern char *pg_client_to_server(const char *s, int len);
 extern char *pg_server_to_client(const char *s, int len);
+extern char *pg_custom_to_server(const char *s, int len, int src_encoding, void *cep); /* Obsolete? */
+extern char *pg_server_to_custom(const char *s, int len, int dest_encoding, void *cep); /* Obsolete? */
 extern char *pg_any_to_server(const char *s, int len, int encoding);
 extern char *pg_server_to_any(const char *s, int len, int encoding);
 

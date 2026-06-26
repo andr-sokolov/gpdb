@@ -266,8 +266,8 @@ ginHeapTupleBulkInsert(GinBuildState *buildstate, OffsetNumber attnum,
 }
 
 static void
-ginBuildCallback(Relation index, HeapTuple htup, Datum *values,
-				 bool *isnull, bool tupleIsAlive, void *state)
+ginBuildCallback(Relation index, ItemPointer tupleId, Datum *values,
+				 bool *isnull, bool tupleIsAlive __attribute__((unused)), void *state)
 {
 	GinBuildState *buildstate = (GinBuildState *) state;
 	MemoryContext oldCtx;
@@ -278,7 +278,7 @@ ginBuildCallback(Relation index, HeapTuple htup, Datum *values,
 	for (i = 0; i < buildstate->ginstate.origTupdesc->natts; i++)
 		ginHeapTupleBulkInsert(buildstate, (OffsetNumber) (i + 1),
 							   values[i], isnull[i],
-							   &htup->t_self);
+							   tupleId);
 
 	/* If we've maxed out our available memory, dump everything to the index */
 	if (buildstate->accum.allocatedMemory >= maintenance_work_mem * 1024L)
@@ -394,8 +394,8 @@ ginbuild(PG_FUNCTION_ARGS)
 	 * Do the heap scan.  We disallow sync scan here because dataPlaceToPage
 	 * prefers to receive tuples in TID order.
 	 */
-	reltuples = IndexBuildHeapScan(heap, index, indexInfo, false,
-								   ginBuildCallback, (void *) &buildstate);
+	reltuples = IndexBuildScan(heap, index, indexInfo, false,
+							   ginBuildCallback, (void *) &buildstate);
 
 	/* dump remaining entries to the index */
 	oldCtx = MemoryContextSwitchTo(buildstate.tmpCtx);

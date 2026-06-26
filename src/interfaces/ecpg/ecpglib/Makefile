@@ -17,8 +17,18 @@ NAME= ecpg
 SO_MAJOR_VERSION= 6
 SO_MINOR_VERSION= 6
 
+# The frontend doesn't need everything that's in LIBS, some are backend only
+LIBS := $(filter-out -lresolv -lbz2, $(LIBS))
+# This program isn't interactive, so doesn't need these
+LIBS := $(filter-out -lreadline -ledit -ltermcap -lncurses -lcurses -lcurl -lssl -lcrypto -lz, $(LIBS))
+
 override CPPFLAGS := -I../include -I$(top_srcdir)/src/interfaces/ecpg/include \
 	-I$(libpq_srcdir) -I$(top_builddir)/src/port -DFRONTEND $(CPPFLAGS)
+
+
+ifeq ($(GCC), yes)
+override CFLAGS += -Wno-error
+endif
 override CFLAGS += $(PTHREAD_CFLAGS)
 
 # Need to recompile any libpgport object files
@@ -31,6 +41,8 @@ OBJS= execute.o typename.o descriptor.o sqlda.o data.o error.o prepare.o memory.
 # thread.c is needed only for non-WIN32 implementation of path.c
 ifneq ($(PORTNAME), win32)
 OBJS += thread.o
+else
+PTHREAD_LIBS=-lpthread
 endif
 
 SHLIB_LINK_INTERNAL = -L../pgtypeslib -lpgtypes $(libpq)

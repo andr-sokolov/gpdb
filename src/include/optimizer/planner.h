@@ -16,6 +16,7 @@
 
 #include "nodes/plannodes.h"
 #include "nodes/relation.h"
+#include "optimizer/clauses.h"
 
 
 /* Hook for plugins to get control in planner() */
@@ -32,8 +33,19 @@ extern PlannedStmt *standard_planner(Query *parse, int cursorOptions,
 
 extern Plan *subquery_planner(PlannerGlobal *glob, Query *parse,
 				 PlannerInfo *parent_root,
-				 bool hasRecursion, double tuple_fraction,
-				 PlannerInfo **subroot);
+				 bool hasRecursion,
+				 double tuple_fraction,
+				 PlannerInfo **subroot,
+				 PlannerConfig *config);
+
+extern bool choose_hashed_grouping(PlannerInfo *root,
+								   double tuple_fraction, double limit_tuples,
+								   double path_rows, int path_width,
+								   Path *cheapest_path,
+								   Path *sorted_path,
+								   int numGroupOps,
+								   double dNumGroups,
+								   AggClauseCosts *agg_costs);
 
 extern void add_tlist_costs_to_plan(PlannerInfo *root, Plan *plan,
 						List *tlist);
