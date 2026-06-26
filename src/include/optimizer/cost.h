@@ -4,6 +4,8 @@
  *	  prototypes for costsize.c and clausesel.c.
  *
  *
+ * Portions Copyright (c) 2005-2008, Greenplum inc
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -22,7 +24,7 @@
 /* NB: cost-estimation code should use the variables, not these constants! */
 /* If you change these, update backend/utils/misc/postgresql.sample.conf */
 #define DEFAULT_SEQ_PAGE_COST  1.0
-#define DEFAULT_RANDOM_PAGE_COST  4.0
+#define DEFAULT_RANDOM_PAGE_COST  100.0
 #define DEFAULT_CPU_TUPLE_COST	0.01
 #define DEFAULT_CPU_INDEX_TUPLE_COST 0.005
 #define DEFAULT_CPU_OPERATOR_COST  0.0025
@@ -35,6 +37,22 @@ typedef enum
 	CONSTRAINT_EXCLUSION_ON,	/* apply c_e to all rels */
 	CONSTRAINT_EXCLUSION_PARTITION		/* apply c_e to otherrels only */
 }	ConstraintExclusionType;
+
+
+/*
+ * clamp_row_est
+ *		Force a row-count estimate to a sane value.
+ */
+static inline double
+clamp_row_est(double nrows)
+{
+	/*
+	 * Force estimate to be at least one row, to make explain output look
+	 * better and to avoid possible divide-by-zero when interpolating costs.
+     * CDB: Don't round to integer.
+	 */
+    return (nrows < 1.0) ? 1.0 : nrows;
+}
 
 
 /*
@@ -57,13 +75,16 @@ extern bool enable_bitmapscan;
 extern bool enable_tidscan;
 extern bool enable_sort;
 extern bool enable_hashagg;
+extern bool enable_groupagg;
 extern bool enable_nestloop;
 extern bool enable_material;
 extern bool enable_mergejoin;
 extern bool enable_hashjoin;
 extern int	constraint_exclusion;
 
-extern double clamp_row_est(double nrows);
+extern bool gp_enable_hashjoin_size_heuristic;          /*CDB*/
+extern bool gp_enable_predicate_propagation;
+
 extern double index_pages_fetched(double tuples_fetched, BlockNumber pages,
 					double index_pages, PlannerInfo *root);
 extern void cost_seqscan(Path *path, PlannerInfo *root, RelOptInfo *baserel,
@@ -73,6 +94,8 @@ extern void cost_index(IndexPath *path, PlannerInfo *root,
 extern void cost_bitmap_heap_scan(Path *path, PlannerInfo *root, RelOptInfo *baserel,
 					  ParamPathInfo *param_info,
 					  Path *bitmapqual, double loop_count);
+extern void cost_bitmap_table_scan(Path *path, PlannerInfo *root, RelOptInfo *baserel,
+					  Path *bitmapqual, RelOptInfo *outer_rel);
 extern void cost_bitmap_and_node(BitmapAndPath *path, PlannerInfo *root);
 extern void cost_bitmap_or_node(BitmapOrPath *path, PlannerInfo *root);
 extern void cost_bitmap_tree_node(Path *path, Cost *cost, Selectivity *selec);
@@ -81,6 +104,8 @@ extern void cost_tidscan(Path *path, PlannerInfo *root,
 extern void cost_subqueryscan(Path *path, PlannerInfo *root,
 				  RelOptInfo *baserel, ParamPathInfo *param_info);
 extern void cost_functionscan(Path *path, PlannerInfo *root,
+				  RelOptInfo *baserel, ParamPathInfo *param_info);
+extern void cost_tablefunction(Path *path, PlannerInfo *root,
 				  RelOptInfo *baserel, ParamPathInfo *param_info);
 extern void cost_valuesscan(Path *path, PlannerInfo *root,
 				RelOptInfo *baserel, ParamPathInfo *param_info);
@@ -95,14 +120,16 @@ extern void cost_merge_append(Path *path, PlannerInfo *root,
 				  List *pathkeys, int n_streams,
 				  Cost input_startup_cost, Cost input_total_cost,
 				  double tuples);
-extern void cost_material(Path *path,
+extern void cost_material(Path *path, PlannerInfo *root,
 			  Cost input_startup_cost, Cost input_total_cost,
 			  double tuples, int width);
 extern void cost_agg(Path *path, PlannerInfo *root,
 		 AggStrategy aggstrategy, const AggClauseCosts *aggcosts,
 		 int numGroupCols, double numGroups,
 		 Cost input_startup_cost, Cost input_total_cost,
-		 double input_tuples);
+		 double input_tuples,
+		 double input_width, double hash_batches,
+		 double hashentry_width, bool hash_streaming);
 extern void cost_windowagg(Path *path, PlannerInfo *root,
 			   List *windowFuncs, int numPartCols, int numOrderCols,
 			   Cost input_startup_cost, Cost input_total_cost,
@@ -111,6 +138,8 @@ extern void cost_group(Path *path, PlannerInfo *root,
 		   int numGroupCols, double numGroups,
 		   Cost input_startup_cost, Cost input_total_cost,
 		   double input_tuples);
+/* GPDB_92_MERGE_FIXME: parameterized path for shared input scan? */
+extern void cost_shareinputscan(Path *path, PlannerInfo *root, Cost sharecost, double ntuples, int width);
 extern void initial_cost_nestloop(PlannerInfo *root,
 					  JoinCostWorkspace *workspace,
 					  JoinType jointype,
@@ -169,10 +198,19 @@ extern void set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
 						   List *restrictlist);
 extern void set_subquery_size_estimates(PlannerInfo *root, RelOptInfo *rel);
 extern void set_function_size_estimates(PlannerInfo *root, RelOptInfo *rel);
+extern void set_table_function_size_estimates(PlannerInfo *root, RelOptInfo *rel);
+extern void set_rel_width(PlannerInfo *root, RelOptInfo *rel);
 extern void set_values_size_estimates(PlannerInfo *root, RelOptInfo *rel);
 extern void set_cte_size_estimates(PlannerInfo *root, RelOptInfo *rel,
 					   Plan *cteplan);
 extern void set_foreign_size_estimates(PlannerInfo *root, RelOptInfo *rel);
+
+/* Additional costsize.c prototypes for CDB incremental cost functions. */
+extern Cost incremental_hashjoin_cost(double rows, 
+									  int inner_width, int outer_width, 
+									  List *hashclauses,
+									  PlannerInfo *root);
+extern Cost incremental_mergejoin_cost(double rows, List *mergeclauses, PlannerInfo *root);
 
 /*
  * prototypes for clausesel.c
@@ -182,11 +220,15 @@ extern Selectivity clauselist_selectivity(PlannerInfo *root,
 					   List *clauses,
 					   int varRelid,
 					   JoinType jointype,
-					   SpecialJoinInfo *sjinfo);
+					   SpecialJoinInfo *sjinfo,
+					   bool use_damping);
 extern Selectivity clause_selectivity(PlannerInfo *root,
 				   Node *clause,
 				   int varRelid,
 				   JoinType jointype,
-				   SpecialJoinInfo *sjinfo);
+				   SpecialJoinInfo *sjinfo,
+				   bool use_damping);
+extern int planner_segment_count(GpPolicy *policy);
+extern double global_work_mem(PlannerInfo *root);
 
 #endif   /* COST_H */

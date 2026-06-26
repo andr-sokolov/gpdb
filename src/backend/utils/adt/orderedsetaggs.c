@@ -268,7 +268,8 @@ ordered_set_startup(FunctionCallInfo fcinfo, bool use_tuples)
 
 	/* Initialize tuplesort object */
 	if (use_tuples)
-		osastate->sortstate = tuplesort_begin_heap(qstate->tupdesc,
+		osastate->sortstate = tuplesort_begin_heap(NULL,
+												   qstate->tupdesc,
 												   qstate->numSortCols,
 												   qstate->sortColIdx,
 												   qstate->sortOperators,
@@ -276,7 +277,8 @@ ordered_set_startup(FunctionCallInfo fcinfo, bool use_tuples)
 												   qstate->sortNullsFirsts,
 												   work_mem, false);
 	else
-		osastate->sortstate = tuplesort_begin_datum(qstate->sortColType,
+		osastate->sortstate = tuplesort_begin_datum(NULL,
+													qstate->sortColType,
 													qstate->sortOperator,
 													qstate->sortCollation,
 													qstate->sortNullsFirst,
@@ -376,14 +378,14 @@ ordered_set_transition_multi(PG_FUNCTION_ARGS)
 	nargs = PG_NARGS() - 1;
 	for (i = 0; i < nargs; i++)
 	{
-		slot->tts_values[i] = PG_GETARG_DATUM(i + 1);
-		slot->tts_isnull[i] = PG_ARGISNULL(i + 1);
+		slot->PRIVATE_tts_values[i] = PG_GETARG_DATUM(i + 1);
+		slot->PRIVATE_tts_isnull[i] = PG_ARGISNULL(i + 1);
 	}
 	if (osastate->qstate->aggref->aggkind == AGGKIND_HYPOTHETICAL)
 	{
 		/* Add a zero flag value to mark this row as a normal input row */
-		slot->tts_values[i] = Int32GetDatum(0);
-		slot->tts_isnull[i] = false;
+		slot->PRIVATE_tts_values[i] = Int32GetDatum(0);
+		slot->PRIVATE_tts_isnull[i] = false;
 		i++;
 	}
 	Assert(i == slot->tts_tupleDescriptor->natts);
@@ -496,6 +498,42 @@ interval_lerp(Datum lo, Datum hi, double pct)
 	return DirectFunctionCall2(interval_pl, mul_result, lo);
 }
 
+static Datum
+timestamp_lerp(Datum lo, Datum hi, double pct)
+{
+	Timestamp	lots = DatumGetTimestamp(lo);
+	Timestamp	hits = DatumGetTimestamp(hi);
+	Timestamp	diff_result;
+	Timestamp	mul_result;
+
+	diff_result = hits - lots;
+#ifdef HAVE_INT64_TIMESTAMP
+	mul_result = (Timestamp) round(diff_result * pct);
+#else
+	mul_result = (Timestamp) diff_result * pct;
+#endif
+
+	return TimestampGetDatum(lo + mul_result);
+}
+
+static Datum
+timestamptz_lerp(Datum lo, Datum hi, double pct)
+{
+	TimestampTz lots = DatumGetTimestampTz(lo);
+	TimestampTz hits = DatumGetTimestampTz(hi);
+	TimestampTz diff_result;
+	TimestampTz mul_result;
+
+	diff_result = hits - lots;
+#ifdef HAVE_INT64_TIMESTAMP
+	mul_result = (TimestampTz) round(diff_result * pct);
+#else
+	mul_result = (TimestampTz) diff_result * pct;
+#endif
+
+	return TimestampTzGetDatum(lo + mul_result);
+}
+
 /*
  * Continuous percentile
  */
@@ -598,6 +636,24 @@ Datum
 percentile_cont_interval_final(PG_FUNCTION_ARGS)
 {
 	return percentile_cont_final_common(fcinfo, INTERVALOID, interval_lerp);
+}
+
+/*
+ * percentile_cont(float8) within group (timestamp)	- continuous percentile
+ */
+Datum
+percentile_cont_timestamp_final(PG_FUNCTION_ARGS)
+{
+	return percentile_cont_final_common(fcinfo, TIMESTAMPOID, timestamp_lerp);
+}
+
+/*
+ * percentile_cont(float8) within group (timestamptz)	- continuous percentile
+ */
+Datum
+percentile_cont_timestamptz_final(PG_FUNCTION_ARGS)
+{
+	return percentile_cont_final_common(fcinfo, TIMESTAMPTZOID, timestamptz_lerp);
 }
 
 
@@ -998,6 +1054,32 @@ percentile_cont_interval_multi_final(PG_FUNCTION_ARGS)
 											  interval_lerp);
 }
 
+/*
+ * percentile_cont(float8[]) within group (timestamp)  - continuous percentiles
+ */
+Datum
+percentile_cont_timestamp_multi_final(PG_FUNCTION_ARGS)
+{
+	return percentile_cont_multi_final_common(fcinfo,
+											  TIMESTAMPOID,
+	/* hard-wired info on type interval */
+											  8, FLOAT8PASSBYVAL, 'd',
+											  timestamp_lerp);
+}
+
+/*
+ * percentile_cont(float8[]) within group (timestamptz)  - continuous percentiles
+ */
+Datum
+percentile_cont_timestamptz_multi_final(PG_FUNCTION_ARGS)
+{
+	return percentile_cont_multi_final_common(fcinfo,
+											  TIMESTAMPTZOID,
+	/* hard-wired info on type interval */
+											  8, FLOAT8PASSBYVAL, 'd',
+											  timestamptz_lerp);
+}
+
 
 /*
  * mode() within group (anyelement) - most common value
@@ -1166,11 +1248,11 @@ hypothetical_rank_common(FunctionCallInfo fcinfo, int flag,
 	ExecClearTuple(slot);
 	for (i = 0; i < nargs; i++)
 	{
-		slot->tts_values[i] = PG_GETARG_DATUM(i + 1);
-		slot->tts_isnull[i] = PG_ARGISNULL(i + 1);
+		slot->PRIVATE_tts_values[i] = PG_GETARG_DATUM(i + 1);
+		slot->PRIVATE_tts_isnull[i] = PG_ARGISNULL(i + 1);
 	}
-	slot->tts_values[i] = Int32GetDatum(flag);
-	slot->tts_isnull[i] = false;
+	slot->PRIVATE_tts_values[i] = Int32GetDatum(flag);
+	slot->PRIVATE_tts_isnull[i] = false;
 	ExecStoreVirtualTuple(slot);
 
 	tuplesort_puttupleslot(osastate->sortstate, slot);
@@ -1319,11 +1401,11 @@ hypothetical_dense_rank_final(PG_FUNCTION_ARGS)
 	ExecClearTuple(slot);
 	for (i = 0; i < nargs; i++)
 	{
-		slot->tts_values[i] = PG_GETARG_DATUM(i + 1);
-		slot->tts_isnull[i] = PG_ARGISNULL(i + 1);
+		slot->PRIVATE_tts_values[i] = PG_GETARG_DATUM(i + 1);
+		slot->PRIVATE_tts_isnull[i] = PG_ARGISNULL(i + 1);
 	}
-	slot->tts_values[i] = Int32GetDatum(-1);
-	slot->tts_isnull[i] = false;
+	slot->PRIVATE_tts_values[i] = Int32GetDatum(-1);
+	slot->PRIVATE_tts_isnull[i] = false;
 	ExecStoreVirtualTuple(slot);
 
 	tuplesort_puttupleslot(osastate->sortstate, slot);

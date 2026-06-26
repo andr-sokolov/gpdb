@@ -47,6 +47,22 @@
 #include "settings.h"
 #include "variables.h"
 
+#define unify_version(a,b,c) ((a<<16)+(b<<8)+c)
+#if unify_version(YY_FLEX_MAJOR_VERSION,YY_FLEX_MINOR_VERSION,YY_FLEX_SUBMINOR_VERSION) < unify_version(2,5,35)
+int yyget_lineno  (void);
+FILE *yyget_in  (void);
+FILE *yyget_out  (void);
+int yyget_leng  (void);
+char *yyget_text  (void);
+void yyset_lineno (int  line_number );
+void yyset_in (FILE *  in_str );
+void yyset_out (FILE *  out_str );
+int yyget_debug  (void);
+void yyset_debug (int  bdebug );
+int yylex_destroy  (void);
+#endif
+
+
 
 /*
  * We use a stack of flex buffers to handle substitution of psql variables.
@@ -126,6 +142,9 @@ static void emit(const char *txt, int len);
 static char *extract_substring(const char *txt, int len);
 static void escape_variable(bool as_ident);
 
+#ifdef ECHO
+#undef ECHO
+#endif
 #define ECHO emit(yytext, yyleng)
 
 %}
@@ -932,6 +951,12 @@ other			.
 
 {space}|"\\"	{
 					yyless(0);
+					return LEXRES_OK;
+				}
+				
+	/* GPDB: This rule removes the need for a space after the "!" command */
+"!"             {
+					ECHO;
 					return LEXRES_OK;
 				}
 

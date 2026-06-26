@@ -424,6 +424,7 @@ rewrite_heap_tuple(RewriteState state,
 	 */
 	if (!((old_tuple->t_data->t_infomask & HEAP_XMAX_INVALID) ||
 		  HeapTupleHeaderIsOnlyLocked(old_tuple->t_data)) &&
+		!HeapTupleHeaderIndicatesMovedPartitions(old_tuple->t_data) &&
 		!(ItemPointerEquals(&(old_tuple->t_self),
 							&(old_tuple->t_data->t_ctid))))
 	{
@@ -665,6 +666,7 @@ raw_heap_insert(RewriteState state, HeapTuple tup)
 		options |= HEAP_INSERT_NO_LOGICAL;
 
 		heaptup = toast_insert_or_update(state->rs_new_rel, tup, NULL,
+										 TOAST_TUPLE_TARGET, false,
 										 options);
 	}
 	else
@@ -717,6 +719,9 @@ raw_heap_insert(RewriteState state, HeapTuple tup)
 
 			state->rs_blockno++;
 			state->rs_buffer_valid = false;
+
+			if (state->rs_use_wal)
+				wait_to_avoid_large_repl_lag();
 		}
 	}
 

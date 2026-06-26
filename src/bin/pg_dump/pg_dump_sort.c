@@ -22,6 +22,7 @@
 /* translator: this is a module name */
 static const char *modulename = gettext_noop("sorter");
 
+#if 0 /* GPDB_100_MERGE_FIXME: we don't support pre-7.3 dumps. This disappears in PG10. */
 /*
  * Sort priority for object types when dumping a pre-7.3 database.
  * Objects are sorted by priority levels, and within an equal priority level
@@ -74,6 +75,7 @@ static const int oldObjectTypePriority[] =
 	20,							/* DO_EVENT_TRIGGER */
 	15							/* DO_REFRESH_MATVIEW */
 };
+#endif
 
 /*
  * Sort priority for object types when dumping newer databases.
@@ -117,10 +119,12 @@ static const int newObjectTypePriority[] =
 	31,							/* DO_DEFAULT_ACL */
 	21,							/* DO_BLOB */
 	24,							/* DO_BLOB_DATA */
+	21,							/* DO_TYPE_STORAGE_OPTIONS */
 	22,							/* DO_PRE_DATA_BOUNDARY */
 	25,							/* DO_POST_DATA_BOUNDARY */
 	32,							/* DO_EVENT_TRIGGER */
-	33							/* DO_REFRESH_MATVIEW */
+	33,							/* DO_REFRESH_MATVIEW */
+	1							/* DO_BINARY_UPGRADE */
 };
 
 static DumpId preDataBoundId;
@@ -128,7 +132,9 @@ static DumpId postDataBoundId;
 
 
 static int	DOTypeNameCompare(const void *p1, const void *p2);
+#if 0 /* GPDB_100_MERGE_FIXME: we don't support pre-7.3 dumps. This disappears in PG10. */
 static int	DOTypeOidCompare(const void *p1, const void *p2);
+#endif
 static bool TopoSort(DumpableObject **objs,
 		 int numObjs,
 		 DumpableObject **ordering,
@@ -359,6 +365,7 @@ DOTypeNameCompare(const void *p1, const void *p2)
 }
 
 
+#if 0 /* GPDB_100_MERGE_FIXME: we don't support pre-7.3 dumps. This disappears in PG10. */
 /*
  * Sort the given objects into a type/OID-based ordering
  *
@@ -388,6 +395,7 @@ DOTypeOidCompare(const void *p1, const void *p2)
 
 	return oidcmp(obj1->catId.oid, obj2->catId.oid);
 }
+#endif
 
 
 /*
@@ -1320,6 +1328,11 @@ describeDumpableObject(DumpableObject *obj, char *buf, int bufsize)
 					 "TYPE %s  (ID %d OID %u)",
 					 obj->name, obj->dumpId, obj->catId.oid);
 			return;
+		case DO_TYPE_STORAGE_OPTIONS:
+			snprintf(buf, bufsize,
+					 "TYPE STORAGE OPTIONS FOR TYPE %s.%s  (ID %d OID %u) OPTIONS %s",
+					 ((TypeStorageOptions *)obj)->typnamespace, obj->name, obj->dumpId, obj->catId.oid, ((TypeStorageOptions *)obj)->typoptions);
+			return;
 		case DO_SHELL_TYPE:
 			snprintf(buf, bufsize,
 					 "SHELL TYPE %s  (ID %d OID %u)",
@@ -1482,6 +1495,11 @@ describeDumpableObject(DumpableObject *obj, char *buf, int bufsize)
 		case DO_POST_DATA_BOUNDARY:
 			snprintf(buf, bufsize,
 					 "POST-DATA BOUNDARY  (ID %d)",
+					 obj->dumpId);
+			return;
+		case DO_BINARY_UPGRADE:
+			snprintf(buf, bufsize,
+					 "BINARY UPGRADE  (ID %d)",
 					 obj->dumpId);
 			return;
 	}

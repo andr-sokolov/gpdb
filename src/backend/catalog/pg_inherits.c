@@ -28,6 +28,7 @@
 #include "parser/parse_type.h"
 #include "storage/lmgr.h"
 #include "utils/fmgroids.h"
+#include "utils/lsyscache.h"
 #include "utils/syscache.h"
 #include "utils/tqual.h"
 
@@ -137,6 +138,34 @@ find_inheritance_children(Oid parentrelId, LOCKMODE lockmode)
 	}
 
 	pfree(oidarr);
+
+	/*
+	 * The order in which child OIDs are scanned on master may not be
+	 * the same on segments.  When a partitioned table needs to be
+	 * rewritten during ALTER TABLE, master generates new OIDs for
+	 * every child in this list.  Segments scan pg_inherits and
+	 * correlate the list of OIDs dispatched by master with each
+	 * child.  To guarantee that the child <--> new OID pairs are
+	 * identical on master and segments, we need the following sort.
+	 */
+	{
+		ListCell   *item;
+		Oid        *ordered_list;
+
+		ordered_list = (Oid *) palloc(sizeof(Oid) * list_length(list));
+		i = 0;
+		foreach(item, list)
+		{
+			ordered_list[i++] = lfirst_oid(item);
+		}
+		qsort(ordered_list, list_length(list), sizeof(Oid), oid_cmp);
+		i = 0;
+		foreach(item, list)
+		{
+			lfirst_oid(item) = ordered_list[i++];
+		}
+		pfree(ordered_list);
+	}
 
 	return list;
 }
@@ -254,6 +283,30 @@ has_subclass(Oid relationId)
 	return result;
 }
 
+/*
+ * has_superclass - does this relation inherit from another?  The caller
+ * should hold a lock on the given relation so that it can't be concurrently
+ * added to or removed from an inheritance hierarchy.
+ */
+bool
+has_superclass(Oid relationId)
+{
+	Relation	catalog;
+	SysScanDesc scan;
+	ScanKeyData skey;
+	bool		result;
+
+	catalog = heap_open(InheritsRelationId, AccessShareLock);
+	ScanKeyInit(&skey, Anum_pg_inherits_inhrelid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(relationId));
+	scan = systable_beginscan(catalog, InheritsRelidSeqnoIndexId, true,
+							  NULL, 1, &skey);
+	result = HeapTupleIsValid(systable_getnext(scan));
+	systable_endscan(scan);
+	heap_close(catalog, AccessShareLock);
+
+	return result;
+}
 
 /*
  * Given two type OIDs, determine whether the first is a complex type
@@ -358,6 +411,86 @@ typeInheritsFrom(Oid subclassTypeId, Oid superclassTypeId)
 	return result;
 }
 
+/*
+ * Create a single pg_inherits row with the given data
+ */
+void
+StoreSingleInheritance(Oid relationId, Oid parentOid, int32 seqNumber)
+{
+	Datum		values[Natts_pg_inherits];
+	bool		nulls[Natts_pg_inherits];
+	HeapTuple	tuple;
+	Relation	inhRelation;
+
+	inhRelation = heap_open(InheritsRelationId, RowExclusiveLock);
+
+	/*
+	 * Make the pg_inherits entry
+	 */
+	values[Anum_pg_inherits_inhrelid - 1] = ObjectIdGetDatum(relationId);
+	values[Anum_pg_inherits_inhparent - 1] = ObjectIdGetDatum(parentOid);
+	values[Anum_pg_inherits_inhseqno - 1] = Int32GetDatum(seqNumber);
+
+	memset(nulls, 0, sizeof(nulls));
+
+	tuple = heap_form_tuple(RelationGetDescr(inhRelation), values, nulls);
+
+	simple_heap_insert(inhRelation, tuple);
+	CatalogUpdateIndexes(inhRelation, tuple);
+
+	heap_freetuple(tuple);
+
+	heap_close(inhRelation, RowExclusiveLock);
+}
+
+/*
+ * DeleteInheritsTuple
+ *
+ * Delete pg_inherits tuples with the given inhrelid.  inhparent may be given
+ * as InvalidOid, in which case all tuples matching inhrelid are deleted;
+ * otherwise only delete tuples with the specified inhparent.
+ *
+ * Returns whether at least one row was deleted.
+ */
+bool
+DeleteInheritsTuple(Oid inhrelid, Oid inhparent)
+{
+	bool	found = false;
+	Relation	catalogRelation;
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	inheritsTuple;
+
+	/*
+	 * Find pg_inherits entries by inhrelid.
+	 */
+	catalogRelation = heap_open(InheritsRelationId, RowExclusiveLock);
+	ScanKeyInit(&key,
+				Anum_pg_inherits_inhrelid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(inhrelid));
+	scan = systable_beginscan(catalogRelation, InheritsRelidSeqnoIndexId,
+							  true, NULL, 1, &key);
+
+	while (HeapTupleIsValid(inheritsTuple = systable_getnext(scan)))
+	{
+		Oid			parent;
+
+		/* Compare inhparent if it was given, and do the actual deletion. */
+		parent = ((Form_pg_inherits) GETSTRUCT(inheritsTuple))->inhparent;
+		if (!OidIsValid(inhparent) || parent == inhparent)
+		{
+			simple_heap_delete(catalogRelation, &inheritsTuple->t_self);
+			found = true;
+		}
+	}
+
+	/* Done */
+	systable_endscan(scan);
+	heap_close(catalogRelation, RowExclusiveLock);
+
+	return found;
+}
 
 /* qsort comparison function */
 static int

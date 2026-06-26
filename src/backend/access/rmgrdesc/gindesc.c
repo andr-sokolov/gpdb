@@ -77,11 +77,12 @@ desc_recompress_leaf(StringInfo buf, ginxlogRecompressDataLeaf *insertData)
 }
 
 void
-gin_desc(StringInfo buf, uint8 xl_info, char *rec)
+gin_desc(StringInfo buf, XLogRecord *record)
 {
-	uint8		info = xl_info & ~XLR_INFO_MASK;
+	uint8		xl_info = record->xl_info & ~XLR_INFO_MASK;
+	char		*rec = XLogRecGetData(record);
 
-	switch (info)
+	switch (xl_info)
 	{
 		case XLOG_GIN_CREATE_INDEX:
 			appendStringInfoString(buf, "Create index, ");
@@ -182,7 +183,7 @@ gin_desc(StringInfo buf, uint8 xl_info, char *rec)
 			desc_node(buf, ((ginxlogDeleteListPages *) rec)->node, GIN_METAPAGE_BLKNO);
 			break;
 		default:
-			appendStringInfo(buf, "unknown gin op code %u", info);
+			appendStringInfo(buf, "unknown gin op code %u", xl_info);
 			break;
 	}
 }

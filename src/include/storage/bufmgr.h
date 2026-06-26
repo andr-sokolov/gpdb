@@ -14,10 +14,13 @@
 #ifndef BUFMGR_H
 #define BUFMGR_H
 
+#include "miscadmin.h"
 #include "storage/block.h"
 #include "storage/buf.h"
+#include "storage/buf_internals.h"
 #include "storage/bufpage.h"
 #include "storage/relfilenode.h"
+#include "storage/smgr.h"
 #include "utils/relcache.h"
 
 typedef void *Block;
@@ -198,6 +201,7 @@ extern void DropRelFileNodeBuffers(RelFileNodeBackend rnode,
 					   ForkNumber forkNum, BlockNumber firstDelBlock);
 extern void DropRelFileNodesAllBuffers(RelFileNodeBackend *rnodes, int nnodes);
 extern void DropDatabaseBuffers(Oid dbid);
+extern XLogRecPtr BufferGetLSNAtomic(Buffer buffer);
 
 #define RelationGetNumberOfBlocks(reln) \
 	RelationGetNumberOfBlocksInFork(reln, MAIN_FORKNUM)

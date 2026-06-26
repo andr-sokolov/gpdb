@@ -16,6 +16,10 @@
 
 #include "parser/parse_node.h"
 
+#define ERRMSG_GP_WITH_COLUMNS_MISMATCH \
+	"specified number of columns in WITH query \"%s\" must not " \
+	"exceed the number of available columns"
+
 extern RangeTblEntry *refnameRangeTblEntry(ParseState *pstate,
 					 const char *schemaname,
 					 const char *refname,
@@ -41,7 +45,7 @@ extern Node *colNameToVar(ParseState *pstate, char *colname, bool localonly,
 extern void markVarForSelectPriv(ParseState *pstate, Var *var,
 					 RangeTblEntry *rte);
 extern Relation parserOpenTable(ParseState *pstate, const RangeVar *relation,
-				int lockmode);
+					int lockmode, bool *lockUpgraded);
 extern RangeTblEntry *addRangeTableEntry(ParseState *pstate,
 				   RangeVar *relation,
 				   Alias *alias,
@@ -81,7 +85,7 @@ extern RangeTblEntry *addRangeTableEntryForCTE(ParseState *pstate,
 						 Index levelsup,
 						 RangeVar *rv,
 						 bool inFromCl);
-extern bool isLockedRefname(ParseState *pstate, const char *refname);
+extern LockingClause *getLockedRefname(ParseState *pstate, const char *refname);
 extern void addRTEtoQuery(ParseState *pstate, RangeTblEntry *rte,
 			  bool addToJoinList,
 			  bool addToRelNameSpace, bool addToVarNameSpace);
@@ -98,5 +102,8 @@ extern Name attnumAttName(Relation rd, int attid);
 extern Oid	attnumTypeId(Relation rd, int attid);
 extern Oid	attnumCollationId(Relation rd, int attid);
 extern bool isQueryUsingTempRelation(Query *query);
+
+extern bool isSimplyUpdatableRelation(Oid relid, bool noerror);
+extern Index extractSimplyUpdatableRTEIndex(List *rtable);
 
 #endif   /* PARSE_RELATION_H */

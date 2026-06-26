@@ -75,30 +75,23 @@ struct ListCell
  * if supported by the compiler, or as regular functions otherwise.
  * See STATIC_IF_INLINE in c.h.
  */
-#ifndef PG_USE_INLINE
-extern ListCell *list_head(const List *l);
-extern ListCell *list_tail(List *l);
-extern int	list_length(const List *l);
-#endif   /* PG_USE_INLINE */
-#if defined(PG_USE_INLINE) || defined(PG_LIST_INCLUDE_DEFINITIONS)
-STATIC_IF_INLINE ListCell *
+static inline ListCell *
 list_head(const List *l)
 {
 	return l ? l->head : NULL;
 }
 
-STATIC_IF_INLINE ListCell *
+static inline ListCell *
 list_tail(List *l)
 {
 	return l ? l->tail : NULL;
 }
 
-STATIC_IF_INLINE int
+static inline int
 list_length(const List *l)
 {
 	return l ? l->length : 0;
 }
-#endif   /*-- PG_USE_INLINE || PG_LIST_INCLUDE_DEFINITIONS */
 
 /*
  * NB: There is an unfortunate legacy from a previous incarnation of
@@ -136,6 +129,11 @@ list_length(const List *l)
 #define lfourth_int(l)			lfirst_int(lnext(lnext(lnext(list_head(l)))))
 #define lfourth_oid(l)			lfirst_oid(lnext(lnext(lnext(list_head(l)))))
 #define lfourth_node(type,l)	castNode(type, lfourth(l))
+
+#define lfifth(l)				lfirst(lnext(lnext(lnext(lnext(list_head(l))))))
+#define lfifth_int(l)			lfirst_int(lnext(lnext(lnext(lnext(list_head(l))))))
+#define lfifth_oid(l)			lfirst_oid(lnext(lnext(lnext(lnext(list_head(l))))))
+#define lcfifth(l)				lnext(lnext(lnext(lnext(list_head(l)))))
 
 #define llast(l)				lfirst(list_tail(l))
 #define llast_int(l)			lfirst_int(list_tail(l))
@@ -175,6 +173,12 @@ list_length(const List *l)
 #define for_each_cell(cell, initcell)	\
 	for ((cell) = (initcell); (cell) != NULL; (cell) = lnext(cell))
 
+#define foreach_with_count(cell, list, counter) \
+	for ((cell) = list_head(list), (counter)=0; \
+	     (cell) != NULL; \
+	     (cell) = lnext(cell), ++(counter))
+
+
 /*
  * forboth -
  *	  a convenience macro for advancing through two linked lists
@@ -212,6 +216,7 @@ extern List *lcons_oid(Oid datum, List *list);
 extern List *list_concat(List *list1, List *list2);
 extern List *list_truncate(List *list, int new_size);
 
+extern ListCell *list_nth_cell(const List *list, int n);
 extern void *list_nth(const List *list, int n);
 extern int	list_nth_int(const List *list, int n);
 extern Oid	list_nth_oid(const List *list, int n);
@@ -258,6 +263,8 @@ extern void list_free_deep(List *list);
 
 extern List *list_copy(const List *list);
 extern List *list_copy_tail(const List *list, int nskip);
+
+extern void *list_nth_replace(List *list, int n, void *new_data);
 
 /*
  * To ease migration to the new list API, a set of compatibility

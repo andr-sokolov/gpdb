@@ -146,8 +146,11 @@ extern PGDLLIMPORT walrcv_send_type walrcv_send;
 typedef void (*walrcv_disconnect_type) (void);
 extern PGDLLIMPORT walrcv_disconnect_type walrcv_disconnect;
 
+void		libpqwalreceiver_PG_init(void);
+
 /* prototypes for functions in walreceiver.c */
 extern void WalReceiverMain(void) __attribute__((noreturn));
+extern void ProcessWalRcvInterrupts(void);
 
 /* prototypes for functions in walreceiverfuncs.c */
 extern Size WalRcvShmemSize(void);
@@ -160,5 +163,7 @@ extern void RequestXLogStreaming(TimeLineID tli, XLogRecPtr recptr,
 extern XLogRecPtr GetWalRcvWriteRecPtr(XLogRecPtr *latestChunkStart, TimeLineID *receiveTLI);
 extern int	GetReplicationApplyDelay(void);
 extern int	GetReplicationTransferLatency(void);
+extern const char *WalRcvGetStateString(WalRcvState state);
+extern XLogRecPtr WaitNextXLogAvailable(XLogRecPtr recptr, bool *finished);
 
 #endif   /* _WALRECEIVER_H */
