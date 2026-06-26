@@ -8,6 +8,11 @@
 --  - EXCLUDE clauses
 --
 
+-- start_matchsubs
+-- m/DETAIL:  Failing row contains \(.*\)/
+-- s/DETAIL:  Failing row contains \(.*\)/DETAIL:  Failing row contains (#####)/
+-- end_matchsubs
+
 --
 -- DEFAULT syntax
 --
@@ -86,9 +91,9 @@ CREATE SEQUENCE INSERT_SEQ;
 
 CREATE TABLE INSERT_TBL (x INT DEFAULT nextval('insert_seq'),
 	y TEXT DEFAULT '-NULL-',
-	z INT DEFAULT -1 * currval('insert_seq'),
+	z INT DEFAULT -1 * (nextval('insert_seq')-1),
 	CONSTRAINT INSERT_CON CHECK (x >= 3 AND y <> 'check failed' AND x < 8),
-	CHECK (x + z = 0));
+	CHECK (x + z = 0)) DISTRIBUTED BY(y);
 
 INSERT INTO INSERT_TBL(x,z) VALUES (2, -2);
 
@@ -106,10 +111,25 @@ INSERT INTO INSERT_TBL(y) VALUES ('-!NULL-');
 
 SELECT '' AS four, * FROM INSERT_TBL;
 
+-- GPDB: reset the table contents to match upstream.
+delete from insert_tbl;
+insert into insert_tbl values
+  (3, 'Y', -3),
+  (7, '-NULL-', -7),
+  (7, '!check failed', -7),
+  (4, '-!NULL-', -4);
+
 INSERT INTO INSERT_TBL(y,z) VALUES ('check failed', 4);
 INSERT INTO INSERT_TBL(x,y) VALUES (5, 'check failed');
+-- these fail on GPDB, because we cannot use currval in the z columns' DEFAULT like in upstream.
 INSERT INTO INSERT_TBL(x,y) VALUES (5, '!check failed');
 INSERT INTO INSERT_TBL(y) VALUES ('-!NULL-');
+
+-- GPDB: fix the table contents to match upstream again, so that the subsequent
+-- tests start with the same state as in upstream.
+insert into insert_tbl values
+  (5, '!check failed', -5),
+  (6, '-!NULL-', -6);
 
 SELECT '' AS six, * FROM INSERT_TBL;
 
@@ -117,7 +137,7 @@ SELECT 'seven' AS one, nextval('insert_seq');
 
 INSERT INTO INSERT_TBL(y) VALUES ('Y');
 
-SELECT 'eight' AS one, currval('insert_seq');
+SELECT 'eight' AS one, nextval('insert_seq');
 
 -- According to SQL, it is OK to insert a record that gives rise to NULL
 -- constraint-condition results.  Postgres used to reject this, but it
@@ -129,17 +149,11 @@ SELECT '' AS nine, * FROM INSERT_TBL;
 --
 -- Check constraints on system columns
 --
+-- GPDB: tableoid is allowed in upstream, but not in GPDB.
 
 CREATE TABLE SYS_COL_CHECK_TBL (city text, state text, is_capital bool,
                   altitude int,
                   CHECK (NOT (is_capital AND tableoid::regclass::text = 'sys_col_check_tbl')));
-
-INSERT INTO SYS_COL_CHECK_TBL VALUES ('Seattle', 'Washington', false, 100);
-INSERT INTO SYS_COL_CHECK_TBL VALUES ('Olympia', 'Washington', true, 100);
-
-SELECT *, tableoid::regclass::text FROM SYS_COL_CHECK_TBL;
-
-DROP TABLE SYS_COL_CHECK_TBL;
 
 --
 -- Check constraints on system columns other then TableOid should return error
@@ -201,18 +215,29 @@ DELETE FROM INSERT_TBL;
 
 ALTER SEQUENCE INSERT_SEQ RESTART WITH 4;
 
-CREATE TABLE tmp (xd INT, yd TEXT, zd INT);
+CREATE TABLE tmp (xd INT, yd TEXT, zd INT) distributed by (xd);
 
 INSERT INTO tmp VALUES (null, 'Y', null);
 INSERT INTO tmp VALUES (5, '!check failed', null);
 INSERT INTO tmp VALUES (null, 'try again', null);
-INSERT INTO INSERT_TBL(y) select yd from tmp;
+
+-- GPDB: This INSERT  doesn't work in GPDB, because the default is
+-- different. Fix the table contents again for the next test.
+--
+--INSERT INTO INSERT_TBL(y) select yd from tmp;
+INSERT INTO INSERT_TBL VALUES
+  (4, 'Y', -4),
+  (5, '!check failed', -5),
+  (6, 'try again', -6);
 
 SELECT '' AS three, * FROM INSERT_TBL;
 
 INSERT INTO INSERT_TBL SELECT * FROM tmp WHERE yd = 'try again';
 INSERT INTO INSERT_TBL(y,z) SELECT yd, -7 FROM tmp WHERE yd = 'try again';
 INSERT INTO INSERT_TBL(y,z) SELECT yd, -8 FROM tmp WHERE yd = 'try again';
+
+-- GPDB: Fixup
+INSERT INTO INSERT_TBL VALUES (7, 'try again', -7);
 
 SELECT '' AS four, * FROM INSERT_TBL;
 
@@ -251,7 +276,7 @@ SELECT * FROM COPY_TBL;
 -- Primary keys
 --
 
-CREATE TABLE PRIMARY_TBL (i int PRIMARY KEY, t text);
+CREATE TABLE PRIMARY_TBL (i int PRIMARY KEY, t text) DISTRIBUTED BY (i);
 
 INSERT INTO PRIMARY_TBL VALUES (1, 'one');
 INSERT INTO PRIMARY_TBL VALUES (2, 'two');
@@ -265,7 +290,7 @@ SELECT '' AS four, * FROM PRIMARY_TBL;
 DROP TABLE PRIMARY_TBL;
 
 CREATE TABLE PRIMARY_TBL (i int, t text,
-	PRIMARY KEY(i,t));
+	PRIMARY KEY(i,t)) DISTRIBUTED BY (i);
 
 INSERT INTO PRIMARY_TBL VALUES (1, 'one');
 INSERT INTO PRIMARY_TBL VALUES (2, 'two');
@@ -282,7 +307,7 @@ DROP TABLE PRIMARY_TBL;
 -- Unique keys
 --
 
-CREATE TABLE UNIQUE_TBL (i int UNIQUE, t text);
+CREATE TABLE UNIQUE_TBL (i int UNIQUE, t text) DISTRIBUTED BY (i);
 
 INSERT INTO UNIQUE_TBL VALUES (1, 'one');
 INSERT INTO UNIQUE_TBL VALUES (2, 'two');
@@ -297,7 +322,7 @@ SELECT '' AS five, * FROM UNIQUE_TBL;
 DROP TABLE UNIQUE_TBL;
 
 CREATE TABLE UNIQUE_TBL (i int, t text,
-	UNIQUE(i,t));
+	UNIQUE(i,t)) DISTRIBUTED BY (i);
 
 INSERT INTO UNIQUE_TBL VALUES (1, 'one');
 INSERT INTO UNIQUE_TBL VALUES (2, 'two');
@@ -334,6 +359,10 @@ UPDATE unique_tbl SET i = i+1;
 
 SELECT * FROM unique_tbl;
 
+-- GPDB: the above fails, because distribution columns cannot be UPDATEd (without ORCA).
+-- Reset the table to the state the rest of the test expects
+TRUNCATE unique_tbl;
+INSERT INTO unique_tbl VALUES (1, 'one'), (2, 'two'), (3, 'tree'), (4, 'four'), (5, 'five');
 -- explicitly defer the constraint
 BEGIN;
 
@@ -363,6 +392,10 @@ DELETE FROM unique_tbl WHERE i = 5 AND t = 'five';
 COMMIT;
 
 SELECT * FROM unique_tbl;
+
+-- GPDB: Reset the table to the state the rest of the test expects, again.
+TRUNCATE unique_tbl;
+INSERT INTO unique_tbl VALUES (3, 'three'), (1, 'five'), (5, 'one'), (4, 'two'), (2, 'four');
 
 -- should fail at commit-time
 BEGIN;
@@ -422,6 +455,8 @@ DROP TABLE unique_tbl;
 -- EXCLUDE constraints
 --
 
+-- start_ignore
+-- GPDB does not support exclusion constraints, so no need to run these tests
 CREATE TABLE circles (
   c1 CIRCLE,
   c2 TEXT,
@@ -488,3 +523,34 @@ UPDATE deferred_excl SET f1 = 3;
 ALTER TABLE deferred_excl ADD EXCLUDE (f1 WITH =);
 
 DROP TABLE deferred_excl;
+-- end_ignore
+
+--
+-- Test foreign key constraints
+--
+BEGIN;
+-- Test with two heap tables
+CREATE TABLE fkc_primary_table1(a int PRIMARY KEY, b text) DISTRIBUTED BY (a);
+CREATE TABLE fkc_foreign_table1(a int REFERENCES fkc_primary_table1 ON DELETE RESTRICT ON UPDATE RESTRICT, b text) DISTRIBUTED BY (a);
+-- the following should succeed
+INSERT INTO fkc_primary_table1 VALUES (1, 'bar');
+INSERT INTO fkc_primary_table1 VALUES (2, 'bar');
+INSERT INTO fkc_foreign_table1 VALUES (1, 'bar');
+INSERT INTO fkc_foreign_table1 VALUES (2, 'bar');
+UPDATE fkc_foreign_table1 SET b = 'foo';
+DELETE FROM fkc_primary_table1 WHERE a = 1;
+COMMIT;
+
+BEGIN;
+-- Test with an ao table and heap table
+CREATE TABLE fkc_primary_table2(a int PRIMARY KEY, b text) DISTRIBUTED BY (a);
+CREATE TABLE fkc_foreign_table2(a int REFERENCES fkc_primary_table2 ON DELETE RESTRICT ON UPDATE RESTRICT,
+                                b text) WITH (APPENDONLY=TRUE) DISTRIBUTED BY (a);
+-- the following should succeed
+INSERT INTO fkc_primary_table2 VALUES (1, 'bar');
+INSERT INTO fkc_primary_table2 VALUES (2, 'bar');
+INSERT INTO fkc_foreign_table2 VALUES (1, 'bar');
+INSERT INTO fkc_foreign_table2 VALUES (2, 'bar');
+UPDATE fkc_foreign_table2 SET b = 'foo';
+DELETE FROM fkc_primary_table2 WHERE a = 1;
+COMMIT;

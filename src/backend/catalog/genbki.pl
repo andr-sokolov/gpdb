@@ -111,7 +111,6 @@ our @types;
 # produce output, one catalog at a time
 foreach my $catname (@{ $catalogs->{names} })
 {
-
 	# .bki CREATE command for this catalog
 	my $catalog = $catalogs->{$catname};
 	print BKI "create $catname $catalog->{relation_oid}"
@@ -233,7 +232,8 @@ foreach my $catname (@{ $catalogs->{names} })
 					{ cmin     => 'cid' },
 					{ xmax     => 'xid' },
 					{ cmax     => 'cid' },
-					{ tableoid => 'oid' });
+					{ tableoid => 'oid' },
+					{ gp_segment_id => 'int4' });
 				foreach my $attr (@SYS_ATTRS)
 				{
 					$attnum--;

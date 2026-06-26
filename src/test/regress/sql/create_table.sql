@@ -175,22 +175,22 @@ CREATE TABLE aggtest (
 CREATE TABLE hash_i4_heap (
 	seqno 		int4,
 	random 		int4
-);
+) distributed by (seqno);
 
 CREATE TABLE hash_name_heap (
 	seqno 		int4,
 	random 		name
-);
+) distributed by (seqno);
 
 CREATE TABLE hash_txt_heap (
 	seqno 		int4,
 	random 		text
-);
+) distributed by (seqno);
 
 CREATE TABLE hash_f8_heap (
 	seqno		int4,
 	random 		float8
-);
+) distributed by (seqno);
 
 -- don't include the hash_ovfl_heap stuff in the distribution
 -- the data set is too large for what it's worth
@@ -254,3 +254,8 @@ CREATE TEMP TABLE explicitly_temp (a int primary key);			-- also OK
 CREATE TEMP TABLE pg_temp.doubly_temp (a int primary key);		-- also OK
 CREATE TEMP TABLE public.temp_to_perm (a int primary key);		-- not OK
 DROP TABLE unlogged1, public.unlogged2;
+
+-- Test github issue #7340. truncating a toast unlogged table fails.
+-- Leave the table on purpose for pg_dump and gp_replica_check tests.
+CREATE UNLOGGED TABLE unlogged_toast (a text);
+TRUNCATE unlogged_toast;

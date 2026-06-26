@@ -1,8 +1,9 @@
+set optimizer_print_missing_stats = off;
 --
 -- ALTER_TABLE
 -- add attribute
 --
-
+DROP TABLE IF EXISTS tmp;
 CREATE TABLE tmp (initial int4);
 
 COMMENT ON TABLE tmp_wrong IS 'table comment';
@@ -201,7 +202,7 @@ ALTER TABLE tmp_view RENAME TO tmp_view_new;
 set enable_seqscan to off;
 set enable_bitmapscan to off;
 -- 5 values, sorted
-SELECT unique1 FROM tenk1 WHERE unique1 < 5;
+SELECT unique1 FROM tenk1 WHERE unique1 < 5 ORDER BY 1;
 reset enable_seqscan;
 reset enable_bitmapscan;
 
@@ -266,11 +267,11 @@ DROP TABLE like_constraint_rename_cache;
 
 -- FOREIGN KEY CONSTRAINT adding TEST
 
-CREATE TABLE tmp2 (a int primary key);
+CREATE TABLE tmp2 (a int primary key) distributed by (a);
 
 CREATE TABLE tmp3 (a int, b int);
 
-CREATE TABLE tmp4 (a int, b int, unique(a,b));
+CREATE TABLE tmp4 (a int, b int, unique(a,b)) distributed by (a);
 
 CREATE TABLE tmp5 (a int, b int);
 
@@ -294,10 +295,8 @@ ALTER TABLE tmp3 add constraint tmpconstr foreign key(a) references tmp2(b) matc
 -- Try (and fail) to add constraint due to invalid data
 ALTER TABLE tmp3 add constraint tmpconstr foreign key (a) references tmp2 match full;
 
--- Delete failing row
+-- Delete one row, add the constraint again -- should fail
 DELETE FROM tmp3 where a=5;
-
--- Try (and succeed)
 ALTER TABLE tmp3 add constraint tmpconstr foreign key (a) references tmp2 match full;
 ALTER TABLE tmp3 drop constraint tmpconstr;
 
@@ -305,14 +304,19 @@ INSERT INTO tmp3 values (5,50);
 
 -- Try NOT VALID and then VALIDATE CONSTRAINT, but fails. Delete failure then re-validate
 ALTER TABLE tmp3 add constraint tmpconstr foreign key (a) references tmp2 match full NOT VALID;
+-- FK constraints are not supported in GPDB
+--start_ignore
 ALTER TABLE tmp3 validate constraint tmpconstr;
+--end_ignore
 
 -- Delete failing row
 DELETE FROM tmp3 where a=5;
 
 -- Try (and succeed) and repeat to show it works on already valid constraint
+--start_ignore
 ALTER TABLE tmp3 validate constraint tmpconstr;
 ALTER TABLE tmp3 validate constraint tmpconstr;
+--end_ignore
 
 -- Try a non-verified CHECK constraint
 ALTER TABLE tmp3 ADD CONSTRAINT b_greater_than_ten CHECK (b > 10); -- fail
@@ -327,7 +331,7 @@ select * from tmp3;
 CREATE TABLE tmp6 () INHERITS (tmp3);
 CREATE TABLE tmp7 () INHERITS (tmp3);
 
-INSERT INTO tmp6 VALUES (6, 30), (7, 16);
+INSERT INTO tmp6 VALUES (6, 30), (1, 16);
 ALTER TABLE tmp3 ADD CONSTRAINT b_le_20 CHECK (b <= 20) NOT VALID;
 ALTER TABLE tmp3 VALIDATE CONSTRAINT b_le_20;	-- fails
 DELETE FROM tmp6 WHERE b > 20;
@@ -335,7 +339,7 @@ ALTER TABLE tmp3 VALIDATE CONSTRAINT b_le_20;	-- succeeds
 
 -- An already validated constraint must not be revalidated
 CREATE FUNCTION boo(int) RETURNS int IMMUTABLE STRICT LANGUAGE plpgsql AS $$ BEGIN RAISE NOTICE 'boo: %', $1; RETURN $1; END; $$;
-INSERT INTO tmp7 VALUES (8, 18);
+INSERT INTO tmp7 VALUES (1, 18);
 ALTER TABLE tmp7 ADD CONSTRAINT identity CHECK (b = boo(b));
 ALTER TABLE tmp3 ADD CONSTRAINT IDENTITY check (b = boo(b)) NOT VALID;
 ALTER TABLE tmp3 VALIDATE CONSTRAINT identity;
@@ -398,7 +402,7 @@ alter table nv_parent add check (d between '2001-01-01'::date and '2099-12-31'::
 -- Note: these tables are TEMP to avoid name conflicts when this test
 -- is run in parallel with foreign_key.sql.
 
-CREATE TEMP TABLE PKTABLE (ptest1 int PRIMARY KEY);
+CREATE TEMP TABLE PKTABLE (ptest1 int PRIMARY KEY) distributed by (ptest1);
 INSERT INTO PKTABLE VALUES(42);
 CREATE TEMP TABLE FKTABLE (ftest1 inet);
 -- This next should fail, because int=inet does not exist
@@ -435,7 +439,8 @@ DROP TABLE FKTABLE;
 DROP TABLE PKTABLE;
 
 CREATE TEMP TABLE PKTABLE (ptest1 int, ptest2 inet,
-                           PRIMARY KEY(ptest1, ptest2));
+                           PRIMARY KEY(ptest1, ptest2))
+                           distributed by (ptest1);
 -- This should fail, because we just chose really odd types
 CREATE TEMP TABLE FKTABLE (ftest1 cidr, ftest2 timestamp);
 ALTER TABLE FKTABLE ADD FOREIGN KEY(ftest1, ftest2) references pktable;
@@ -493,6 +498,9 @@ ORDER BY 1,2,3;
 create table atacc1 ( test int );
 -- add a check constraint
 alter table atacc1 add constraint atacc_test1 check (test>3);
+-- start_ignore
+-- Known_opt_diff: MPP-21330
+-- end_ignore
 -- should fail
 insert into atacc1 (test) values (2);
 -- should succeed
@@ -598,7 +606,7 @@ drop table atacc1;
 
 -- test unique constraint adding
 
-create table atacc1 ( test int ) with oids;
+create table atacc1 ( test int ) with oids distributed by (test);
 -- add a unique constraint
 alter table atacc1 add constraint atacc_test1 unique (test);
 -- insert first value
@@ -606,15 +614,20 @@ insert into atacc1 (test) values (2);
 -- should fail
 insert into atacc1 (test) values (2);
 -- should succeed
-insert into atacc1 (test) values (4);
+-- In GPDB, we must insert enough values so as to cause duplicates to
+-- be detected on at least one out of several (usually 3) gpdb
+-- segments.
+insert into atacc1 select i from generate_series(3,10)i;
 -- try adding a unique oid constraint
 alter table atacc1 add constraint atacc_oid1 unique(oid);
 -- try to create duplicates via alter table using - should fail
+-- this errors out in Greenplum for a different reason: we don't support
+-- SET DATA TYPE on an indexed column yet
 alter table atacc1 alter column test type integer using 0;
 drop table atacc1;
 
 -- let's do one where the unique constraint fails when added
-create table atacc1 ( test int );
+create table atacc1 ( test int ) distributed by (test);
 -- insert soon to be failing rows
 insert into atacc1 (test) values (2);
 insert into atacc1 (test) values (2);
@@ -625,13 +638,13 @@ drop table atacc1;
 
 -- let's do one where the unique constraint fails
 -- because the column doesn't exist
-create table atacc1 ( test int );
+create table atacc1 ( test int ) distributed by (test);
 -- add a unique constraint (fails)
 alter table atacc1 add constraint atacc_test1 unique (test1);
 drop table atacc1;
 
 -- something a little more complicated
-create table atacc1 ( test int, test2 int);
+create table atacc1 ( test int, test2 int) distributed by (test);
 -- add a unique constraint
 alter table atacc1 add constraint atacc_test1 unique (test, test2);
 -- insert initial value
@@ -645,7 +658,7 @@ insert into atacc1 (test,test2) values (5,5);
 drop table atacc1;
 
 -- lets do some naming tests
-create table atacc1 (test int, test2 int, unique(test));
+create table atacc1 (test int, test2 int, unique(test)) distributed by (test);
 alter table atacc1 add unique (test2);
 -- should fail for @@ second one @@
 insert into atacc1 (test2, test) values (3, 3);
@@ -654,7 +667,7 @@ drop table atacc1;
 
 -- test primary key constraint adding
 
-create table atacc1 ( test int ) with oids;
+create table atacc1 ( test int ) with oids distributed by (test);
 -- add a primary key constraint
 alter table atacc1 add constraint atacc_test1 primary key (test);
 -- insert first value
@@ -669,12 +682,12 @@ insert into atacc1 (test) values(NULL);
 alter table atacc1 add constraint atacc_oid1 primary key(oid);
 -- drop first primary key constraint
 alter table atacc1 drop constraint atacc_test1 restrict;
--- try adding a primary key on oid (should succeed)
+-- try adding a primary key on oid (should fail)
 alter table atacc1 add constraint atacc_oid1 primary key(oid);
 drop table atacc1;
 
 -- let's do one where the primary key constraint fails when added
-create table atacc1 ( test int );
+create table atacc1 ( test int ) distributed by (test);
 -- insert soon to be failing rows
 insert into atacc1 (test) values (2);
 insert into atacc1 (test) values (2);
@@ -684,7 +697,7 @@ insert into atacc1 (test) values (3);
 drop table atacc1;
 
 -- let's do another one where the primary key constraint fails when added
-create table atacc1 ( test int );
+create table atacc1 ( test int ) distributed by (test);
 -- insert soon to be failing row
 insert into atacc1 (test) values (NULL);
 -- add a primary key (fails)
@@ -694,7 +707,7 @@ drop table atacc1;
 
 -- let's do one where the primary key constraint fails
 -- because the column doesn't exist
-create table atacc1 ( test int );
+create table atacc1 ( test int ) distributed by (test);
 -- add a primary key constraint (fails)
 alter table atacc1 add constraint atacc_test1 primary key (test1);
 drop table atacc1;
@@ -710,7 +723,7 @@ alter table atacc1 add column test2 int default 0 primary key;
 drop table atacc1;
 
 -- something a little more complicated
-create table atacc1 ( test int, test2 int);
+create table atacc1 ( test int, test2 int) distributed by (test);
 -- add a primary key constraint
 alter table atacc1 add constraint atacc_test1 primary key (test, test2);
 -- try adding a second primary key - should fail
@@ -729,7 +742,7 @@ insert into atacc1 (test,test2) values (5,5);
 drop table atacc1;
 
 -- lets do some naming tests
-create table atacc1 (test int, test2 int, primary key(test));
+create table atacc1 (test int, test2 int, primary key(test)) distributed by (test);
 -- only first should succeed
 insert into atacc1 (test2, test) values (3, 3);
 insert into atacc1 (test2, test) values (2, 3);
@@ -747,7 +760,7 @@ alter table non_existent alter column bar drop not null;
 
 -- test setting columns to null and not null and vice versa
 -- test checking for null values and primary key
-create table atacc1 (test int not null) with oids;
+create table atacc1 (test int not null) with oids distributed by (test);
 alter table atacc1 add constraint "atacc1_pkey" primary key (test);
 alter table atacc1 alter column test drop not null;
 alter table atacc1 drop constraint "atacc1_pkey";
@@ -844,7 +857,8 @@ alter table pg_class drop column relname;
 alter table nosuchtable drop column bar;
 
 -- test dropping columns
-create table atacc1 (a int4 not null, b int4, c int4 not null, d int4) with oids;
+create table atacc1 (a int4 not null, b int4, c int4 not null, d int4) with oids
+distributed by (a);
 insert into atacc1 values (1, 2, 3, 4);
 alter table atacc1 drop a;
 alter table atacc1 drop a;
@@ -933,7 +947,7 @@ alter table atacc1 add unique(a);
 alter table atacc1 add unique("........pg.dropped.1........");
 alter table atacc1 add check (a > 3);
 alter table atacc1 add check ("........pg.dropped.1........" > 3);
-create table atacc2 (id int4 unique);
+create table atacc2 (id int4 unique) distributed by (id);
 alter table atacc1 add foreign key (a) references atacc2(id);
 alter table atacc1 add foreign key ("........pg.dropped.1........") references atacc2(id);
 alter table atacc2 add foreign key (id) references atacc1(a);
@@ -944,12 +958,12 @@ create index "testing_idx" on atacc1("........pg.dropped.1........");
 
 -- test create as and select into
 insert into atacc1 values (21, 22, 23);
-create table test1 as select * from atacc1;
-select * from test1;
-drop table test1;
-select * into test2 from atacc1;
-select * from test2;
-drop table test2;
+create table alter_table_test1 as select * from atacc1;
+select * from alter_table_test1;
+drop table alter_table_test1;
+select * into alter_table_test2 from atacc1;
+select * from alter_table_test2;
+drop table alter_table_test2;
 
 -- try dropping all columns
 alter table atacc1 drop c;
@@ -985,27 +999,27 @@ drop table child;
 drop table parent;
 
 -- test copy in/out
-create table test (a int4, b int4, c int4);
-insert into test values (1,2,3);
-alter table test drop a;
-copy test to stdout;
-copy test(a) to stdout;
-copy test("........pg.dropped.1........") to stdout;
-copy test from stdin;
+create table alter_table_test (a int4, b int4, c int4);
+insert into alter_table_test values (1,2,3);
+alter table alter_table_test drop a;
+copy alter_table_test to stdout;
+copy alter_table_test(a) to stdout;
+copy alter_table_test("........pg.dropped.1........") to stdout;
+copy alter_table_test from stdin;
 10	11	12
 \.
-select * from test;
-copy test from stdin;
+select * from alter_table_test order by 1;
+copy alter_table_test from stdin;
 21	22
 \.
-select * from test;
-copy test(a) from stdin;
-copy test("........pg.dropped.1........") from stdin;
-copy test(b,c) from stdin;
+select * from alter_table_test order by 1;
+copy alter_table_test(a) from stdin;
+copy alter_table_test("........pg.dropped.1........") from stdin;
+copy alter_table_test(b,c) from stdin;
 31	32
 \.
-select * from test;
-drop table test;
+select * from alter_table_test order by 1;
+drop table alter_table_test;
 
 -- test inheritance
 
@@ -1253,7 +1267,8 @@ alter table foo alter f1 TYPE integer; -- fails
 alter table foo alter f1 TYPE varchar(10);
 
 create table anothertab (atcol1 serial8, atcol2 boolean,
-	constraint anothertab_chk check (atcol1 <= 3));
+	constraint anothertab_chk check (atcol1 <= 3))
+	distributed by (atcol1);
 
 insert into anothertab (atcol1, atcol2) values (default, true);
 insert into anothertab (atcol1, atcol2) values (default, false);
@@ -1293,31 +1308,32 @@ select * from anothertab;
 drop table anothertab;
 
 -- Test index handling in alter table column type (cf. bugs #15835, #15865)
-create table anothertab(f1 int primary key, f2 int unique,
-                        f3 int, f4 int, f5 int);
-alter table anothertab
-  add exclude using btree (f3 with =);
-alter table anothertab
-  add exclude using btree (f4 with =) where (f4 is not null);
-alter table anothertab
-  add exclude using btree (f4 with =) where (f5 > 0);
-alter table anothertab
-  add unique(f1,f4);
-create index on anothertab(f2,f3);
-create unique index on anothertab(f4);
+-- gpdb does not support it 
+-- create table anothertab(f1 int primary key, f2 int unique,
+--                         f3 int, f4 int, f5 int);
+-- alter table anothertab
+--   add exclude using btree (f3 with =);
+-- alter table anothertab
+--   add exclude using btree (f4 with =) where (f4 is not null);
+-- alter table anothertab
+--   add exclude using btree (f4 with =) where (f5 > 0);
+-- alter table anothertab
+--   add unique(f1,f4);
+-- create index on anothertab(f2,f3);
+-- create unique index on anothertab(f4);
+-- 
+-- \d anothertab
+-- alter table anothertab alter column f1 type bigint;
+-- alter table anothertab
+--   alter column f2 type bigint,
+--   alter column f3 type bigint,
+--   alter column f4 type bigint;
+-- alter table anothertab alter column f5 type bigint;
+-- \d anothertab
+-- 
+-- drop table anothertab;
 
-\d anothertab
-alter table anothertab alter column f1 type bigint;
-alter table anothertab
-  alter column f2 type bigint,
-  alter column f3 type bigint,
-  alter column f4 type bigint;
-alter table anothertab alter column f5 type bigint;
-\d anothertab
-
-drop table anothertab;
-
-create table another (f1 int, f2 text);
+create table another (f1 int, f2 text) distributed by (f1);
 
 insert into another values(1, 'one');
 insert into another values(2, 'two');
@@ -1534,14 +1550,14 @@ drop type lockmodes;
 --
 create function test_strict(text) returns text as
     'select coalesce($1, ''got passed a null'');'
-    language sql returns null on null input;
+    language sql CONTAINS SQL returns null on null input;
 select test_strict(NULL);
 alter function test_strict(text) called on null input;
 select test_strict(NULL);
 
 create function non_strict(text) returns text as
     'select coalesce($1, ''got passed a null'');'
-    language sql called on null input;
+    language sql CONTAINS SQL called on null input;
 select non_strict(NULL);
 alter function non_strict(text) returns null on null input;
 select non_strict(NULL);
@@ -1553,11 +1569,11 @@ select non_strict(NULL);
 create schema alter1;
 create schema alter2;
 
-create table alter1.t1(f1 serial primary key, f2 int check (f2 > 0));
+create table alter1.t1(f1 serial primary key, f2 int check (f2 > 0)) distributed by (f1);
 
 create view alter1.v1 as select * from alter1.t1;
 
-create function alter1.plus1(int) returns int as 'select $1+1' language sql;
+create function alter1.plus1(int) returns int as 'select $1+1' language sql CONTAINS SQL;
 
 create domain alter1.posint integer check (value > 0);
 
@@ -1740,6 +1756,7 @@ DROP TABLE test_drop_constr_parent CASCADE;
 -- IF EXISTS test
 --
 ALTER TABLE IF EXISTS tt8 ADD COLUMN f int;
+ALTER TABLE IF EXISTS tt8 SET DISTRIBUTED BY(f);
 ALTER TABLE IF EXISTS tt8 ADD CONSTRAINT xxx PRIMARY KEY(f);
 ALTER TABLE IF EXISTS tt8 ADD CHECK (f BETWEEN 0 AND 10);
 ALTER TABLE IF EXISTS tt8 ALTER COLUMN f SET DEFAULT 0;
@@ -1750,6 +1767,7 @@ CREATE TABLE tt8(a int);
 CREATE SCHEMA alter2;
 
 ALTER TABLE IF EXISTS tt8 ADD COLUMN f int;
+ALTER TABLE IF EXISTS tt8 SET DISTRIBUTED BY(f);
 ALTER TABLE IF EXISTS tt8 ADD CONSTRAINT xxx PRIMARY KEY(f);
 ALTER TABLE IF EXISTS tt8 ADD CHECK (f BETWEEN 0 AND 10);
 ALTER TABLE IF EXISTS tt8 ALTER COLUMN f SET DEFAULT 0;
@@ -1803,3 +1821,39 @@ TRUNCATE old_system_table;
 ALTER TABLE old_system_table DROP CONSTRAINT new_system_table_pkey;
 ALTER TABLE old_system_table DROP COLUMN othercol;
 DROP TABLE old_system_table;
+
+--
+-- Test for splitting after dropping a column
+--
+DROP TABLE IF EXISTS test_part;
+CREATE TABLE test_part (
+    field_part timestamp without time zone,
+    field1 int,
+    field2 text,
+    field3 int
+) PARTITION BY RANGE(field_part)
+          (
+          PARTITION p2017 START ('2017-01-01'::date) END ('2018-01-01'::date) WITH (appendonly=false ),
+          DEFAULT PARTITION p_overflow  WITH (appendonly=false )
+          );
+
+DROP TABLE IF EXISTS test_ref;
+CREATE TABLE test_ref (
+    field1 text,
+    field2 text
+) DISTRIBUTED BY (field1);
+
+INSERT INTO test_part select '2017-01-01'::date + interval '1 days' * mod (id,1000) , mod(id,50), 'test ' || mod(id,5) ,mod(id,2) from generate_series(1,10000) id;
+INSERT INTO test_ref select 'test ' || id , 'values' from generate_series(1,10) id;
+
+ALTER TABLE test_part DROP COLUMN field1;
+ALTER TABLE test_part   SPLIT DEFAULT PARTITION
+START('2018-01-01'::date)
+       END( '2018-02-01'::date);
+ANALYZE test_part;
+ANALYZE test_ref;
+
+SELECT * FROM test_part WHERE field2 IN (SELECT field1 FROM test_ref) ORDER BY 1 LIMIT 10;
+
+DROP TABLE test_ref;
+DROP TABLE test_part;

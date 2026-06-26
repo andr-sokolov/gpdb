@@ -49,6 +49,7 @@
 #define _WINSOCKAPI_
 #endif
 #include <winsock2.h>
+#include <windows.h>
 #include <ws2tcpip.h>
 #include <windows.h>
 #undef small
@@ -226,6 +227,8 @@ struct timezone
 
 /* for setitimer in backend/port/win32/timer.c */
 #define ITIMER_REAL 0
+#define ITIMER_VIRTUAL 1
+#define ITIMER_PROF 2
 struct itimerval
 {
 	struct timeval it_interval;
@@ -293,6 +296,8 @@ typedef int pid_t;
 #define EAGAIN WSAEWOULDBLOCK
 #undef EINTR
 #define EINTR WSAEINTR
+#undef EAGAIN
+#define EAGAIN WSAEWOULDBLOCK
 #undef EMSGSIZE
 #define EMSGSIZE WSAEMSGSIZE
 #undef EAFNOSUPPORT
@@ -411,6 +416,20 @@ extern void pgwin32_install_crashdump_handler(void);
 
 /* in port/win32error.c */
 extern void _dosmaperr(unsigned long);
+
+#ifndef			BIG_ENDIAN
+#define			BIG_ENDIAN		4321
+#endif
+#ifndef			LITTLE_ENDIAN
+#define			LITTLE_ENDIAN	1234
+#endif
+#ifndef			PDP_ENDIAN
+#define			PDP_ENDIAN		3412
+#endif
+
+#ifndef BYTE_ORDER
+#define BYTE_ORDER LITTLE_ENDIAN
+#endif
 
 /* in port/win32env.c */
 extern int	pgwin32_putenv(const char *);

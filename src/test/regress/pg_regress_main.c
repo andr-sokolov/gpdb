@@ -18,6 +18,9 @@
 
 #include "pg_regress.h"
 
+#include <sys/stat.h>
+#include <sys/types.h>
+
 /*
  * start a psql test process for specified file (including redirection),
  * and return process ID
@@ -31,9 +34,15 @@ psql_start_test(const char *testname,
 	PID_TYPE	pid;
 	char		infile[MAXPGPATH];
 	char		outfile[MAXPGPATH];
-	char		expectfile[MAXPGPATH];
-	char		psql_cmd[MAXPGPATH * 3];
+	char		expectfile[MAXPGPATH] = "";
+	char		psql_cmd[MAXPGPATH * 4];
 	size_t		offset = 0;
+	char		use_utility_mode = 0;
+	char	   *lastslash;
+
+	/* generalise later */
+	if (strcmp(testname, "upg2") == 0)
+		use_utility_mode = 1;
 
 	/*
 	 * Look for files in the output dir first, consistent with a vpath search.
@@ -49,6 +58,31 @@ psql_start_test(const char *testname,
 
 	snprintf(outfile, sizeof(outfile), "%s/results/%s.out",
 			 outputdir, testname);
+
+	/*
+	 * If the test name contains slashes, create intermediary results
+	 * directory.
+	 */
+	if ((lastslash = strrchr(outfile, '/')) != NULL)
+	{
+		char		resultdir[MAXPGPATH];
+
+		memcpy(resultdir, outfile, lastslash - outfile);
+		resultdir[lastslash - outfile] = '\0';
+		if (mkdir(resultdir, S_IRWXU | S_IRWXG | S_IRWXO) < 0)
+		{
+			if (errno == EEXIST)
+			{
+				/* exists already, that's OK */
+			}
+			else
+			{
+				fprintf(stderr, _("could not create directory \"%s\": %s\n"),
+						resultdir, strerror(errno));
+				exit_nicely(2);
+			}
+		}
+	}
 
 	snprintf(expectfile, sizeof(expectfile), "%s/expected/%s.out",
 			 outputdir, testname);
@@ -70,13 +104,36 @@ psql_start_test(const char *testname,
 		}
 	}
 
+	/*
+	 * We need to pass multiple input files (prehook and infile) to psql,
+	 * to do this a simple way is to execute it like this:
+	 *
+	 *     cat prehook infile | psql
+	 *
+	 * However the problem is that cat's pid is returned, although it does not
+	 * really matter we prefer to return psql's pid.  We could change the
+	 * command like this:
+	 *
+	 *     psql <(prehook infile)
+	 *
+	 * However some shells like dash do not support it.  So we have to
+	 * execute the command as below:
+	 *
+	 *     psql <<EOF
+	 *     $(cat prehook infile)
+	 *     EOF
+	 */
 	offset += snprintf(psql_cmd + offset, sizeof(psql_cmd) - offset,
-					   "\"%s%spsql\" -X -a -q -d \"%s\" < \"%s\" > \"%s\" 2>&1",
+					   "%s \"%s%spsql\" -X -a -q -d \"%s\" > \"%s\" 2>&1 <<EOF\n"
+					   "$(cat \"%s\" \"%s\")\n"
+					   "EOF",
+					   use_utility_mode ? "env PGOPTIONS='-c gp_session_role=utility'" : "",
 					   psqldir ? psqldir : "",
 					   psqldir ? "/" : "",
 					   dblist->str,
-					   infile,
-					   outfile);
+					   outfile,
+					   prehook[0] ? prehook : "/dev/null",
+					   infile);
 	if (offset >= sizeof(psql_cmd))
 	{
 		fprintf(stderr, _("command too long\n"));

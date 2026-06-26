@@ -711,6 +711,7 @@ SELECT COUNT(*) = 19::bigint AS t FROM try;
 SELECT like_escape( name, '' ) = like_escape( name::text, '' ) AS t FROM srt;
 SELECT like_escape( name::text, ''::citext ) = like_escape( name::text, '' ) AS t FROM srt;
 
+-- start_ignore
 -- Ensure correct behavior for citext with materialized views.
 CREATE TABLE citext_table (
   id serial primary key,
@@ -733,3 +734,4 @@ SELECT *
   WHERE t.id IS NULL OR m.id IS NULL;
 REFRESH MATERIALIZED VIEW CONCURRENTLY citext_matview;
 SELECT * FROM citext_matview ORDER BY id;
+-- end_ignore

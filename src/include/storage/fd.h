@@ -4,6 +4,8 @@
  *	  Virtual file descriptor definitions.
  *
  *
+ * Portions Copyright (c) 2007-2008, Greenplum inc
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -67,15 +69,22 @@ extern int	max_safe_fds;
 
 /* Operations on virtual Files --- equivalent to Unix kernel file ops */
 extern File PathNameOpenFile(FileName fileName, int fileFlags, int fileMode);
-extern File OpenTemporaryFile(bool interXact);
+
+extern File OpenNamedTemporaryFile(const char *fileName,
+								   bool create,
+								   bool delOnClose,
+								   bool interXact);
+extern File OpenTemporaryFile(bool interXact, const char *filePrefix);
 extern void FileClose(File file);
 extern int	FilePrefetch(File file, off_t offset, int amount);
 extern int	FileRead(File file, char *buffer, int amount);
 extern int	FileWrite(File file, char *buffer, int amount);
 extern int	FileSync(File file);
-extern off_t FileSeek(File file, off_t offset, int whence);
-extern int	FileTruncate(File file, off_t offset);
+extern int64 FileSeek(File file, int64 offset, int whence);
+extern int64 FileNonVirtualCurSeek(File file);
+extern int	FileTruncate(File file, int64 offset);
 extern char *FilePathName(File file);
+extern int64 FileDiskSize(File file);
 
 /* Operations that allow use of regular stdio --- USE WITH CAUTION */
 extern FILE *AllocateFile(const char *name, const char *mode);
@@ -119,11 +128,21 @@ extern int	pg_flush_data(int fd, off_t offset, off_t amount);
 extern void fsync_fname(const char *fname, bool isdir);
 extern int	durable_rename(const char *oldfile, const char *newfile, int loglevel);
 extern int	durable_link_or_rename(const char *oldfile, const char *newfile, int loglevel);
+extern void SyncAllXLogFiles(void);
 extern void SyncDataDirectory(void);
 extern int data_sync_elevel(int elevel);
+
+extern int gp_retry_close(int fd);
 
 /* Filename components for OpenTemporaryFile */
 #define PG_TEMP_FILES_DIR "pgsql_tmp"
 #define PG_TEMP_FILE_PREFIX "pgsql_tmp"
+
+extern char *GetTempFilePath(const char *filename, bool createdir);
+
+extern const char *FileGetFilename(File file);
+
+extern void FileSetIsWorkfile(File file);
+extern void FileSetIsTempFile(File file, bool isTempFile);
 
 #endif   /* FD_H */

@@ -43,6 +43,7 @@ COMMENT ON
   OPERATOR CLASS <replaceable class="PARAMETER">object_name</replaceable> USING <replaceable class="parameter">index_method</replaceable> |
   OPERATOR FAMILY <replaceable class="PARAMETER">object_name</replaceable> USING <replaceable class="parameter">index_method</replaceable> |
   [ PROCEDURAL ] LANGUAGE <replaceable class="PARAMETER">object_name</replaceable> |
+  RESOURCE QUEUE <replaceable class="PARAMETER">object_name</replaceable> |
   ROLE <replaceable class="PARAMETER">object_name</replaceable> |
   RULE <replaceable class="PARAMETER">rule_name</replaceable> ON <replaceable class="PARAMETER">table_name</replaceable> |
   SCHEMA <replaceable class="PARAMETER">object_name</replaceable> |

@@ -43,22 +43,22 @@ CREATE TYPE text_w_default;
 CREATE FUNCTION int42_in(cstring)
    RETURNS int42
    AS 'int4in'
-   LANGUAGE internal STRICT;
+   LANGUAGE internal IMMUTABLE STRICT;
 NOTICE:  return type int42 is only a shell
 CREATE FUNCTION int42_out(int42)
    RETURNS cstring
    AS 'int4out'
-   LANGUAGE internal STRICT;
+   LANGUAGE internal IMMUTABLE STRICT;
 NOTICE:  argument type int42 is only a shell
 CREATE FUNCTION text_w_default_in(cstring)
    RETURNS text_w_default
    AS 'textin'
-   LANGUAGE internal STRICT;
+   LANGUAGE internal IMMUTABLE STRICT;
 NOTICE:  return type text_w_default is only a shell
 CREATE FUNCTION text_w_default_out(text_w_default)
    RETURNS cstring
    AS 'textout'
-   LANGUAGE internal STRICT;
+   LANGUAGE internal IMMUTABLE STRICT;
 NOTICE:  argument type text_w_default is only a shell
 CREATE TYPE int42 (
    internallength = 4,
@@ -76,6 +76,7 @@ CREATE TYPE text_w_default (
    default = 'zippo'
 );
 CREATE TABLE default_test (f1 text_w_default, f2 int42);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, and no column type is suitable for a distribution key. Creating a NULL policy entry.
 INSERT INTO default_test DEFAULT VALUES;
 SELECT * FROM default_test;
   f1   | f2 
@@ -87,7 +88,7 @@ SELECT * FROM default_test;
 CREATE TYPE default_test_row AS (f1 text_w_default, f2 int42);
 CREATE FUNCTION get_default_test() RETURNS SETOF default_test_row AS '
   SELECT * FROM default_test;
-' LANGUAGE SQL;
+' LANGUAGE SQL READS SQL DATA;
 SELECT * FROM get_default_test();
   f1   | f2 
 -------+----
@@ -154,3 +155,13 @@ WHERE attrelid = 'mytab'::regclass AND attnum > 0;
  widget(42,13)
 (1 row)
 
+-- Create & Drop type as non-superuser
+CREATE USER user_bob;
+NOTICE:  resource queue required -- using default resource queue "pg_default"
+SET SESSION AUTHORIZATION user_bob;
+CREATE TYPE shell; -- not allowed
+ERROR:  must be superuser to create a base type
+CREATE TYPE compfoo as (f1 int, f2 text);
+DROP TYPE compfoo;
+RESET SESSION AUTHORIZATION;
+DROP USER user_bob;

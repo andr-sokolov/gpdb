@@ -2,17 +2,18 @@ SELECT name, setting FROM pg_settings WHERE name LIKE 'enable%';
          name         | setting 
 ----------------------+---------
  enable_bitmapscan    | on
+ enable_groupagg      | on
  enable_hashagg       | on
  enable_hashjoin      | on
  enable_indexonlyscan | on
  enable_indexscan     | on
  enable_material      | on
- enable_mergejoin     | on
- enable_nestloop      | on
+ enable_mergejoin     | off
+ enable_nestloop      | off
  enable_seqscan       | on
  enable_sort          | on
  enable_tidscan       | on
-(11 rows)
+(12 rows)
 
 CREATE TABLE foo2(fooid int, f2 int);
 INSERT INTO foo2 VALUES(1, 11);
@@ -209,6 +210,8 @@ select definition from pg_views where viewname='vw_ord';
 
 drop view vw_ord;
 -- ordinality and multiple functions vs. rewind and reverse scan
+-- Backward scan not supported in GPDB, which makes this a lot less
+-- interesting than in PostgreSQL.
 begin;
 declare foo scroll cursor for select * from rows from(generate_series(1,5),generate_series(1,2)) with ordinality as g(i,j,o);
 fetch all from foo;
@@ -221,25 +224,11 @@ fetch all from foo;
  5 |   | 5
 (5 rows)
 
-fetch backward all from foo;
- i | j | o 
----+---+---
- 5 |   | 5
- 4 |   | 4
- 3 |   | 3
- 2 | 2 | 2
- 1 | 1 | 1
-(5 rows)
-
+--fetch backward all from foo;
 fetch all from foo;
  i | j | o 
 ---+---+---
- 1 | 1 | 1
- 2 | 2 | 2
- 3 |   | 3
- 4 |   | 4
- 5 |   | 5
-(5 rows)
+(0 rows)
 
 fetch next from foo;
  i | j | o 
@@ -251,98 +240,49 @@ fetch next from foo;
 ---+---+---
 (0 rows)
 
-fetch prior from foo;
+--fetch prior from foo;
+--fetch absolute 1 from foo;
+fetch next from foo;
  i | j | o 
 ---+---+---
- 5 |   | 5
-(1 row)
-
-fetch absolute 1 from foo;
- i | j | o 
----+---+---
- 1 | 1 | 1
-(1 row)
+(0 rows)
 
 fetch next from foo;
  i | j | o 
 ---+---+---
- 2 | 2 | 2
-(1 row)
+(0 rows)
 
 fetch next from foo;
  i | j | o 
 ---+---+---
- 3 |   | 3
-(1 row)
+(0 rows)
 
-fetch next from foo;
- i | j | o 
----+---+---
- 4 |   | 4
-(1 row)
-
-fetch prior from foo;
- i | j | o 
----+---+---
- 3 |   | 3
-(1 row)
-
-fetch prior from foo;
- i | j | o 
----+---+---
- 2 | 2 | 2
-(1 row)
-
-fetch prior from foo;
- i | j | o 
----+---+---
- 1 | 1 | 1
-(1 row)
-
+--fetch prior from foo;
+--fetch prior from foo;
+--fetch prior from foo;
 commit;
 -- function with implicit LATERAL
 select * from foo2, foot(foo2.fooid) z where foo2.f2 = z.f2;
- fooid | f2  | fooid | f2  
--------+-----+-------+-----
-     1 |  11 |     1 |  11
-     2 |  22 |     2 |  22
-     1 | 111 |     1 | 111
-(3 rows)
-
+ERROR:  query plan with multiple segworker groups is not supported
+HINT:  likely caused by a function that reads or modifies data in a distributed table
+CONTEXT:  SQL function "foot" statement 1
 -- function with implicit LATERAL and explicit ORDINALITY
 select * from foo2, foot(foo2.fooid) with ordinality as z(fooid,f2,ord) where foo2.f2 = z.f2;
- fooid | f2  | fooid | f2  | ord 
--------+-----+-------+-----+-----
-     1 |  11 |     1 |  11 |   1
-     2 |  22 |     2 |  22 |   1
-     1 | 111 |     1 | 111 |   2
-(3 rows)
-
+ERROR:  query plan with multiple segworker groups is not supported
+HINT:  likely caused by a function that reads or modifies data in a distributed table
+CONTEXT:  SQL function "foot" statement 1
 -- function in subselect
 select * from foo2 where f2 in (select f2 from foot(foo2.fooid) z where z.fooid = foo2.fooid) ORDER BY 1,2;
- fooid | f2  
--------+-----
-     1 |  11
-     1 | 111
-     2 |  22
-(3 rows)
-
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.foo2"
+CONTEXT:  SQL function "foot" during startup
 -- function in subselect
 select * from foo2 where f2 in (select f2 from foot(1) z where z.fooid = foo2.fooid) ORDER BY 1,2;
- fooid | f2  
--------+-----
-     1 |  11
-     1 | 111
-(2 rows)
-
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.foo2"
+CONTEXT:  SQL function "foot" during startup
 -- function in subselect
 select * from foo2 where f2 in (select f2 from foot(foo2.fooid) z where z.fooid = 1) ORDER BY 1,2;
- fooid | f2  
--------+-----
-     1 |  11
-     1 | 111
-(2 rows)
-
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.foo2"
+CONTEXT:  SQL function "foot" during startup
 -- nested functions
 select foot.fooid, foot.f2 from foot(sin(pi()/2)::int) ORDER BY 1,2;
  fooid | f2  
@@ -420,7 +360,7 @@ SELECT * FROM vw_getfoo;
 
 DROP VIEW vw_getfoo;
 -- sql, proretset = t, prorettype = b
-CREATE FUNCTION getfoo3(int) RETURNS setof text AS 'SELECT fooname FROM foo WHERE fooid = $1;' LANGUAGE SQL;
+CREATE FUNCTION getfoo3(int) RETURNS setof text AS 'SELECT fooname FROM foo WHERE fooid = $1 ORDER BY fooname DESC /* ORDER BY to force the Joe row to be returned */ ;' LANGUAGE SQL;
 SELECT * FROM getfoo3(1) AS t1;
  t1  
 -----
@@ -454,7 +394,7 @@ SELECT * FROM vw_getfoo;
 
 DROP VIEW vw_getfoo;
 -- sql, proretset = f, prorettype = c
-CREATE FUNCTION getfoo4(int) RETURNS foo AS 'SELECT * FROM foo WHERE fooid = $1;' LANGUAGE SQL;
+CREATE FUNCTION getfoo4(int) RETURNS foo AS 'SELECT * FROM foo WHERE fooid = $1 ORDER BY fooname DESC /* ORDER BY to force the Joe row to be returned */ ;' LANGUAGE SQL;
 SELECT * FROM getfoo4(1) AS t1;
  fooid | foosubid | fooname 
 -------+----------+---------
@@ -484,7 +424,7 @@ SELECT * FROM vw_getfoo;
 
 DROP VIEW vw_getfoo;
 -- sql, proretset = t, prorettype = c
-CREATE FUNCTION getfoo5(int) RETURNS setof foo AS 'SELECT * FROM foo WHERE fooid = $1;' LANGUAGE SQL;
+CREATE FUNCTION getfoo5(int) RETURNS setof foo AS 'SELECT * FROM foo WHERE fooid = $1 ORDER BY fooname DESC /* ORDER BY to force the Joe row to be returned */ ;' LANGUAGE SQL;
 SELECT * FROM getfoo5(1) AS t1;
  fooid | foosubid | fooname 
 -------+----------+---------
@@ -518,7 +458,7 @@ SELECT * FROM vw_getfoo;
 
 DROP VIEW vw_getfoo;
 -- sql, proretset = f, prorettype = record
-CREATE FUNCTION getfoo6(int) RETURNS RECORD AS 'SELECT * FROM foo WHERE fooid = $1;' LANGUAGE SQL;
+CREATE FUNCTION getfoo6(int) RETURNS RECORD AS 'SELECT * FROM foo WHERE fooid = $1 ORDER BY fooname DESC /* ORDER BY to force the Joe row to be returned */ ;' LANGUAGE SQL;
 SELECT * FROM getfoo6(1) AS t1(fooid int, foosubid int, fooname text);
  fooid | foosubid | fooname 
 -------+----------+---------
@@ -551,7 +491,7 @@ SELECT * FROM vw_getfoo;
 
 DROP VIEW vw_getfoo;
 -- sql, proretset = t, prorettype = record
-CREATE FUNCTION getfoo7(int) RETURNS setof record AS 'SELECT * FROM foo WHERE fooid = $1;' LANGUAGE SQL;
+CREATE FUNCTION getfoo7(int) RETURNS setof record AS 'SELECT * FROM foo WHERE fooid = $1 ORDER BY fooname DESC /* ORDER BY to force the Joe row to be returned */ ;' LANGUAGE SQL;
 SELECT * FROM getfoo7(1) AS t1(fooid int, foosubid int, fooname text);
  fooid | foosubid | fooname 
 -------+----------+---------
@@ -618,7 +558,7 @@ SELECT * FROM vw_getfoo;
 
 DROP VIEW vw_getfoo;
 -- plpgsql, proretset = f, prorettype = c
-CREATE FUNCTION getfoo9(int) RETURNS foo AS 'DECLARE footup foo%ROWTYPE; BEGIN SELECT * into footup FROM foo WHERE fooid = $1; RETURN footup; END;' LANGUAGE plpgsql;
+CREATE FUNCTION getfoo9(int) RETURNS foo AS 'DECLARE footup foo%ROWTYPE; BEGIN SELECT * into footup FROM foo WHERE fooid = $1 ORDER BY fooname DESC /* ORDER BY to force the Joe row to be returned */ ; RETURN footup; END;' LANGUAGE plpgsql;
 SELECT * FROM getfoo9(1) AS t1;
  fooid | foosubid | fooname 
 -------+----------+---------
@@ -1625,6 +1565,20 @@ DROP FUNCTION foo();
 -- some tests on SQL functions with RETURNING
 --
 create temp table tt(f1 serial, data text);
+-- GPDB: The tests below which throw NOTICEs, throw them in indeterminate
+-- order, if the rows are hashed to different segments. Force the rows
+-- that have problem to be hashed to the same segment, using a custom hash
+-- function.
+CREATE OPERATOR FAMILY dummy_int_hash_ops USING hash;
+CREATE FUNCTION dummy_hashfunc(int) RETURNS int AS $$
+begin
+  return CASE WHEN $1 BETWEEN 7 AND 15 THEN 0 ELSE $1 END;
+end; $$ LANGUAGE plpgsql STRICT IMMUTABLE;
+CREATE OPERATOR CLASS dummy_int_hash_ops FOR TYPE int4
+  USING hash FAMILY dummy_int_hash_ops AS
+  OPERATOR 1 =,
+  FUNCTION 1 dummy_hashfunc(int);
+ALTER TABLE tt SET DISTRIBUTED BY (f1 dummy_int_hash_ops);
 create function insert_tt(text) returns int as
 $$ insert into tt(data) values($1) returning f1 $$
 language sql;
@@ -1649,12 +1603,12 @@ select * from tt;
 
 -- insert will execute to completion even if function needs just 1 row
 create or replace function insert_tt(text) returns int as
-$$ insert into tt(data) values($1),($1||$1) returning f1 $$
+$$ insert into tt(data) values($1),($1||$1) returning (f1>0)::int $$
 language sql;
 select insert_tt('fool');
  insert_tt 
 -----------
-         3
+         1
 (1 row)
 
 select * from tt;
@@ -1802,6 +1756,7 @@ create function foo1(n integer, out a text, out b text)
   language sql
   as $$ select 'foo ' || i, 'bar ' || i from generate_series(1,$1) i $$;
 set work_mem='64kB';
+WARNING:  "work_mem": setting is deprecated, and may be removed in a future release.
 select t.a, t, t.a from foo1(10000) t limit 1;
    a   |         t         |   a   
 -------+-------------------+-------
@@ -1809,6 +1764,7 @@ select t.a, t, t.a from foo1(10000) t limit 1;
 (1 row)
 
 reset work_mem;
+WARNING:  "work_mem": setting is deprecated, and may be removed in a future release.
 select t.a, t, t.a from foo1(10000) t limit 1;
    a   |         t         |   a   
 -------+-------------------+-------
@@ -2037,16 +1993,19 @@ create function extractq2(t int8_tbl) returns int8 as $$
 $$ language sql immutable;
 explain (verbose, costs off)
 select x from int8_tbl, extractq2(int8_tbl) f(x);
-                QUERY PLAN                
-------------------------------------------
- Nested Loop
+                   QUERY PLAN                   
+------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
    Output: f.x
-   ->  Seq Scan on public.int8_tbl
-         Output: int8_tbl.q1, int8_tbl.q2
-   ->  Function Scan on f
+   ->  Nested Loop
          Output: f.x
-         Function Call: int8_tbl.q2
-(7 rows)
+         ->  Seq Scan on public.int8_tbl
+               Output: int8_tbl.q1, int8_tbl.q2
+         ->  Function Scan on f
+               Output: f.x
+               Function Call: int8_tbl.q2
+ Optimizer: Postgres query optimizer
+(10 rows)
 
 select x from int8_tbl, extractq2(int8_tbl) f(x);
          x         
@@ -2063,15 +2022,21 @@ create function extractq2_2(t int8_tbl) returns table(ret1 int8) as $$
 $$ language sql immutable;
 explain (verbose, costs off)
 select x from int8_tbl, extractq2_2(int8_tbl) f(x);
-            QUERY PLAN             
------------------------------------
- Nested Loop
+                 QUERY PLAN                  
+---------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
    Output: ((int8_tbl.*).q2)
-   ->  Seq Scan on public.int8_tbl
-         Output: int8_tbl.*
-   ->  Result
-         Output: (int8_tbl.*).q2
-(6 rows)
+   ->  Nested Loop
+         Output: ((int8_tbl.*).q2)
+         ->  Seq Scan on public.int8_tbl
+               Output: int8_tbl.*
+         ->  Materialize
+               Output: ((int8_tbl.*).q2)
+               ->  Result
+                     Output: (int8_tbl.*).q2
+ Optimizer: Postgres query optimizer
+ Settings: optimizer=off
+(12 rows)
 
 select x from int8_tbl, extractq2_2(int8_tbl) f(x);
          x         
@@ -2081,5 +2046,79 @@ select x from int8_tbl, extractq2_2(int8_tbl) f(x);
                123
   4567890123456789
  -4567890123456789
+(5 rows)
+
+-- gpdb: test append node in subquery_motionHazard_walker(). Without that
+-- change the select query below will panic.
+create function extractq2_append(t int8_tbl) returns table(ret1 int8) as $$
+  select extractq2(t) union all select extractq2(t)
+$$ language sql immutable;
+explain (verbose, costs off)
+select x from int8_tbl, extractq2_append(int8_tbl) f(x);
+                    QUERY PLAN                     
+---------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Output: ((int8_tbl.*).q2)
+   ->  Nested Loop
+         Output: ((int8_tbl.*).q2)
+         ->  Seq Scan on public.int8_tbl
+               Output: int8_tbl.*
+         ->  Materialize
+               Output: ((int8_tbl.*).q2)
+               ->  Append
+                     ->  Result
+                           Output: (int8_tbl.*).q2
+                     ->  Result
+                           Output: (int8_tbl.*).q2
+ Optimizer: Postgres query optimizer
+ Settings: optimizer=off
+(15 rows)
+
+select x from int8_tbl, extractq2_append(int8_tbl) f(x);
+         x         
+-------------------
+               123
+               123
+  4567890123456789
+  4567890123456789
+ -4567890123456789
+ -4567890123456789
+               456
+               456
+  4567890123456789
+  4567890123456789
+(10 rows)
+
+create function extractq2_wapper(t int8_tbl) returns table(ret1 int8) as $$      
+  select (select extractq2(t))                                                  
+$$ language sql immutable;                                                      
+explain (verbose, costs off) select x from int8_tbl, extractq2_wapper(int8_tbl) f(x);
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Output: ($1)
+   ->  Nested Loop
+         Output: ($1)
+         ->  Seq Scan on public.int8_tbl
+               Output: int8_tbl.*
+         ->  Materialize
+               Output: ($1)
+               ->  Result
+                     Output: $1
+                     InitPlan 1 (returns $1)  (slice2)
+                       ->  Result
+                             Output: ($0).q2
+ Optimizer: Postgres query optimizer
+ Settings: optimizer=off
+(15 rows)
+
+select x from int8_tbl, extractq2_wapper(int8_tbl) f(x);
+         x         
+-------------------
+               123
+  4567890123456789
+ -4567890123456789
+               456
+  4567890123456789
 (5 rows)
 

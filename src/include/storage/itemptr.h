@@ -50,6 +50,13 @@ ItemPointerData;
 
 typedef ItemPointerData *ItemPointer;
 
+/*
+ * When a tuple is moved to a different segment by split UPDATE, the t_ctid of
+ * the old tuple version is set to this magic value.
+ */
+#define MovedPartitionsOffsetNumber 0xfffd
+#define MovedPartitionsBlockNumber	InvalidBlockNumber
+
 /* ----------------
  *		support macros
  * ----------------
@@ -61,6 +68,15 @@ typedef ItemPointerData *ItemPointer;
  */
 #define ItemPointerIsValid(pointer) \
 	((bool) (PointerIsValid(pointer) && ((pointer)->ip_posid != 0)))
+
+/*
+ * ItemPointerGetBlockNumberNoCheck
+ *		Returns the block number of a disk item pointer.
+ */
+#define ItemPointerGetBlockNumberNoCheck(pointer) \
+( \
+	BlockIdGetBlockNumber(&(pointer)->ip_blkid) \
+)
 
 /*
  * ItemPointerGetBlockNumber
@@ -138,6 +154,27 @@ typedef ItemPointerData *ItemPointer;
 	(pointer)->ip_posid = InvalidOffsetNumber \
 )
 
+/*
+ * ItemPointerIndicatesMovedPartitions
+ *		True iff the block number indicates the tuple has moved to another
+ *		partition.
+ */
+#define ItemPointerIndicatesMovedPartitions(pointer) \
+( \
+	ItemPointerGetOffsetNumber(pointer) == MovedPartitionsOffsetNumber && \
+	ItemPointerGetBlockNumberNoCheck(pointer) == MovedPartitionsBlockNumber \
+)
+
+/*
+ * ItemPointerSetMovedPartitions
+ *		Indicate that the item referenced by the itempointer has moved into a
+ *		different partition.
+ */
+#define ItemPointerSetMovedPartitions(pointer) \
+	ItemPointerSet((pointer), MovedPartitionsBlockNumber, MovedPartitionsOffsetNumber)
+
+
+
 /* ----------------
  *		externs
  * ----------------
@@ -145,5 +182,7 @@ typedef ItemPointerData *ItemPointer;
 
 extern bool ItemPointerEquals(ItemPointer pointer1, ItemPointer pointer2);
 extern int32 ItemPointerCompare(ItemPointer arg1, ItemPointer arg2);
+extern char *ItemPointerToString(ItemPointer tid);
+extern char *ItemPointerToString2(ItemPointer tid);
 
 #endif   /* ITEMPTR_H */

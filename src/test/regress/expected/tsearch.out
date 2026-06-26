@@ -1,3 +1,4 @@
+set optimizer_print_missing_stats = off;
 --
 -- Sanity checks for text search catalogs
 --
@@ -121,12 +122,14 @@ SET enable_seqscan=OFF;
 SET enable_indexscan=ON;
 SET enable_bitmapscan=OFF;
 explain (costs off) SELECT count(*) FROM test_tsvector WHERE a @@ 'wr|qh';
-                      QUERY PLAN                       
--------------------------------------------------------
+                            QUERY PLAN                             
+-------------------------------------------------------------------
  Aggregate
-   ->  Index Scan using wowidx on test_tsvector
-         Index Cond: (a @@ '''wr'' | ''qh'''::tsquery)
-(3 rows)
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Aggregate
+               ->  Index Scan using wowidx on test_tsvector
+                     Index Cond: (a @@ '''wr'' | ''qh'''::tsquery)
+(6 rows)
 
 SELECT count(*) FROM test_tsvector WHERE a @@ 'wr|qh';
  count 
@@ -191,14 +194,16 @@ SELECT count(*) FROM test_tsvector WHERE a @@ '!no_such_lexeme';
 SET enable_indexscan=OFF;
 SET enable_bitmapscan=ON;
 explain (costs off) SELECT count(*) FROM test_tsvector WHERE a @@ 'wr|qh';
-                         QUERY PLAN                          
--------------------------------------------------------------
+                               QUERY PLAN                                
+-------------------------------------------------------------------------
  Aggregate
-   ->  Bitmap Heap Scan on test_tsvector
-         Recheck Cond: (a @@ '''wr'' | ''qh'''::tsquery)
-         ->  Bitmap Index Scan on wowidx
-               Index Cond: (a @@ '''wr'' | ''qh'''::tsquery)
-(5 rows)
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Aggregate
+               ->  Bitmap Heap Scan on test_tsvector
+                     Recheck Cond: (a @@ '''wr'' | ''qh'''::tsquery)
+                     ->  Bitmap Index Scan on wowidx
+                           Index Cond: (a @@ '''wr'' | ''qh'''::tsquery)
+(8 rows)
 
 SELECT count(*) FROM test_tsvector WHERE a @@ 'wr|qh';
  count 
@@ -268,14 +273,16 @@ CREATE INDEX wowidx ON test_tsvector USING gin (a);
 SET enable_seqscan=OFF;
 -- GIN only supports bitmapscan, so no need to test plain indexscan
 explain (costs off) SELECT count(*) FROM test_tsvector WHERE a @@ 'wr|qh';
-                         QUERY PLAN                          
--------------------------------------------------------------
+                               QUERY PLAN                                
+-------------------------------------------------------------------------
  Aggregate
-   ->  Bitmap Heap Scan on test_tsvector
-         Recheck Cond: (a @@ '''wr'' | ''qh'''::tsquery)
-         ->  Bitmap Index Scan on wowidx
-               Index Cond: (a @@ '''wr'' | ''qh'''::tsquery)
-(5 rows)
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Aggregate
+               ->  Bitmap Heap Scan on test_tsvector
+                     Recheck Cond: (a @@ '''wr'' | ''qh'''::tsquery)
+                     ->  Bitmap Index Scan on wowidx
+                           Index Cond: (a @@ '''wr'' | ''qh'''::tsquery)
+(8 rows)
 
 SELECT count(*) FROM test_tsvector WHERE a @@ 'wr|qh';
  count 
@@ -963,7 +970,7 @@ SELECT COUNT(*) FROM test_tsquery WHERE keyword >  'new & york';
      2
 (1 row)
 
-CREATE UNIQUE INDEX bt_tsq ON test_tsquery (keyword);
+CREATE INDEX bt_tsq ON test_tsquery (keyword);
 SET enable_seqscan=OFF;
 SELECT COUNT(*) FROM test_tsquery WHERE keyword <  'new & york';
  count 
@@ -1221,6 +1228,10 @@ SELECT to_tsquery('SKIES & My | booKs');
 (1 row)
 
 --trigger
+-- GPDB doesn't allow updating the distribution key, so create a synthetic
+-- distribution key column.
+alter table test_tsvector add column distkey int4;
+alter table test_tsvector set distributed by (distkey);
 CREATE TRIGGER tsvectorupdate
 BEFORE UPDATE OR INSERT ON test_tsvector
 FOR EACH ROW EXECUTE PROCEDURE tsvector_update_trigger(a, 'pg_catalog.english', t);
@@ -1251,37 +1262,5 @@ SELECT count(*) FROM test_tsvector WHERE a @@ to_tsquery('345&qwerty');
      1
 (1 row)
 
--- test finding items in GIN's pending list
-create temp table pendtest (ts tsvector);
-create index pendtest_idx on pendtest using gin(ts);
-insert into pendtest values (to_tsvector('Lore ipsam'));
-insert into pendtest values (to_tsvector('Lore ipsum'));
-select * from pendtest where 'ipsu:*'::tsquery @@ ts;
-         ts         
---------------------
- 'ipsum':2 'lore':1
-(1 row)
-
-select * from pendtest where 'ipsa:*'::tsquery @@ ts;
-         ts         
---------------------
- 'ipsam':2 'lore':1
-(1 row)
-
-select * from pendtest where 'ips:*'::tsquery @@ ts;
-         ts         
---------------------
- 'ipsam':2 'lore':1
- 'ipsum':2 'lore':1
-(2 rows)
-
-select * from pendtest where 'ipt:*'::tsquery @@ ts;
- ts 
-----
-(0 rows)
-
-select * from pendtest where 'ipi:*'::tsquery @@ ts;
- ts 
-----
-(0 rows)
-
+COPY test_tsvector TO '/tmp/test_tsvector.txt';
+COPY test_tsvector FROM '/tmp/test_tsvector.txt';

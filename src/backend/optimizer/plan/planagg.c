@@ -17,6 +17,8 @@
  * scan all the rows anyway.
  *
  *
+ * Portions Copyright (c) 2006-2008, Greenplum inc
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -44,6 +46,9 @@
 #include "parser/parse_clause.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
+
+#include "cdb/cdbllize.h"                   /* pull_up_Flow() */
+#include "cdb/cdbsetop.h"
 
 
 static bool find_minmax_aggs_walker(Node *node, List **context);
@@ -97,6 +102,12 @@ preprocess_minmax_aggregates(PlannerInfo *root, List *tlist)
 	 * preprocess_minmax_aggregates and optimize_minmax_aggregates.)
 	 */
 	if (parse->groupClause || parse->hasWindowFuncs)
+		return;
+
+	/*
+	 * Reject if disabled by caller.
+	 */
+	if (!root->config->gp_enable_minmax_optimization)
 		return;
 
 	/*
@@ -234,7 +245,7 @@ optimize_minmax_aggregates(PlannerInfo *root, List *tlist,
 	cost_agg(&agg_p, root, AGG_PLAIN, aggcosts,
 			 0, 0,
 			 best_path->startup_cost, best_path->total_cost,
-			 best_path->parent->rows);
+			 best_path->parent->rows, 0.0, 0.0, 0.0, false);
 
 	if (total_cost > agg_p.total_cost)
 		return NULL;			/* too expensive */
@@ -542,6 +553,7 @@ make_agg_subplan(PlannerInfo *root, MinMaxAggInfo *mminfo)
 	PlannerInfo *subroot = mminfo->subroot;
 	Query	   *subparse = subroot->parse;
 	Plan	   *plan;
+	bool        needGather = false;
 
 	/*
 	 * Generate the plan for the subquery. We already have a Path, but we have
@@ -554,27 +566,34 @@ make_agg_subplan(PlannerInfo *root, MinMaxAggInfo *mminfo)
 	 * and its existing target list isn't already what we need, we must insert
 	 * a Result node to project the desired tlist.
 	 */
-	if (!is_projection_capable_plan(plan) &&
-		!tlist_same_exprs(subparse->targetList, plan->targetlist))
+	plan = plan_pushdown_tlist(root, plan, copyObject(subparse->targetList));
+
+	/* check whether to gather subplan */
+	if (plan->flow->flotype == FLOW_PARTITIONED ||
+		(plan->flow->flotype == FLOW_SINGLETON &&
+		 plan->flow->locustype == CdbLocusType_SegmentGeneral))
+		needGather = true;
+
+	if (needGather)
 	{
-		plan = (Plan *) make_result(subroot,
-									subparse->targetList,
-									NULL,
-									plan);
+		plan = (Plan *) make_motion_gather(subroot, plan, subroot->sort_pathkeys, CdbLocusType_SingleQE);
+	}
+	else if (plan->flow->flotype == FLOW_SINGLETON && plan->flow->locustype == CdbLocusType_Entry)
+	{
+		/* No need to gather if the plan is executed on entryDB. */
 	}
 	else
-	{
-		/*
-		 * Otherwise, just replace the subplan's flat tlist with the desired
-		 * tlist.
-		 */
-		plan->targetlist = subparse->targetList;
-	}
+		elog(ERROR, "MIN/MAX subplan has unexpected flowtype: %d", plan->flow->type);
 
+	if (!focusPlan(plan, true, false))
+		elog(ERROR, "could not focus MIN/MAX subplan");
 	plan = (Plan *) make_limit(plan,
 							   subparse->limitOffset,
 							   subparse->limitCount,
 							   0, 1);
+
+    /* Decorate the Limit node with a Flow node. */
+    plan->flow = pull_up_Flow(plan, plan->lefttree);
 
 	/*
 	 * Convert the plan into an InitPlan, and make a Param for its result.
@@ -583,7 +602,8 @@ make_agg_subplan(PlannerInfo *root, MinMaxAggInfo *mminfo)
 		SS_make_initplan_from_plan(subroot, plan,
 								   exprType((Node *) mminfo->target),
 								   -1,
-								   exprCollation((Node *) mminfo->target));
+								   exprCollation((Node *) mminfo->target),
+								   false);
 
 	/*
 	 * Make sure the initplan gets into the outer PlannerInfo, along with any

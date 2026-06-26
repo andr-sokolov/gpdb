@@ -504,8 +504,13 @@ PostgreSQL documentation
       <term><option>--table=<replaceable class="parameter">table</replaceable></option></term>
       <listitem>
        <para>
-        Dump only tables (or views or sequences or foreign tables) matching
-        <replaceable class="parameter">table</replaceable>.  Multiple tables
+        Dump only tables (or views or sequences or foreign tables) matching the
+        <replaceable class="parameter">table</replaceable> pattern.
+        Specify the table in the format schema.table.
+       </para>
+
+       <para>
+        Multiple tables
         can be selected by writing multiple <option>-t</> switches.  Also, the
         <replaceable class="parameter">table</replaceable> parameter is
         interpreted as a pattern according to the same rules used by
@@ -536,14 +541,8 @@ PostgreSQL documentation
 
        <note>
         <para>
-         The behavior of the <option>-t</> switch is not entirely upward
-         compatible with pre-8.2 <productname>PostgreSQL</productname>
-         versions.  Formerly, writing <literal>-t tab</> would dump all
-         tables named <literal>tab</>, but now it just dumps whichever one
-         is visible in your default search path.  To get the old behavior
-         you can write <literal>-t '*.tab'</>.  Also, you must write something
-         like <literal>-t sch.tab</> to select a table in a particular schema,
-         rather than the old locution of <literal>-n sch -t tab</>.
+         -t cannot be used to specify a child table partition. 
+         To dump a partitioned table, you must specify the parent table name.
         </para>
        </note>
       </listitem>
@@ -554,11 +553,13 @@ PostgreSQL documentation
       <term><option>--exclude-table=<replaceable class="parameter">table</replaceable></option></term>
       <listitem>
        <para>
-        Do not dump any tables matching the <replaceable
-        class="parameter">table</replaceable> pattern.  The pattern is
-        interpreted according to the same rules as for <option>-t</>.
-        <option>-T</> can be given more than once to exclude tables
-        matching any of several patterns.
+       Do not dump any tables matching the table pattern. 
+       The pattern is interpreted according to the same rules as for -t. 
+       -T can be given more than once to exclude tables matching any of 
+       several patterns. When both -t and -T are given, the behavior is 
+       to dump just the tables that match at least one -t switch but 
+       no -T switches. If -T appears without -t, then tables matching -T 
+       are excluded from what is otherwise a normal dump.
        </para>
 
        <para>
@@ -1130,6 +1131,12 @@ CREATE DATABASE foo WITH TEMPLATE template0;
    in cross-version cases, as it can prevent problems arising from varying
    reserved-word lists in different <productname>PostgreSQL</> versions.
   </para>
+
+  <para>
+   <application>pg_dump</application> also supports a
+   <literal>--binary-upgrade</> option for upgrade utility usage.
+  </para>
+
  </refsect1>
 
  <refsect1 id="pg-dump-examples">

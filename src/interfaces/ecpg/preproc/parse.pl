@@ -43,13 +43,16 @@ my %replace_token = (
 
 # or in the block
 my %replace_string = (
-	'WITH_TIME'       => 'with time',
+	'WITH_CASCADED'    => 'with cascaded',
+	'WITH_LOCAL'    => 'with local',
+	'WITH_CHECK'    => 'with check',
+	'WITH_TIME'    => 'with time',
 	'WITH_ORDINALITY' => 'with ordinality',
-	'NULLS_FIRST'     => 'nulls first',
-	'NULLS_LAST'      => 'nulls last',
-	'TYPECAST'        => '::',
-	'DOT_DOT'         => '..',
-	'COLON_EQUALS'    => ':=',);
+	'NULLS_FIRST'  => 'nulls first',
+	'NULLS_LAST'   => 'nulls last',
+	'TYPECAST'     => '::',
+	'DOT_DOT'      => '..',
+	'COLON_EQUALS' => ':=',);
 
 # specific replace_types for specific non-terminals - never include the ':'
 # ECPG-only replace_types are defined in ecpg-replace_types

@@ -29,6 +29,16 @@ select 'four: ' || 2+2;
 
 select 3 || 4.0;
 
+--
+-- TEXT CASTING TO/FROM ANY TYPE
+--
+SELECT '1'::bool::text;
+SELECT array[1,2]::text;
+SELECT '{1,2}'::text::integer[];
+
+CREATE TYPE usr_define_type as (id int, name text);
+SELECT '(1,abc)'::text::usr_define_type;
+
 /*
  * various string functions
  */

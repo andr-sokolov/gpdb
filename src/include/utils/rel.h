@@ -4,6 +4,8 @@
  *	  POSTGRES relation descriptor (a/k/a relcache entry) definitions.
  *
  *
+ * Portions Copyright (c) 2005-2009, Greenplum inc.
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -16,6 +18,7 @@
 
 #include "access/tupdesc.h"
 #include "catalog/pg_am.h"
+#include "catalog/pg_appendonly.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_index.h"
 #include "fmgr.h"
@@ -105,6 +108,8 @@ typedef struct RelationData
 	RuleLock   *rd_rules;		/* rewrite rules */
 	MemoryContext rd_rulescxt;	/* private memory cxt for rd_rules, if any */
 	TriggerDesc *trigdesc;		/* Trigger info, or NULL if rel has none */
+    struct GpPolicy *rd_cdbpolicy; /* Partitioning info if distributed rel */
+    bool        rd_cdbDefaultStatsWarningIssued;
 
 	/* data managed by RelationGetIndexList: */
 	List	   *rd_indexlist;	/* list of OIDs of indexes on relation */
@@ -181,6 +186,12 @@ typedef struct RelationData
 	 */
 	Oid			rd_toastoid;	/* Real TOAST table's OID, or InvalidOid */
 
+	/*
+	 * AO table support info (used only for AO and AOCS relations)
+	 */
+	Form_pg_appendonly rd_appendonly;
+	struct HeapTupleData *rd_aotuple;		/* all of pg_appendonly tuple */
+
 	/* use "struct" here to avoid needing to include pgstat.h: */
 	struct PgStat_TableStatus *pgstat_info;		/* statistics collection area */
 } RelationData;
@@ -216,6 +227,16 @@ typedef struct StdRdOptions
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
 	int			fillfactor;		/* page fill factor in percent (0..100) */
 	AutoVacOpts autovacuum;		/* autovacuum-related options */
+
+	bool		appendonly;		/* is this an appendonly relation? */
+	int			blocksize;		/* max varblock size (AO rels only) */
+	int			compresslevel;  /* compression level (AO rels only) */
+	char		compresstype[NAMEDATALEN]; /* compression type (AO rels only) */
+	bool		checksum;		/* checksum (AO rels only) */
+	bool 		columnstore;	/* columnstore (AO only) */
+	char		orientation[NAMEDATALEN]; /* orientation (AO only) */
+	bool		security_barrier;		/* for views */
+	int			check_option_offset;	/* for views */
 	bool		user_catalog_table;		/* use as an additional catalog
 										 * relation */
 } StdRdOptions;
@@ -316,6 +337,55 @@ typedef struct ViewOptions
 #define RelationIsValid(relation) PointerIsValid(relation)
 
 #define InvalidRelation ((Relation) NULL)
+
+/*
+ * RelationIsHeap
+ * 		True iff relation has heap storage
+ */
+#define RelationIsHeap(relation) \
+	((bool)((relation)->rd_rel->relstorage == RELSTORAGE_HEAP))
+
+/*
+ * RelationIsExternal
+ * 		True iff relation has external storage
+ */
+#define RelationIsExternal(relation) \
+	((bool)((relation)->rd_rel->relstorage == RELSTORAGE_EXTERNAL))
+
+/*
+ * RelationIsAoRows
+ * 		True iff relation has append only storage with row orientation
+ */
+#define RelationIsAoRows(relation) \
+	((bool)(((relation)->rd_rel->relstorage == RELSTORAGE_AOROWS)))
+
+/*
+ * RelationIsAoCols
+ * 		True iff relation has append only storage with column orientation
+ */
+#define RelationIsAoCols(relation) \
+	((bool)(((relation)->rd_rel->relstorage == RELSTORAGE_AOCOLS)))
+
+/*
+ * RelationIsAppendOptimized
+ * 		True iff relation has append only storage (can be row or column orientation)
+ */
+#define RelationIsAppendOptimized(relation) \
+	(RelationIsAoRows(relation) || RelationIsAoCols(relation))
+
+/*
+ * RelationIsForeign
+ * 		True iff relation has foreign storage
+ */
+#define RelationIsForeign(relation) \
+	((bool)((relation)->rd_rel->relstorage == RELSTORAGE_FOREIGN))
+
+/*
+ * RelationIsBitmapIndex
+ *      True iff relation is a bitmap index
+ */
+#define RelationIsBitmapIndex(relation) \
+	((bool)((relation)->rd_rel->relam == BITMAP_AM_OID))
 
 /*
  * RelationHasReferenceCountZero
@@ -435,8 +505,18 @@ typedef struct ViewOptions
 /*
  * RelationUsesLocalBuffers
  *		True if relation's pages are stored in local buffers.
+ *
+ * In GPDB, we do not use local buffers for temp tables because segmates need
+ * to share temp table contents.  Currently, there is no other reason to use
+ * local buffers.
  */
-#define RelationUsesLocalBuffers(relation) \
+#define RelationUsesLocalBuffers(relation) false
+
+/*
+ * RelationUsesTempNamespace
+ *		True if relation's catalog entries live in a private namespace.
+ */
+#define RelationUsesTempNamespace(relation) \
 	((relation)->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
 
 /*

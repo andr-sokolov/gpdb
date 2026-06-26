@@ -175,8 +175,11 @@ bool		is_connect;			/* establish connection for each transaction */
 bool		is_latencies;		/* report per-command latencies */
 int			main_pid;			/* main process id used in log filename */
 
+int			use_unique_key=1;	/* indexes will be primary key if set, otherwise non-unique indexes */
+
 char	   *pghost = "";
 char	   *pgport = "";
+char	   *storage_clause = "appendonly=false";
 char	   *login = NULL;
 char	   *dbName;
 const char *progname;
@@ -353,12 +356,16 @@ usage(void)
 		   "Usage:\n"
 		   "  %s [OPTION]... [DBNAME]\n"
 		   "\nInitialization options:\n"
+
 		   "  -i, --initialize         invokes initialization mode\n"
+		   "  -x STRING    append this string to the storage clause e.g. 'appendonly=true, orientation=column'\n"
 		   "  -F, --fillfactor=NUM     set fill factor\n"
 		"  -n, --no-vacuum          do not run VACUUM after initialization\n"
 	"  -q, --quiet              quiet logging (one message each 5 seconds)\n"
 		   "  -s, --scale=NUM          scaling factor\n"
 		   "  --foreign-keys           create foreign key constraints between tables\n"
+		   "  --use-unique-keys"
+		   "               make the indexes that are created non-unique indexes (default: unique)\n"
 		   "  --index-tablespace=TABLESPACE\n"
 	"                           create indexes in the specified tablespace\n"
 	 "  --tablespace=TABLESPACE  create tables in the specified tablespace\n"
@@ -393,7 +400,7 @@ usage(void)
 		 "  -V, --version            output version information, then exit\n"
 		   "  -?, --help               show this help, then exit\n"
 		   "\n"
-		   "Report bugs to <pgsql-bugs@postgresql.org>.\n",
+		   "Report bugs to <bugs@greenplum.org>.\n",
 		   progname, progname);
 }
 
@@ -1686,6 +1693,7 @@ init(bool is_no_vacuum)
 		const char *smcols;		/* column decls if accountIDs are 32 bits */
 		const char *bigcols;	/* column decls if accountIDs are 64 bits */
 		int			declare_fillfactor;
+		char	   *distributed_col;
 	};
 	static const struct ddlinfo DDLs[] = {
 		{
@@ -1693,30 +1701,39 @@ init(bool is_no_vacuum)
 			"tid int,bid int,aid    int,delta int,mtime timestamp,filler char(22)",
 			"tid int,bid int,aid bigint,delta int,mtime timestamp,filler char(22)",
 			0
+			, "bid"
 		},
 		{
 			"pgbench_tellers",
 			"tid int not null,bid int,tbalance int,filler char(84)",
 			"tid int not null,bid int,tbalance int,filler char(84)",
-			1
+			1,
+			"tid"
 		},
 		{
 			"pgbench_accounts",
 			"aid    int not null,bid int,abalance int,filler char(84)",
 			"aid bigint not null,bid int,abalance int,filler char(84)",
 			1
+			, "aid"
 		},
 		{
 			"pgbench_branches",
 			"bid int not null,bbalance int,filler char(88)",
 			"bid int not null,bbalance int,filler char(88)",
 			1
+			, "bid"
 		}
 	};
 	static const char *const DDLINDEXes[] = {
 		"alter table pgbench_branches add primary key (bid)",
 		"alter table pgbench_tellers add primary key (tid)",
 		"alter table pgbench_accounts add primary key (aid)"
+	};
+	static const char *const NON_UNIQUE_INDEX_DDLINDEXes[] = {
+		"CREATE INDEX branch_idx ON pgbench_branches (bid) ",
+		"CREATE INDEX teller_idx ON pgbench_tellers (tid) ",
+		"CREATE INDEX account_idx ON pgbench_accounts (aid) "
 	};
 	static const char *const DDLKEYs[] = {
 		"alter table pgbench_tellers add foreign key (bid) references pgbench_branches",
@@ -1742,6 +1759,8 @@ init(bool is_no_vacuum)
 	if ((con = doConnect()) == NULL)
 		exit(1);
 
+	fprintf(stderr, "creating tables...\n");
+
 	for (i = 0; i < lengthof(DDLs); i++)
 	{
 		char		opts[256];
@@ -1757,7 +1776,12 @@ init(bool is_no_vacuum)
 		opts[0] = '\0';
 		if (ddl->declare_fillfactor)
 			snprintf(opts + strlen(opts), sizeof(opts) - strlen(opts),
-					 " with (fillfactor=%d)", fillfactor);
+					 " with (fillfactor=%d, %s) DISTRIBUTED BY (%s)",
+					 fillfactor, storage_clause, ddl->distributed_col);
+		else
+			snprintf(opts + strlen(opts), sizeof(opts) - strlen(opts),
+					 " with (%s) DISTRIBUTED BY (%s)",
+					 storage_clause, ddl->distributed_col);
 		if (tablespace != NULL)
 		{
 			char	   *escape_tablespace;
@@ -1803,7 +1827,6 @@ init(bool is_no_vacuum)
 	/*
 	 * fill the pgbench_accounts table with some data
 	 */
-	fprintf(stderr, "creating tables...\n");
 
 	executeStatement(con, "begin");
 	executeStatement(con, "truncate pgbench_accounts");
@@ -1900,8 +1923,14 @@ init(bool is_no_vacuum)
 	for (i = 0; i < lengthof(DDLINDEXes); i++)
 	{
 		char		buffer[256];
-
-		strlcpy(buffer, DDLINDEXes[i], sizeof(buffer));
+		if (use_unique_key)
+		{
+			strncpy(buffer, DDLINDEXes[i], sizeof(buffer));
+		}
+		else
+		{
+			strncpy(buffer, NON_UNIQUE_INDEX_DDLINDEXes[i], sizeof(buffer));
+		}
 
 		if (index_tablespace != NULL)
 		{
@@ -2450,6 +2479,7 @@ main(int argc, char **argv)
 		{"vacuum-all", no_argument, NULL, 'v'},
 		/* long-named only options */
 		{"foreign-keys", no_argument, &foreign_keys, 1},
+		{"use-unique-keys", no_argument, &use_unique_key, 1},
 		{"index-tablespace", required_argument, NULL, 3},
 		{"tablespace", required_argument, NULL, 2},
 		{"unlogged-tables", no_argument, &unlogged_tables, 1},
@@ -2526,12 +2556,15 @@ main(int argc, char **argv)
 	state = (CState *) pg_malloc(sizeof(CState));
 	memset(state, 0, sizeof(CState));
 
-	while ((c = getopt_long(argc, argv, "ih:nvp:dqSNc:j:Crs:t:T:U:lf:D:F:M:P:R:", long_options, &optindex)) != -1)
+	while ((c = getopt_long(argc, argv, "ih:nvp:dqSNc:j:Crs:t:T:U:lf:D:F:M:P:R:x:", long_options, &optindex)) != -1)
 	{
 		switch (c)
 		{
 			case 'i':
 				is_init_mode++;
+				break;
+			case 'x':
+				storage_clause = optarg;
 				break;
 			case 'h':
 				pghost = pg_strdup(optarg);

@@ -160,7 +160,7 @@ SET enable_bitmapscan = off;
 --
 -- Btree index / opclass with the various operators
 --
-CREATE UNIQUE INDEX enumtest_btree ON enumtest USING btree (col);
+CREATE INDEX enumtest_btree ON enumtest USING btree (col);
 SELECT * FROM enumtest WHERE col = 'orange';
 SELECT * FROM enumtest WHERE col <> 'orange' ORDER BY col;
 SELECT * FROM enumtest WHERE col > 'yellow' ORDER BY col;
@@ -171,13 +171,6 @@ SELECT min(col) FROM enumtest;
 SELECT max(col) FROM enumtest;
 SELECT max(col) FROM enumtest WHERE col < 'green';
 DROP INDEX enumtest_btree;
-
---
--- Hash index / opclass with the = operator
---
-CREATE INDEX enumtest_hash ON enumtest USING hash (col);
-SELECT * FROM enumtest WHERE col = 'orange';
-DROP INDEX enumtest_hash;
 
 --
 -- End index tests

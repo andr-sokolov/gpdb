@@ -1,7 +1,10 @@
+#ifndef PG_UPGRADE_H
+#define PG_UPGRADE_H
 /*
  *	pg_upgrade.h
  *
  *	Copyright (c) 2010-2014, PostgreSQL Global Development Group
+ *	Portions Copyright (c) 2016-Present, Pivotal Software Inc
  *	contrib/pg_upgrade/pg_upgrade.h
  */
 
@@ -10,8 +13,11 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 
+#include "postgres.h"
 #include "libpq-fe.h"
 #include "pqexpbuffer.h"
+
+#include "greenplum/greenplum_cluster_info.h"
 
 /* Use port in the private/dynamic port number range */
 #define DEF_PGUPORT			50432
@@ -99,7 +105,8 @@ extern char *output_files[];
 /* OID system catalog preservation added during PG 9.0 development */
 #define TABLE_SPACE_SUBDIRS_CAT_VER 201001111
 /* postmaster/postgres -b (binary_upgrade) flag added during PG 9.1 development */
-#define BINARY_UPGRADE_SERVER_FLAG_CAT_VER 201104251
+/* In GPDB, it was introduced during GPDB 5.0 development. */
+#define BINARY_UPGRADE_SERVER_FLAG_CAT_VER 301607301
 /*
  *	Visibility map changed with this 9.2 commit,
  *	8f9fe6edce358f7904e0db119416b4d1080a83aa; pick later catalog version.
@@ -116,8 +123,74 @@ extern char *output_files[];
  * ("Improve concurrency of foreign key locking") which also updated catalog
  * version to this value.  pg_upgrade behavior depends on whether old and new
  * server versions are both newer than this, or only the new one is.
+ *
+ * In GPDB: that upstream change was merged into GPDB in the big 9.3 merge
+ * commit.
  */
-#define MULTIXACT_FORMATCHANGE_CAT_VER 201301231
+#define MULTIXACT_FORMATCHANGE_CAT_VER 301809211
+
+/*
+ * Extra information stored for each Append-only table.
+ * This is used to transfer the information from the auxiliary
+ * AO table to the new cluster.
+ */
+
+/* To hold contents of pg_visimap_<oid> */
+typedef struct
+{
+	int			segno;
+	int64		first_row_no;
+	char	   *visimap;		/* text representation of the "bit varying" field */
+} AOVisiMapInfo;
+
+typedef struct
+{
+	int			segno;
+	int			columngroup_no;
+	int64		first_row_no;
+	char	   *minipage;		/* text representation of the "bit varying" field */
+} AOBlkDir;
+
+/* To hold contents of pg_aoseg_<oid> */
+typedef struct
+{
+	int			segno;
+	int64		eof;
+	int64		tupcount;
+	int64		varblockcount;
+	int64		eofuncompressed;
+	int64		modcount;
+	int16		version;
+	int16		state;
+} AOSegInfo;
+
+/* To hold contents of pf_aocsseg_<oid> */
+typedef struct
+{
+	int         segno;
+	int64		tupcount;
+	int64		varblockcount;
+	char       *vpinfo;
+	int64		modcount;
+	int16		state;
+	int16		version;
+} AOCSSegInfo;
+
+typedef struct
+{
+	int16		attlen;
+	char		attalign;
+	bool		is_numeric;
+} AttInfo;
+
+typedef enum
+{
+	HEAP,
+	AO,
+	AOCS,
+	FSM
+} RelType;
+
 
 /*
  * Each relation is represented by a relinfo structure.
@@ -128,11 +201,32 @@ typedef struct
 	char	   *nspname;		/* namespace name */
 	char	   *relname;		/* relation name */
 	Oid			reloid;			/* relation oid */
+	char		relstorage;
 	Oid			relfilenode;	/* relation relfile node */
+	/* GPDB_96_MERGE_FIXME: indtable and toastheap are backported from 9.6. */
+	Oid			indtable;		/* if index, OID of its table, else 0 */
+	Oid			toastheap;		/* if toast table, OID of base table, else 0 */
 	/* relation tablespace path, or "" for the cluster default */
 	char	   *tablespace;
 	bool		nsp_alloc;
 	bool		tblsp_alloc;
+
+	RelType		reltype;
+
+	/* Extra information for append-only tables */
+	AOSegInfo  *aosegments;
+	AOCSSegInfo *aocssegments;
+	int			naosegments;
+	AOVisiMapInfo *aovisimaps;
+	int			naovisimaps;
+	AOBlkDir   *aoblkdirs;
+	int			naoblkdirs;
+
+	/* Extra information for heap tables */
+	bool		gpdb4_heap_conversion_needed;
+	bool		has_numerics;
+	AttInfo	   *atts;
+	int			natts;
 } RelInfo;
 
 typedef struct
@@ -162,6 +256,16 @@ typedef struct
 	/* the rest are used only for logging and error reporting */
 	char	   *nspname;		/* namespaces */
 	char	   *relname;
+
+	bool		missing_seg0_ok;
+
+	RelType		type;			/* Type of relation */
+
+	/* Extra information for heap tables */
+	bool		gpdb4_heap_conversion_needed;
+	bool		has_numerics;
+	AttInfo	   *atts;
+	int			natts;
 } FileNameMap;
 
 /*
@@ -173,6 +277,8 @@ typedef struct
 	char	   *db_name;		/* database name */
 	char		db_tablespace[MAXPGPATH];		/* database default tablespace
 												 * path */
+	uint32 		datfrozenxid;
+	uint32 		datminmxid;
 	RelInfoArr	rel_arr;		/* array of all user relinfos */
 } DbInfo;
 
@@ -263,8 +369,9 @@ typedef struct
 	Oid			install_role_oid;		/* OID of connected role */
 	Oid			role_count;		/* number of roles defined in the cluster */
 	const char *tablespace_suffix;		/* directory specification */
-} ClusterInfo;
 
+	GreenplumClusterInfo *greenplum_cluster_info;
+} ClusterInfo;
 
 /*
  *	LogOpts
@@ -285,7 +392,8 @@ typedef struct
 	bool		check;			/* TRUE -> ask user for permission to make
 								 * changes */
 	transferMode transfer_mode; /* copy files or link them? */
-	int			jobs;
+	int			jobs;			/* number of processes/threads to use */
+	char	   *socketdir;		/* directory to use for Unix sockets */
 } UserOpts;
 
 
@@ -314,7 +422,6 @@ extern UserOpts user_opts;
 extern ClusterInfo old_cluster,
 			new_cluster;
 extern OSInfo os_info;
-
 
 /* check.c */
 
@@ -347,10 +454,10 @@ void		generate_old_dump(void);
 /* exec.c */
 
 #define EXEC_PSQL_ARGS "--echo-queries --set ON_ERROR_STOP=on --no-psqlrc --dbname=template1"
-bool
-exec_prog(const char *log_file, const char *opt_log_file,
-		  bool throw_error, const char *fmt,...)
-__attribute__((format(PG_PRINTF_ATTRIBUTE, 4, 5)));
+
+bool exec_prog(const char *log_file, const char *opt_log_file,
+		  bool report_error, bool exit_on_error, const char *fmt,...)
+		  __attribute__((format(PG_PRINTF_ATTRIBUTE, 5, 6)));
 void		verify_directories(void);
 bool		pid_lock_file_exists(const char *datadir);
 
@@ -432,7 +539,6 @@ void transfer_all_new_dbs(DbInfoArr *old_db_arr,
 
 void		init_tablespaces(void);
 
-
 /* server.c */
 
 PGconn	   *connectToServer(ClusterInfo *cluster, const char *db_name);
@@ -442,8 +548,8 @@ __attribute__((format(PG_PRINTF_ATTRIBUTE, 2, 3)));
 
 char	   *cluster_conn_opts(ClusterInfo *cluster);
 
-bool		start_postmaster(ClusterInfo *cluster, bool throw_error);
-void		stop_postmaster(bool fast);
+bool		start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error);
+void		stop_postmaster(bool in_atexit);
 uint32		get_major_server_version(ClusterInfo *cluster);
 void		check_pghost_envvar(void);
 
@@ -476,9 +582,14 @@ void		pg_putenv(const char *var, const char *val);
 
 
 /* version.c */
-
+#if 0
+/*
+ * In Greenplum, large objects are not supported, so the below
+ * code is not required
+ */
 void new_9_0_populate_pg_largeobject_metadata(ClusterInfo *cluster,
 										 bool check_mode);
+#endif
 void old_9_3_check_for_line_data_type_usage(ClusterInfo *cluster);
 
 /* version_old_8_3.c */
@@ -501,3 +612,17 @@ void parallel_transfer_all_new_dbs(DbInfoArr *old_db_arr, DbInfoArr *new_db_arr,
 							  char *old_pgdata, char *new_pgdata,
 							  char *old_tablespace);
 bool		reap_child(bool wait_for_child);
+
+/*
+ * Hack to make backend macros that check for assertions to work.
+ */
+#ifdef AssertMacro
+#undef AssertMacro
+#endif
+#define AssertMacro(condition) ((void) true)
+#ifdef Assert
+#undef Assert
+#endif
+#define Assert(condition) ((void) (true || (condition)))
+
+#endif /* PG_UPGRADE_H */

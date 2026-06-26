@@ -15,6 +15,21 @@ OBJS =  specparse.o isolationtester.o
 
 all: isolationtester$(X) pg_isolation_regress$(X)
 
+gpstringsubs.pl:
+	rm -f $@ && $(LN_S) $(top_builddir)/src/test/regress/gpstringsubs.pl
+
+gpdiff.pl: atmsort.pm explain.pm GPTest.pm
+	rm -f $@ && $(LN_S) $(top_builddir)/src/test/regress/gpdiff.pl
+
+GPTest.pm:
+	rm -f $@ && $(LN_S) $(top_builddir)/src/test/regress/GPTest.pm
+
+atmsort.pm:
+	rm -f $@ && $(LN_S) $(top_builddir)/src/test/regress/atmsort.pm
+
+explain.pm:
+	rm -f $@ && $(LN_S) $(top_builddir)/src/test/regress/explain.pm
+
 submake-regress:
 	$(MAKE) -C $(top_builddir)/src/test/regress pg_regress.o
 
@@ -37,13 +52,18 @@ specparse.o: specscanner.c
 clean distclean:
 	rm -f isolationtester$(X) pg_isolation_regress$(X) $(OBJS) isolation_main.o
 	rm -f pg_regress.o
+	rm -f gpstringsubs.pl gpdiff.pl atmsort.pm explain.pm GPTest.pm
 	rm -rf $(pg_regress_clean_files)
 
 maintainer-clean: distclean
 	rm -f specparse.c specscanner.c
 
-installcheck: all
-	./pg_isolation_regress --psqldir='$(PSQLDIR)' $(EXTRA_REGRESS_OPTS) --inputdir=$(srcdir) --schedule=$(srcdir)/isolation_schedule
+# GPDB: pageinspect module is needed by some tests.
+install-tests:
+	$(MAKE) -C $(top_builddir)/contrib/pageinspect install
+
+installcheck: all gpdiff.pl gpstringsubs.pl install-tests
+	./pg_isolation_regress --psqldir='$(PSQLDIR)' $(EXTRA_REGRESS_OPTS) --inputdir=$(srcdir) --init-file=$(srcdir)/init_file --load-extension=pageinspect --schedule=$(srcdir)/isolation_schedule
 
 check: all
 	./pg_isolation_regress --temp-install=./tmp_check --inputdir=$(srcdir) --top-builddir=$(top_builddir) $(EXTRA_REGRESS_OPTS) --schedule=$(srcdir)/isolation_schedule

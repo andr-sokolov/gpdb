@@ -463,7 +463,7 @@ SELECT json_agg(q)
   {"b":"a2","c":5,"z":[{"f1":2,"f2":[1,2,3]},{"f1":5,"f2":[4,5,6]}]}]
 (1 row)
 
-SELECT json_agg(q)
+SELECT json_agg(q order by q)
   FROM rows q;
        json_agg        
 -----------------------
@@ -1589,7 +1589,7 @@ CREATE TEMP TABLE foo (serial_num int, name text, type text);
 INSERT INTO foo VALUES (847001,'t15','GE1043');
 INSERT INTO foo VALUES (847002,'t16','GE1043');
 INSERT INTO foo VALUES (847003,'sub-alpha','GESS90');
-SELECT json_build_object('turbines',json_object_agg(serial_num,json_build_object('name',name,'type',type)))
+SELECT json_build_object('turbines',json_object_agg(serial_num,json_build_object('name',name,'type',type) order by serial_num))
 FROM foo;
                                                                             json_build_object                                                                            
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -1663,6 +1663,25 @@ select * from json_to_recordset('[{"a":1,"b":"foo","d":false},{"a":2,"b":"bar","
  1 | foo | 
  2 | bar | t
 (2 rows)
+
+-- checking proisstrict settings
+select '[{"a":1}]'::json->0->'b';
+ ?column? 
+----------
+ 
+(1 row)
+
+select '[{"a":1}]'::json->1;
+ ?column? 
+----------
+ 
+(1 row)
+
+select '[{"a":1}]'::json->1->'a';
+ ?column? 
+----------
+ 
+(1 row)
 
 select * from json_to_recordset('[{"a":1,"b":{"d":"foo"},"c":true},{"a":2,"c":false,"b":{"d":"bar"}}]')
     as x(a int, b json, c boolean);

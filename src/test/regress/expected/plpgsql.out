@@ -1025,47 +1025,173 @@ insert into Room values ('106', 'Office');
 -- Second we install the wall connectors
 --
 insert into WSlot values ('WS.001.1a', '001', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.001.1b', '001', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.001.2a', '001', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.001.2b', '001', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.001.3a', '001', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.001.3b', '001', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.002.1a', '002', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.002.1b', '002', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.002.2a', '002', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.002.2b', '002', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.002.3a', '002', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.002.3b', '002', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.003.1a', '003', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.003.1b', '003', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.003.2a', '003', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.003.2b', '003', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.003.3a', '003', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.003.3b', '003', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.101.1a', '101', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.101.1b', '101', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.101.2a', '101', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.101.2b', '101', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.101.3a', '101', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.101.3b', '101', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.102.1a', '102', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.102.1b', '102', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.102.2a', '102', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.102.2b', '102', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.102.3a', '102', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.102.3b', '102', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.105.1a', '105', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.105.1b', '105', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.105.2a', '105', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.105.2b', '105', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.105.3a', '105', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.105.3b', '105', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.106.1a', '106', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.106.1b', '106', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.106.2a', '106', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.106.2b', '106', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.106.3a', '106', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 insert into WSlot values ('WS.106.3b', '106', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.room"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "SELECT count(*) = 0 from Room where roomno = new.roomno"
+PL/pgSQL function tg_wslot_biu() line 3 at IF
 --
 -- Now create the patch fields and their slots
 --
@@ -1074,68 +1200,230 @@ insert into PField values ('PF0_1', 'Wallslots basement');
 -- The cables for these will be made later, so they are unconnected for now
 --
 insert into PSlot values ('PS.base.a1', 'PF0_1', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.base.a2', 'PF0_1', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.base.a3', 'PF0_1', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.base.a4', 'PF0_1', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.base.a5', 'PF0_1', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.base.a6', 'PF0_1', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 --
 -- These are already wired to the wall connectors
 --
 insert into PSlot values ('PS.base.b1', 'PF0_1', '', 'WS.002.1a');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.base.b2', 'PF0_1', '', 'WS.002.1b');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.base.b3', 'PF0_1', '', 'WS.002.2a');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.base.b4', 'PF0_1', '', 'WS.002.2b');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.base.b5', 'PF0_1', '', 'WS.002.3a');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.base.b6', 'PF0_1', '', 'WS.002.3b');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.base.c1', 'PF0_1', '', 'WS.003.1a');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.base.c2', 'PF0_1', '', 'WS.003.1b');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.base.c3', 'PF0_1', '', 'WS.003.2a');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.base.c4', 'PF0_1', '', 'WS.003.2b');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.base.c5', 'PF0_1', '', 'WS.003.3a');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.base.c6', 'PF0_1', '', 'WS.003.3b');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 --
 -- This patchfield will be renamed later into PF0_2 - so its
 -- slots references in pfname should follow
 --
 insert into PField values ('PF0_X', 'Phonelines basement');
 insert into PSlot values ('PS.base.ta1', 'PF0_X', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.base.ta2', 'PF0_X', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.base.ta3', 'PF0_X', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.base.ta4', 'PF0_X', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.base.ta5', 'PF0_X', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.base.ta6', 'PF0_X', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.base.tb1', 'PF0_X', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.base.tb2', 'PF0_X', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.base.tb3', 'PF0_X', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.base.tb4', 'PF0_X', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.base.tb5', 'PF0_X', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.base.tb6', 'PF0_X', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PField values ('PF1_1', 'Wallslots first floor');
 insert into PSlot values ('PS.first.a1', 'PF1_1', '', 'WS.101.1a');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.a2', 'PF1_1', '', 'WS.101.1b');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.a3', 'PF1_1', '', 'WS.101.2a');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.a4', 'PF1_1', '', 'WS.101.2b');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.a5', 'PF1_1', '', 'WS.101.3a');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.a6', 'PF1_1', '', 'WS.101.3b');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.b1', 'PF1_1', '', 'WS.102.1a');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.b2', 'PF1_1', '', 'WS.102.1b');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.b3', 'PF1_1', '', 'WS.102.2a');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.b4', 'PF1_1', '', 'WS.102.2b');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.b5', 'PF1_1', '', 'WS.102.3a');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.b6', 'PF1_1', '', 'WS.102.3b');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.c1', 'PF1_1', '', 'WS.105.1a');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.c2', 'PF1_1', '', 'WS.105.1b');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.c3', 'PF1_1', '', 'WS.105.2a');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.c4', 'PF1_1', '', 'WS.105.2b');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.c5', 'PF1_1', '', 'WS.105.3a');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.c6', 'PF1_1', '', 'WS.105.3b');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.d1', 'PF1_1', '', 'WS.106.1a');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.d2', 'PF1_1', '', 'WS.106.1b');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.d3', 'PF1_1', '', 'WS.106.2a');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.d4', 'PF1_1', '', 'WS.106.2b');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.d5', 'PF1_1', '', 'WS.106.3a');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.d6', 'PF1_1', '', 'WS.106.3b');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 --
 -- Now we wire the wall connectors 1a-2a in room 001 to the
 -- patchfield. In the second update we make an error, and
@@ -1144,72 +1432,36 @@ insert into PSlot values ('PS.first.d6', 'PF1_1', '', 'WS.106.3b');
 update PSlot set backlink = 'WS.001.1a' where slotname = 'PS.base.a1';
 update PSlot set backlink = 'WS.001.1b' where slotname = 'PS.base.a3';
 select * from WSlot where roomno = '001' order by slotname;
-       slotname       |  roomno  |       slotlink       |       backlink       
-----------------------+----------+----------------------+----------------------
- WS.001.1a            | 001      |                      | PS.base.a1          
- WS.001.1b            | 001      |                      | PS.base.a3          
- WS.001.2a            | 001      |                      |                     
- WS.001.2b            | 001      |                      |                     
- WS.001.3a            | 001      |                      |                     
- WS.001.3b            | 001      |                      |                     
-(6 rows)
+ slotname | roomno | slotlink | backlink 
+----------+--------+----------+----------
+(0 rows)
 
 select * from PSlot where slotname ~ 'PS.base.a' order by slotname;
-       slotname       | pfname |       slotlink       |       backlink       
-----------------------+--------+----------------------+----------------------
- PS.base.a1           | PF0_1  |                      | WS.001.1a           
- PS.base.a2           | PF0_1  |                      |                     
- PS.base.a3           | PF0_1  |                      | WS.001.1b           
- PS.base.a4           | PF0_1  |                      |                     
- PS.base.a5           | PF0_1  |                      |                     
- PS.base.a6           | PF0_1  |                      |                     
-(6 rows)
+ slotname | pfname | slotlink | backlink 
+----------+--------+----------+----------
+(0 rows)
 
 update PSlot set backlink = 'WS.001.2a' where slotname = 'PS.base.a3';
 select * from WSlot where roomno = '001' order by slotname;
-       slotname       |  roomno  |       slotlink       |       backlink       
-----------------------+----------+----------------------+----------------------
- WS.001.1a            | 001      |                      | PS.base.a1          
- WS.001.1b            | 001      |                      |                     
- WS.001.2a            | 001      |                      | PS.base.a3          
- WS.001.2b            | 001      |                      |                     
- WS.001.3a            | 001      |                      |                     
- WS.001.3b            | 001      |                      |                     
-(6 rows)
+ slotname | roomno | slotlink | backlink 
+----------+--------+----------+----------
+(0 rows)
 
 select * from PSlot where slotname ~ 'PS.base.a' order by slotname;
-       slotname       | pfname |       slotlink       |       backlink       
-----------------------+--------+----------------------+----------------------
- PS.base.a1           | PF0_1  |                      | WS.001.1a           
- PS.base.a2           | PF0_1  |                      |                     
- PS.base.a3           | PF0_1  |                      | WS.001.2a           
- PS.base.a4           | PF0_1  |                      |                     
- PS.base.a5           | PF0_1  |                      |                     
- PS.base.a6           | PF0_1  |                      |                     
-(6 rows)
+ slotname | pfname | slotlink | backlink 
+----------+--------+----------+----------
+(0 rows)
 
 update PSlot set backlink = 'WS.001.1b' where slotname = 'PS.base.a2';
 select * from WSlot where roomno = '001' order by slotname;
-       slotname       |  roomno  |       slotlink       |       backlink       
-----------------------+----------+----------------------+----------------------
- WS.001.1a            | 001      |                      | PS.base.a1          
- WS.001.1b            | 001      |                      | PS.base.a2          
- WS.001.2a            | 001      |                      | PS.base.a3          
- WS.001.2b            | 001      |                      |                     
- WS.001.3a            | 001      |                      |                     
- WS.001.3b            | 001      |                      |                     
-(6 rows)
+ slotname | roomno | slotlink | backlink 
+----------+--------+----------+----------
+(0 rows)
 
 select * from PSlot where slotname ~ 'PS.base.a' order by slotname;
-       slotname       | pfname |       slotlink       |       backlink       
-----------------------+--------+----------------------+----------------------
- PS.base.a1           | PF0_1  |                      | WS.001.1a           
- PS.base.a2           | PF0_1  |                      | WS.001.1b           
- PS.base.a3           | PF0_1  |                      | WS.001.2a           
- PS.base.a4           | PF0_1  |                      |                     
- PS.base.a5           | PF0_1  |                      |                     
- PS.base.a6           | PF0_1  |                      |                     
-(6 rows)
+ slotname | pfname | slotlink | backlink 
+----------+--------+----------+----------
+(0 rows)
 
 --
 -- Same procedure for 2b-3b but this time updating the WSlot instead
@@ -1219,207 +1471,100 @@ select * from PSlot where slotname ~ 'PS.base.a' order by slotname;
 update WSlot set backlink = 'PS.base.a4' where slotname = 'WS.001.2b';
 update WSlot set backlink = 'PS.base.a6' where slotname = 'WS.001.3a';
 select * from WSlot where roomno = '001' order by slotname;
-       slotname       |  roomno  |       slotlink       |       backlink       
-----------------------+----------+----------------------+----------------------
- WS.001.1a            | 001      |                      | PS.base.a1          
- WS.001.1b            | 001      |                      | PS.base.a2          
- WS.001.2a            | 001      |                      | PS.base.a3          
- WS.001.2b            | 001      |                      | PS.base.a4          
- WS.001.3a            | 001      |                      | PS.base.a6          
- WS.001.3b            | 001      |                      |                     
-(6 rows)
+ slotname | roomno | slotlink | backlink 
+----------+--------+----------+----------
+(0 rows)
 
 select * from PSlot where slotname ~ 'PS.base.a' order by slotname;
-       slotname       | pfname |       slotlink       |       backlink       
-----------------------+--------+----------------------+----------------------
- PS.base.a1           | PF0_1  |                      | WS.001.1a           
- PS.base.a2           | PF0_1  |                      | WS.001.1b           
- PS.base.a3           | PF0_1  |                      | WS.001.2a           
- PS.base.a4           | PF0_1  |                      | WS.001.2b           
- PS.base.a5           | PF0_1  |                      |                     
- PS.base.a6           | PF0_1  |                      | WS.001.3a           
-(6 rows)
+ slotname | pfname | slotlink | backlink 
+----------+--------+----------+----------
+(0 rows)
 
 update WSlot set backlink = 'PS.base.a6' where slotname = 'WS.001.3b';
 select * from WSlot where roomno = '001' order by slotname;
-       slotname       |  roomno  |       slotlink       |       backlink       
-----------------------+----------+----------------------+----------------------
- WS.001.1a            | 001      |                      | PS.base.a1          
- WS.001.1b            | 001      |                      | PS.base.a2          
- WS.001.2a            | 001      |                      | PS.base.a3          
- WS.001.2b            | 001      |                      | PS.base.a4          
- WS.001.3a            | 001      |                      |                     
- WS.001.3b            | 001      |                      | PS.base.a6          
-(6 rows)
+ slotname | roomno | slotlink | backlink 
+----------+--------+----------+----------
+(0 rows)
 
 select * from PSlot where slotname ~ 'PS.base.a' order by slotname;
-       slotname       | pfname |       slotlink       |       backlink       
-----------------------+--------+----------------------+----------------------
- PS.base.a1           | PF0_1  |                      | WS.001.1a           
- PS.base.a2           | PF0_1  |                      | WS.001.1b           
- PS.base.a3           | PF0_1  |                      | WS.001.2a           
- PS.base.a4           | PF0_1  |                      | WS.001.2b           
- PS.base.a5           | PF0_1  |                      |                     
- PS.base.a6           | PF0_1  |                      | WS.001.3b           
-(6 rows)
+ slotname | pfname | slotlink | backlink 
+----------+--------+----------+----------
+(0 rows)
 
 update WSlot set backlink = 'PS.base.a5' where slotname = 'WS.001.3a';
 select * from WSlot where roomno = '001' order by slotname;
-       slotname       |  roomno  |       slotlink       |       backlink       
-----------------------+----------+----------------------+----------------------
- WS.001.1a            | 001      |                      | PS.base.a1          
- WS.001.1b            | 001      |                      | PS.base.a2          
- WS.001.2a            | 001      |                      | PS.base.a3          
- WS.001.2b            | 001      |                      | PS.base.a4          
- WS.001.3a            | 001      |                      | PS.base.a5          
- WS.001.3b            | 001      |                      | PS.base.a6          
-(6 rows)
+ slotname | roomno | slotlink | backlink 
+----------+--------+----------+----------
+(0 rows)
 
 select * from PSlot where slotname ~ 'PS.base.a' order by slotname;
-       slotname       | pfname |       slotlink       |       backlink       
-----------------------+--------+----------------------+----------------------
- PS.base.a1           | PF0_1  |                      | WS.001.1a           
- PS.base.a2           | PF0_1  |                      | WS.001.1b           
- PS.base.a3           | PF0_1  |                      | WS.001.2a           
- PS.base.a4           | PF0_1  |                      | WS.001.2b           
- PS.base.a5           | PF0_1  |                      | WS.001.3a           
- PS.base.a6           | PF0_1  |                      | WS.001.3b           
-(6 rows)
+ slotname | pfname | slotlink | backlink 
+----------+--------+----------+----------
+(0 rows)
 
 insert into PField values ('PF1_2', 'Phonelines first floor');
 insert into PSlot values ('PS.first.ta1', 'PF1_2', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.ta2', 'PF1_2', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.ta3', 'PF1_2', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.ta4', 'PF1_2', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.ta5', 'PF1_2', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.ta6', 'PF1_2', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.tb1', 'PF1_2', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.tb2', 'PF1_2', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.tb3', 'PF1_2', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.tb4', 'PF1_2', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.tb5', 'PF1_2', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 insert into PSlot values ('PS.first.tb6', 'PF1_2', '', '');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pfield"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "select            * from PField where name = ps.pfname"
+PL/pgSQL function tg_pslot_biu() line 6 at SQL statement
 --
 -- Fix the wrong name for patchfield PF0_2
 --
 update PField set name = 'PF0_2' where name = 'PF0_X';
+ERROR:  UPDATE on distributed key column not allowed on relation with update triggers
 select * from PSlot order by slotname;
-       slotname       | pfname |       slotlink       |       backlink       
-----------------------+--------+----------------------+----------------------
- PS.base.a1           | PF0_1  |                      | WS.001.1a           
- PS.base.a2           | PF0_1  |                      | WS.001.1b           
- PS.base.a3           | PF0_1  |                      | WS.001.2a           
- PS.base.a4           | PF0_1  |                      | WS.001.2b           
- PS.base.a5           | PF0_1  |                      | WS.001.3a           
- PS.base.a6           | PF0_1  |                      | WS.001.3b           
- PS.base.b1           | PF0_1  |                      | WS.002.1a           
- PS.base.b2           | PF0_1  |                      | WS.002.1b           
- PS.base.b3           | PF0_1  |                      | WS.002.2a           
- PS.base.b4           | PF0_1  |                      | WS.002.2b           
- PS.base.b5           | PF0_1  |                      | WS.002.3a           
- PS.base.b6           | PF0_1  |                      | WS.002.3b           
- PS.base.c1           | PF0_1  |                      | WS.003.1a           
- PS.base.c2           | PF0_1  |                      | WS.003.1b           
- PS.base.c3           | PF0_1  |                      | WS.003.2a           
- PS.base.c4           | PF0_1  |                      | WS.003.2b           
- PS.base.c5           | PF0_1  |                      | WS.003.3a           
- PS.base.c6           | PF0_1  |                      | WS.003.3b           
- PS.base.ta1          | PF0_2  |                      |                     
- PS.base.ta2          | PF0_2  |                      |                     
- PS.base.ta3          | PF0_2  |                      |                     
- PS.base.ta4          | PF0_2  |                      |                     
- PS.base.ta5          | PF0_2  |                      |                     
- PS.base.ta6          | PF0_2  |                      |                     
- PS.base.tb1          | PF0_2  |                      |                     
- PS.base.tb2          | PF0_2  |                      |                     
- PS.base.tb3          | PF0_2  |                      |                     
- PS.base.tb4          | PF0_2  |                      |                     
- PS.base.tb5          | PF0_2  |                      |                     
- PS.base.tb6          | PF0_2  |                      |                     
- PS.first.a1          | PF1_1  |                      | WS.101.1a           
- PS.first.a2          | PF1_1  |                      | WS.101.1b           
- PS.first.a3          | PF1_1  |                      | WS.101.2a           
- PS.first.a4          | PF1_1  |                      | WS.101.2b           
- PS.first.a5          | PF1_1  |                      | WS.101.3a           
- PS.first.a6          | PF1_1  |                      | WS.101.3b           
- PS.first.b1          | PF1_1  |                      | WS.102.1a           
- PS.first.b2          | PF1_1  |                      | WS.102.1b           
- PS.first.b3          | PF1_1  |                      | WS.102.2a           
- PS.first.b4          | PF1_1  |                      | WS.102.2b           
- PS.first.b5          | PF1_1  |                      | WS.102.3a           
- PS.first.b6          | PF1_1  |                      | WS.102.3b           
- PS.first.c1          | PF1_1  |                      | WS.105.1a           
- PS.first.c2          | PF1_1  |                      | WS.105.1b           
- PS.first.c3          | PF1_1  |                      | WS.105.2a           
- PS.first.c4          | PF1_1  |                      | WS.105.2b           
- PS.first.c5          | PF1_1  |                      | WS.105.3a           
- PS.first.c6          | PF1_1  |                      | WS.105.3b           
- PS.first.d1          | PF1_1  |                      | WS.106.1a           
- PS.first.d2          | PF1_1  |                      | WS.106.1b           
- PS.first.d3          | PF1_1  |                      | WS.106.2a           
- PS.first.d4          | PF1_1  |                      | WS.106.2b           
- PS.first.d5          | PF1_1  |                      | WS.106.3a           
- PS.first.d6          | PF1_1  |                      | WS.106.3b           
- PS.first.ta1         | PF1_2  |                      |                     
- PS.first.ta2         | PF1_2  |                      |                     
- PS.first.ta3         | PF1_2  |                      |                     
- PS.first.ta4         | PF1_2  |                      |                     
- PS.first.ta5         | PF1_2  |                      |                     
- PS.first.ta6         | PF1_2  |                      |                     
- PS.first.tb1         | PF1_2  |                      |                     
- PS.first.tb2         | PF1_2  |                      |                     
- PS.first.tb3         | PF1_2  |                      |                     
- PS.first.tb4         | PF1_2  |                      |                     
- PS.first.tb5         | PF1_2  |                      |                     
- PS.first.tb6         | PF1_2  |                      |                     
-(66 rows)
+ slotname | pfname | slotlink | backlink 
+----------+--------+----------+----------
+(0 rows)
 
 select * from WSlot order by slotname;
-       slotname       |  roomno  |       slotlink       |       backlink       
-----------------------+----------+----------------------+----------------------
- WS.001.1a            | 001      |                      | PS.base.a1          
- WS.001.1b            | 001      |                      | PS.base.a2          
- WS.001.2a            | 001      |                      | PS.base.a3          
- WS.001.2b            | 001      |                      | PS.base.a4          
- WS.001.3a            | 001      |                      | PS.base.a5          
- WS.001.3b            | 001      |                      | PS.base.a6          
- WS.002.1a            | 002      |                      | PS.base.b1          
- WS.002.1b            | 002      |                      | PS.base.b2          
- WS.002.2a            | 002      |                      | PS.base.b3          
- WS.002.2b            | 002      |                      | PS.base.b4          
- WS.002.3a            | 002      |                      | PS.base.b5          
- WS.002.3b            | 002      |                      | PS.base.b6          
- WS.003.1a            | 003      |                      | PS.base.c1          
- WS.003.1b            | 003      |                      | PS.base.c2          
- WS.003.2a            | 003      |                      | PS.base.c3          
- WS.003.2b            | 003      |                      | PS.base.c4          
- WS.003.3a            | 003      |                      | PS.base.c5          
- WS.003.3b            | 003      |                      | PS.base.c6          
- WS.101.1a            | 101      |                      | PS.first.a1         
- WS.101.1b            | 101      |                      | PS.first.a2         
- WS.101.2a            | 101      |                      | PS.first.a3         
- WS.101.2b            | 101      |                      | PS.first.a4         
- WS.101.3a            | 101      |                      | PS.first.a5         
- WS.101.3b            | 101      |                      | PS.first.a6         
- WS.102.1a            | 102      |                      | PS.first.b1         
- WS.102.1b            | 102      |                      | PS.first.b2         
- WS.102.2a            | 102      |                      | PS.first.b3         
- WS.102.2b            | 102      |                      | PS.first.b4         
- WS.102.3a            | 102      |                      | PS.first.b5         
- WS.102.3b            | 102      |                      | PS.first.b6         
- WS.105.1a            | 105      |                      | PS.first.c1         
- WS.105.1b            | 105      |                      | PS.first.c2         
- WS.105.2a            | 105      |                      | PS.first.c3         
- WS.105.2b            | 105      |                      | PS.first.c4         
- WS.105.3a            | 105      |                      | PS.first.c5         
- WS.105.3b            | 105      |                      | PS.first.c6         
- WS.106.1a            | 106      |                      | PS.first.d1         
- WS.106.1b            | 106      |                      | PS.first.d2         
- WS.106.2a            | 106      |                      | PS.first.d3         
- WS.106.2b            | 106      |                      | PS.first.d4         
- WS.106.3a            | 106      |                      | PS.first.d5         
- WS.106.3b            | 106      |                      | PS.first.d6         
-(42 rows)
+ slotname | roomno | slotlink | backlink 
+----------+--------+----------+----------
+(0 rows)
 
 --
 -- Install the central phone system and create the phone numbers.
@@ -1428,87 +1573,161 @@ select * from WSlot order by slotname;
 -- backlink field.
 --
 insert into PLine values ('PL.001', '-0', 'Central call', 'PS.base.ta1');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pslot"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select          * from PSlot where slotname = myname"
+PL/pgSQL function tg_backlink_set(character,character) line 18 at SQL statement
+PL/pgSQL function tg_backlink_a() line 7 at assignment
 insert into PLine values ('PL.002', '-101', '', 'PS.base.ta2');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pslot"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "select          * from PSlot where slotname = myname"
+PL/pgSQL function tg_backlink_set(character,character) line 18 at SQL statement
+PL/pgSQL function tg_backlink_a() line 7 at assignment
 insert into PLine values ('PL.003', '-102', '', 'PS.base.ta3');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pslot"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "select          * from PSlot where slotname = myname"
+PL/pgSQL function tg_backlink_set(character,character) line 18 at SQL statement
+PL/pgSQL function tg_backlink_a() line 7 at assignment
 insert into PLine values ('PL.004', '-103', '', 'PS.base.ta5');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pslot"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select          * from PSlot where slotname = myname"
+PL/pgSQL function tg_backlink_set(character,character) line 18 at SQL statement
+PL/pgSQL function tg_backlink_a() line 7 at assignment
 insert into PLine values ('PL.005', '-104', '', 'PS.base.ta6');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pslot"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "select          * from PSlot where slotname = myname"
+PL/pgSQL function tg_backlink_set(character,character) line 18 at SQL statement
+PL/pgSQL function tg_backlink_a() line 7 at assignment
 insert into PLine values ('PL.006', '-106', '', 'PS.base.tb2');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pslot"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "select          * from PSlot where slotname = myname"
+PL/pgSQL function tg_backlink_set(character,character) line 18 at SQL statement
+PL/pgSQL function tg_backlink_a() line 7 at assignment
 insert into PLine values ('PL.007', '-108', '', 'PS.base.tb3');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pslot"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select          * from PSlot where slotname = myname"
+PL/pgSQL function tg_backlink_set(character,character) line 18 at SQL statement
+PL/pgSQL function tg_backlink_a() line 7 at assignment
 insert into PLine values ('PL.008', '-109', '', 'PS.base.tb4');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pslot"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "select          * from PSlot where slotname = myname"
+PL/pgSQL function tg_backlink_set(character,character) line 18 at SQL statement
+PL/pgSQL function tg_backlink_a() line 7 at assignment
 insert into PLine values ('PL.009', '-121', '', 'PS.base.tb5');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pslot"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "select          * from PSlot where slotname = myname"
+PL/pgSQL function tg_backlink_set(character,character) line 18 at SQL statement
+PL/pgSQL function tg_backlink_a() line 7 at assignment
 insert into PLine values ('PL.010', '-122', '', 'PS.base.tb6');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pslot"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "select          * from PSlot where slotname = myname"
+PL/pgSQL function tg_backlink_set(character,character) line 18 at SQL statement
+PL/pgSQL function tg_backlink_a() line 7 at assignment
 insert into PLine values ('PL.015', '-134', '', 'PS.first.ta1');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pslot"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "select          * from PSlot where slotname = myname"
+PL/pgSQL function tg_backlink_set(character,character) line 18 at SQL statement
+PL/pgSQL function tg_backlink_a() line 7 at assignment
 insert into PLine values ('PL.016', '-137', '', 'PS.first.ta3');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pslot"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select          * from PSlot where slotname = myname"
+PL/pgSQL function tg_backlink_set(character,character) line 18 at SQL statement
+PL/pgSQL function tg_backlink_a() line 7 at assignment
 insert into PLine values ('PL.017', '-139', '', 'PS.first.ta4');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pslot"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "select          * from PSlot where slotname = myname"
+PL/pgSQL function tg_backlink_set(character,character) line 18 at SQL statement
+PL/pgSQL function tg_backlink_a() line 7 at assignment
 insert into PLine values ('PL.018', '-362', '', 'PS.first.tb1');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pslot"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select          * from PSlot where slotname = myname"
+PL/pgSQL function tg_backlink_set(character,character) line 18 at SQL statement
+PL/pgSQL function tg_backlink_a() line 7 at assignment
 insert into PLine values ('PL.019', '-363', '', 'PS.first.tb2');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pslot"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "select          * from PSlot where slotname = myname"
+PL/pgSQL function tg_backlink_set(character,character) line 18 at SQL statement
+PL/pgSQL function tg_backlink_a() line 7 at assignment
 insert into PLine values ('PL.020', '-364', '', 'PS.first.tb3');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pslot"  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "select          * from PSlot where slotname = myname"
+PL/pgSQL function tg_backlink_set(character,character) line 18 at SQL statement
+PL/pgSQL function tg_backlink_a() line 7 at assignment
 insert into PLine values ('PL.021', '-365', '', 'PS.first.tb5');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pslot"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "select          * from PSlot where slotname = myname"
+PL/pgSQL function tg_backlink_set(character,character) line 18 at SQL statement
+PL/pgSQL function tg_backlink_a() line 7 at assignment
 insert into PLine values ('PL.022', '-367', '', 'PS.first.tb6');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pslot"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "select          * from PSlot where slotname = myname"
+PL/pgSQL function tg_backlink_set(character,character) line 18 at SQL statement
+PL/pgSQL function tg_backlink_a() line 7 at assignment
 insert into PLine values ('PL.028', '-501', 'Fax entrance', 'PS.base.ta2');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pslot"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "select          * from PSlot where slotname = myname"
+PL/pgSQL function tg_backlink_set(character,character) line 18 at SQL statement
+PL/pgSQL function tg_backlink_a() line 7 at assignment
 insert into PLine values ('PL.029', '-502', 'Fax first floor', 'PS.first.ta1');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.pslot"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select          * from PSlot where slotname = myname"
+PL/pgSQL function tg_backlink_set(character,character) line 18 at SQL statement
+PL/pgSQL function tg_backlink_a() line 7 at assignment
 --
 -- Buy some phones, plug them into the wall and patch the
 -- phone lines to the corresponding patchfield slots.
 --
 insert into PHone values ('PH.hc001', 'Hicom standard', 'WS.001.1a');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.wslot"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select          * from WSlot where slotname = myname"
+PL/pgSQL function tg_slotlink_set(character,character) line 38 at SQL statement
+PL/pgSQL function tg_slotlink_a() line 7 at assignment
 update PSlot set slotlink = 'PS.base.ta1' where slotname = 'PS.base.a1';
 insert into PHone values ('PH.hc002', 'Hicom standard', 'WS.002.1a');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.wslot"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select          * from WSlot where slotname = myname"
+PL/pgSQL function tg_slotlink_set(character,character) line 38 at SQL statement
+PL/pgSQL function tg_slotlink_a() line 7 at assignment
 update PSlot set slotlink = 'PS.base.ta5' where slotname = 'PS.base.b1';
 insert into PHone values ('PH.hc003', 'Hicom standard', 'WS.002.2a');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.wslot"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "select          * from WSlot where slotname = myname"
+PL/pgSQL function tg_slotlink_set(character,character) line 38 at SQL statement
+PL/pgSQL function tg_slotlink_a() line 7 at assignment
 update PSlot set slotlink = 'PS.base.tb2' where slotname = 'PS.base.b3';
 insert into PHone values ('PH.fax001', 'Canon fax', 'WS.001.2a');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.wslot"  (seg0 127.0.0.1:40000 pid=1760)
+CONTEXT:  SQL statement "select          * from WSlot where slotname = myname"
+PL/pgSQL function tg_slotlink_set(character,character) line 38 at SQL statement
+PL/pgSQL function tg_slotlink_a() line 7 at assignment
 update PSlot set slotlink = 'PS.base.ta2' where slotname = 'PS.base.a3';
 --
 -- Install a hub at one of the patchfields, plug a computers
 -- ethernet interface into the wall and patch it to the hub.
 --
 insert into Hub values ('base.hub1', 'Patchfield PF0_1 hub', 16);
+ERROR:  function cannot execute on a QE slice because it issues a non-SELECT statement  (seg1 127.0.0.1:40001 pid=1761)
+CONTEXT:  SQL statement "insert into HSlot (slotname, hubname, slotno, slotlink)
+		values ('HS.dummy', hname, i, '')"
+PL/pgSQL function tg_hub_adjustslots(character,integer,integer) line 11 at SQL statement
+PL/pgSQL function tg_hub_a() line 7 at assignment
 insert into System values ('orion', 'PC');
 insert into IFace values ('IF', 'orion', 'eth0', 'WS.002.1b');
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.system"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select             * from system where name = new.sysname"
+PL/pgSQL function tg_iface_biu() line 6 at SQL statement
 update PSlot set slotlink = 'HS.base.hub1.1' where slotname = 'PS.base.b2';
 --
 -- Now we take a look at the patchfield
 --
 select * from PField_v1 where pfname = 'PF0_1' order by slotname;
- pfname |       slotname       |                         backside                         |                     patch                     
---------+----------------------+----------------------------------------------------------+-----------------------------------------------
- PF0_1  | PS.base.a1           | WS.001.1a in room 001 -> Phone PH.hc001 (Hicom standard) | PS.base.ta1 -> Phone line -0 (Central call)
- PF0_1  | PS.base.a2           | WS.001.1b in room 001 -> -                               | -
- PF0_1  | PS.base.a3           | WS.001.2a in room 001 -> Phone PH.fax001 (Canon fax)     | PS.base.ta2 -> Phone line -501 (Fax entrance)
- PF0_1  | PS.base.a4           | WS.001.2b in room 001 -> -                               | -
- PF0_1  | PS.base.a5           | WS.001.3a in room 001 -> -                               | -
- PF0_1  | PS.base.a6           | WS.001.3b in room 001 -> -                               | -
- PF0_1  | PS.base.b1           | WS.002.1a in room 002 -> Phone PH.hc002 (Hicom standard) | PS.base.ta5 -> Phone line -103
- PF0_1  | PS.base.b2           | WS.002.1b in room 002 -> orion IF eth0 (PC)              | Patchfield PF0_1 hub slot 1
- PF0_1  | PS.base.b3           | WS.002.2a in room 002 -> Phone PH.hc003 (Hicom standard) | PS.base.tb2 -> Phone line -106
- PF0_1  | PS.base.b4           | WS.002.2b in room 002 -> -                               | -
- PF0_1  | PS.base.b5           | WS.002.3a in room 002 -> -                               | -
- PF0_1  | PS.base.b6           | WS.002.3b in room 002 -> -                               | -
- PF0_1  | PS.base.c1           | WS.003.1a in room 003 -> -                               | -
- PF0_1  | PS.base.c2           | WS.003.1b in room 003 -> -                               | -
- PF0_1  | PS.base.c3           | WS.003.2a in room 003 -> -                               | -
- PF0_1  | PS.base.c4           | WS.003.2b in room 003 -> -                               | -
- PF0_1  | PS.base.c5           | WS.003.3a in room 003 -> -                               | -
- PF0_1  | PS.base.c6           | WS.003.3b in room 003 -> -                               | -
-(18 rows)
+ pfname | slotname | backside | patch 
+--------+----------+----------+-------
+(0 rows)
 
 select * from PField_v1 where pfname = 'PF0_2' order by slotname;
- pfname |       slotname       |            backside            |                                 patch                                  
---------+----------------------+--------------------------------+------------------------------------------------------------------------
- PF0_2  | PS.base.ta1          | Phone line -0 (Central call)   | PS.base.a1 -> WS.001.1a in room 001 -> Phone PH.hc001 (Hicom standard)
- PF0_2  | PS.base.ta2          | Phone line -501 (Fax entrance) | PS.base.a3 -> WS.001.2a in room 001 -> Phone PH.fax001 (Canon fax)
- PF0_2  | PS.base.ta3          | Phone line -102                | -
- PF0_2  | PS.base.ta4          | -                              | -
- PF0_2  | PS.base.ta5          | Phone line -103                | PS.base.b1 -> WS.002.1a in room 002 -> Phone PH.hc002 (Hicom standard)
- PF0_2  | PS.base.ta6          | Phone line -104                | -
- PF0_2  | PS.base.tb1          | -                              | -
- PF0_2  | PS.base.tb2          | Phone line -106                | PS.base.b3 -> WS.002.2a in room 002 -> Phone PH.hc003 (Hicom standard)
- PF0_2  | PS.base.tb3          | Phone line -108                | -
- PF0_2  | PS.base.tb4          | Phone line -109                | -
- PF0_2  | PS.base.tb5          | Phone line -121                | -
- PF0_2  | PS.base.tb6          | Phone line -122                | -
-(12 rows)
+ pfname | slotname | backside | patch 
+--------+----------+----------+-------
+(0 rows)
 
 --
 -- Finally we want errors
@@ -1517,28 +1736,26 @@ insert into PField values ('PF1_1', 'should fail due to unique index');
 ERROR:  duplicate key value violates unique constraint "pfield_name"
 DETAIL:  Key (name)=(PF1_1) already exists.
 update PSlot set backlink = 'WS.not.there' where slotname = 'PS.base.a1';
-ERROR:  WS.not.there         does not exist
-CONTEXT:  PL/pgSQL function tg_backlink_a() line 17 at assignment
 update PSlot set backlink = 'XX.illegal' where slotname = 'PS.base.a1';
-ERROR:  illegal backlink beginning with XX
-CONTEXT:  PL/pgSQL function tg_backlink_a() line 17 at assignment
 update PSlot set slotlink = 'PS.not.there' where slotname = 'PS.base.a1';
-ERROR:  PS.not.there         does not exist
-CONTEXT:  PL/pgSQL function tg_slotlink_a() line 17 at assignment
 update PSlot set slotlink = 'XX.illegal' where slotname = 'PS.base.a1';
-ERROR:  illegal slotlink beginning with XX
-CONTEXT:  PL/pgSQL function tg_slotlink_a() line 17 at assignment
 insert into HSlot values ('HS', 'base.hub1', 1, '');
-ERROR:  duplicate key value violates unique constraint "hslot_name"
-DETAIL:  Key (slotname)=(HS.base.hub1.1      ) already exists.
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.hub"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select             * from Hub where name = new.hubname"
+PL/pgSQL function tg_hslot_biu() line 7 at SQL statement
 insert into HSlot values ('HS', 'base.hub1', 20, '');
-ERROR:  no manual manipulation of HSlot
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.hub"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select             * from Hub where name = new.hubname"
+PL/pgSQL function tg_hslot_biu() line 7 at SQL statement
 delete from HSlot;
-ERROR:  no manual manipulation of HSlot
 insert into IFace values ('IF', 'notthere', 'eth0', '');
-ERROR:  system "notthere" does not exist
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.system"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select             * from system where name = new.sysname"
+PL/pgSQL function tg_iface_biu() line 6 at SQL statement
 insert into IFace values ('IF', 'orion', 'ethernet_interface_name_too_long', '');
-ERROR:  IFace slotname "IF.orion.ethernet_interface_name_too_long" too long (20 char max)
+ERROR:  function cannot execute on a QE slice because it accesses relation "public.system"  (seg2 127.0.0.1:40002 pid=1762)
+CONTEXT:  SQL statement "select             * from system where name = new.sysname"
+PL/pgSQL function tg_iface_biu() line 6 at SQL statement
 --
 -- The following tests are unrelated to the scenario outlined above;
 -- they merely exercise specific parts of PL/pgSQL
@@ -1610,12 +1827,12 @@ select test_found();
 select * from found_test_tbl;
   a  
 -----
-   2
- 100
    3
    4
    5
    6
+   2
+ 100
 (6 rows)
 
 --
@@ -1634,11 +1851,11 @@ select * from test_table_func_rec();
   a  
 -----
    2
- 100
    3
    4
    5
    6
+ 100
 (6 rows)
 
 create function test_table_func_row() returns setof found_test_tbl as '
@@ -1653,12 +1870,12 @@ END;' language plpgsql;
 select * from test_table_func_row();
   a  
 -----
-   2
- 100
    3
    4
    5
    6
+ 100
+   2
 (6 rows)
 
 create function test_ret_set_scalar(int,int) returns setof int as '
@@ -1900,9 +2117,9 @@ SELECT perform_test_func();
 SELECT * FROM perform_test;
   a  |  b  
 -----+-----
+ 100 | 100
+ 100 | 100
    5 |  15
- 100 | 100
- 100 | 100
 (3 rows)
 
 drop table perform_test;
@@ -1977,7 +2194,7 @@ begin
 		when data_exception then  -- category match
 			raise notice 'caught data_exception';
 			x := -1;
-		when NUMERIC_VALUE_OUT_OF_RANGE OR CARDINALITY_VIOLATION then
+		when NUMERIC_VALUE_OUT_OF_RANGE OR CARDINALITY_VIOLATION OR TOO_MANY_ROWS then
 			raise notice 'caught numeric_value_out_of_range or cardinality_violation';
 			x := -2;
 	end;
@@ -2098,11 +2315,10 @@ PL/pgSQL function test_variable_storage() line 8 at PERFORM
 --
 create temp table master(f1 int primary key);
 create temp table slave(f1 int references master deferrable);
+WARNING:  referential integrity (FOREIGN KEY) constraints are not supported in Greenplum Database, will not be enforced
 insert into master values(1);
 insert into slave values(1);
 insert into slave values(2);	-- fails
-ERROR:  insert or update on table "slave" violates foreign key constraint "slave_f1_fkey"
-DETAIL:  Key (f1)=(2) is not present in table "master".
 create function trap_foreign_key(int) returns int as $$
 begin
 	begin	-- start a subtransaction
@@ -2132,10 +2348,9 @@ select trap_foreign_key(1);
 (1 row)
 
 select trap_foreign_key(2);	-- detects FK violation
-NOTICE:  caught foreign_key_violation
  trap_foreign_key 
 ------------------
-                0
+                1
 (1 row)
 
 begin;
@@ -2148,19 +2363,14 @@ begin;
 
   savepoint x;
     set constraints all immediate; -- fails
-ERROR:  insert or update on table "slave" violates foreign key constraint "slave_f1_fkey"
-DETAIL:  Key (f1)=(2) is not present in table "master".
   rollback to x;
   select trap_foreign_key_2();  -- detects FK violation
-NOTICE:  caught foreign_key_violation
  trap_foreign_key_2 
 --------------------
-                  0
+                  1
 (1 row)
 
 commit;				-- still fails
-ERROR:  insert or update on table "slave" violates foreign key constraint "slave_f1_fkey"
-DETAIL:  Key (f1)=(2) is not present in table "master".
 drop function trap_foreign_key(int);
 drop function trap_foreign_key_2();
 --
@@ -2240,7 +2450,7 @@ create table rc_test (a int, b int);
 copy rc_test from stdin;
 create function return_refcursor(rc refcursor) returns refcursor as $$
 begin
-    open rc for select a from rc_test;
+    open rc for select a from rc_test order by a;
     return rc;
 end
 $$ language plpgsql;
@@ -2737,13 +2947,19 @@ begin
   end loop;
 
   raise notice '---5---';
-  for _r in select * from conttesttbl loop
+  -- select from a heap table, the order is uncertain.
+  -- the test framework does not sort NOTICE
+  -- so we add `order by` here.
+  for _r in select * from conttesttbl order by v loop
     continue when _r.v <= 20;
     raise notice '%', _r.v;
   end loop;
 
   raise notice '---6---';
-  for _r in execute 'select * from conttesttbl' loop
+  -- select from a heap table, the order is uncertain.
+  -- the test framework does not sort NOTICE
+  -- so we add `order by` here.
+  for _r in execute 'select * from conttesttbl order by v' loop
     continue when _r.v <= 20;
     raise notice '%', _r.v;
   end loop;
@@ -3372,15 +3588,8 @@ begin
 end;
 $$ language plpgsql;
 select * from sc_test();
-   sc_test   
--------------
- -2147483647
-  2147483647
-     -123456
-      123456
-           0
-(5 rows)
-
+ERROR:  backward scan is not supported in this version of Greenplum Database
+CONTEXT:  PL/pgSQL function sc_test() line 7 at FETCH
 create or replace function sc_test() returns setof integer as $$
 declare
   c no scroll cursor for select f1 from int4_tbl;
@@ -3396,8 +3605,7 @@ begin
 end;
 $$ language plpgsql;
 select * from sc_test();  -- fails because of NO SCROLL specification
-ERROR:  cursor can only scan forward
-HINT:  Declare it with SCROLL option to enable backward scan.
+ERROR:  backward scan is not supported in this version of Greenplum Database
 CONTEXT:  PL/pgSQL function sc_test() line 7 at FETCH
 create or replace function sc_test() returns setof integer as $$
 declare
@@ -3414,15 +3622,8 @@ begin
 end;
 $$ language plpgsql;
 select * from sc_test();
-   sc_test   
--------------
- -2147483647
-  2147483647
-     -123456
-      123456
-           0
-(5 rows)
-
+ERROR:  backward scan is not supported in this version of Greenplum Database
+CONTEXT:  PL/pgSQL function sc_test() line 7 at FETCH
 create or replace function sc_test() returns setof integer as $$
 declare
   c refcursor;
@@ -3438,13 +3639,8 @@ begin
 end;
 $$ language plpgsql;
 select * from sc_test();
-   sc_test   
--------------
- -2147483647
-     -123456
-           0
-(3 rows)
-
+ERROR:  backward scan is not supported in this version of Greenplum Database
+CONTEXT:  PL/pgSQL function sc_test() line 7 at FETCH
 create or replace function sc_test() returns setof integer as $$
 declare
   c refcursor;
@@ -3461,12 +3657,8 @@ begin
 end;
 $$ language plpgsql;
 select * from sc_test();
-   sc_test   
--------------
- -2147483647
-      123456
-(2 rows)
-
+ERROR:  backward scan is not supported in this version of Greenplum Database
+CONTEXT:  PL/pgSQL function sc_test() line 7 at FETCH
 create or replace function sc_test() returns setof integer as $$
 declare
   c cursor for select * from generate_series(1, 10);
@@ -3509,11 +3701,8 @@ begin
 end;
 $$ language plpgsql;
 select * from sc_test();
- sc_test 
----------
-      10
-(1 row)
-
+ERROR:  backward scan is not supported in this version of Greenplum Database
+CONTEXT:  PL/pgSQL function sc_test() line 8 at FETCH
 drop function sc_test();
 -- test qualified variable names
 create function pl_qual_names (param1 int) returns void as $$
@@ -3705,7 +3894,7 @@ NOTICE:  after loop, c2 = <NULL>
 
 -- try updating the cursor's current row
 create temp table forc_test as
-  select n as i, n as j from generate_series(1,10) n;
+  select 1 as distkey, n as i, n as j from generate_series(1,10) n distributed by (distkey);
 create or replace function forc01() returns void as $$
 declare
   c cursor for select * from forc_test;
@@ -3732,7 +3921,7 @@ NOTICE:  10, 10
  
 (1 row)
 
-select * from forc_test;
+select i, j from forc_test;
   i   | j  
 ------+----
   100 |  2
@@ -3778,7 +3967,7 @@ NOTICE:  1000, 20
  
 (1 row)
 
-select * from forc_test;
+select i, j from forc_test;
    i    | j  
 --------+----
   10000 |  4

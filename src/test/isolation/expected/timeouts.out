@@ -1,7 +1,7 @@
 Parsed test spec with 2 sessions
 
 starting permutation: rdtbl sto locktbl
-step rdtbl: SELECT * FROM accounts;
+step rdtbl: SELECT * FROM accounts ORDER BY accountid;
 accountid      balance        
 
 checking       600            
@@ -12,7 +12,7 @@ step locktbl: <... completed>
 ERROR:  canceling statement due to statement timeout
 
 starting permutation: rdtbl lto locktbl
-step rdtbl: SELECT * FROM accounts;
+step rdtbl: SELECT * FROM accounts ORDER BY accountid;
 accountid      balance        
 
 checking       600            
@@ -23,7 +23,7 @@ step locktbl: <... completed>
 ERROR:  canceling statement due to lock timeout
 
 starting permutation: rdtbl lsto locktbl
-step rdtbl: SELECT * FROM accounts;
+step rdtbl: SELECT * FROM accounts ORDER BY accountid;
 accountid      balance        
 
 checking       600            
@@ -34,7 +34,7 @@ step locktbl: <... completed>
 ERROR:  canceling statement due to lock timeout
 
 starting permutation: rdtbl slto locktbl
-step rdtbl: SELECT * FROM accounts;
+step rdtbl: SELECT * FROM accounts ORDER BY accountid;
 accountid      balance        
 
 checking       600            

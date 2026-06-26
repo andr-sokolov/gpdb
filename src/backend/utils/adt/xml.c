@@ -100,6 +100,8 @@ int			xmloption;
 /* random number to identify PgXmlErrorContext */
 #define ERRCXT_MAGIC	68275028
 
+static xmlParserInputPtr xmlPgEntityLoader(const char *URL, const char *ID,
+				  xmlParserCtxtPtr ctxt);
 struct PgXmlErrorContext
 {
 	int			magic;
@@ -166,7 +168,7 @@ static const char *map_sql_catalog_to_xmlschema_types(List *nspid_list,
 static const char *map_sql_type_to_xml_name(Oid typeoid, int typmod);
 static const char *map_sql_typecoll_to_xmlschema_types(List *tupdesc_list);
 static const char *map_sql_type_to_xmlschema_type(Oid typeoid, int typmod);
-static void SPI_sql_row_to_xmlelement(int rownum, StringInfo result,
+static void SPI_sql_row_to_xmlelement(uint64 rownum, StringInfo result,
 						  char *tablename, bool nulls, bool tableforest,
 						  const char *targetns, bool top_level);
 
@@ -976,6 +978,9 @@ pg_xml_init(PgXmlStrictness strictness)
 
 	xmlSetStructuredErrorFunc((void *) errcxt, xml_errorHandler);
 
+	/* set up our entity loader, too */
+	xmlSetExternalEntityLoader(xmlPgEntityLoader);
+
 	/*
 	 * Verify that xmlSetStructuredErrorFunc set the context variable we
 	 * expected it to.  If not, the error context pointer we just saved is not
@@ -1003,6 +1008,13 @@ pg_xml_init(PgXmlStrictness strictness)
 				 errhint("This probably indicates that the version of libxml2"
 						 " being used is not compatible with the libxml2"
 						 " header files that PostgreSQL was built with.")));
+
+	/*
+	 * Also, install an entity loader to prevent unwanted fetches of external
+	 * files and URLs.
+	 */
+	errcxt->saved_entityfunc = xmlGetExternalEntityLoader();
+	xmlSetExternalEntityLoader(xmlPgEntityLoader);
 
 	/*
 	 * Also, install an entity loader to prevent unwanted fetches of external
@@ -2361,7 +2373,7 @@ _SPI_strdup(const char *s)
 static List *
 query_to_oid_list(const char *query)
 {
-	int			i;
+	uint64			i;
 	List	   *list = NIL;
 
 	SPI_execute(query, true, 0);
@@ -2480,7 +2492,7 @@ cursor_to_xml(PG_FUNCTION_ARGS)
 
 	StringInfoData result;
 	Portal		portal;
-	int			i;
+	uint64			i;
 
 	initStringInfo(&result);
 
@@ -2564,7 +2576,7 @@ query_to_xml_internal(const char *query, char *tablename,
 {
 	StringInfo	result;
 	char	   *xmltn;
-	int			i;
+	uint64			i;
 
 	if (tablename)
 		xmltn = map_sql_identifier_to_xml_name(tablename, true, false);
@@ -3642,7 +3654,7 @@ map_sql_type_to_xmlschema_type(Oid typeoid, int typmod)
  * SPI cursor.  See also SQL/XML:2008 section 9.10.
  */
 static void
-SPI_sql_row_to_xmlelement(int rownum, StringInfo result, char *tablename,
+SPI_sql_row_to_xmlelement(uint64 rownum, StringInfo result, char *tablename,
 						  bool nulls, bool tableforest,
 						  const char *targetns, bool top_level)
 {
@@ -4082,7 +4094,7 @@ xpath(PG_FUNCTION_ARGS)
 	if (res_nitems == 0)
 		PG_RETURN_ARRAYTYPE_P(construct_empty_array(XMLOID));
 	else
-		PG_RETURN_ARRAYTYPE_P(makeArrayResult(astate, CurrentMemoryContext));
+		PG_RETURN_ARRAYTYPE_P(DatumGetArrayTypeP(makeArrayResult(astate, CurrentMemoryContext)));
 #else
 	NO_XML_SUPPORT();
 	return 0;

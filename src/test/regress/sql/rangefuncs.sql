@@ -49,21 +49,23 @@ select definition from pg_views where viewname='vw_ord';
 drop view vw_ord;
 
 -- ordinality and multiple functions vs. rewind and reverse scan
+-- Backward scan not supported in GPDB, which makes this a lot less
+-- interesting than in PostgreSQL.
 begin;
 declare foo scroll cursor for select * from rows from(generate_series(1,5),generate_series(1,2)) with ordinality as g(i,j,o);
 fetch all from foo;
-fetch backward all from foo;
+--fetch backward all from foo;
 fetch all from foo;
 fetch next from foo;
 fetch next from foo;
-fetch prior from foo;
-fetch absolute 1 from foo;
+--fetch prior from foo;
+--fetch absolute 1 from foo;
 fetch next from foo;
 fetch next from foo;
 fetch next from foo;
-fetch prior from foo;
-fetch prior from foo;
-fetch prior from foo;
+--fetch prior from foo;
+--fetch prior from foo;
+--fetch prior from foo;
 commit;
 
 -- function with implicit LATERAL
@@ -112,7 +114,7 @@ SELECT * FROM vw_getfoo;
 DROP VIEW vw_getfoo;
 
 -- sql, proretset = t, prorettype = b
-CREATE FUNCTION getfoo3(int) RETURNS setof text AS 'SELECT fooname FROM foo WHERE fooid = $1;' LANGUAGE SQL;
+CREATE FUNCTION getfoo3(int) RETURNS setof text AS 'SELECT fooname FROM foo WHERE fooid = $1 ORDER BY fooname DESC /* ORDER BY to force the Joe row to be returned */ ;' LANGUAGE SQL;
 SELECT * FROM getfoo3(1) AS t1;
 SELECT * FROM getfoo3(1) WITH ORDINALITY AS t1(v,o);
 CREATE VIEW vw_getfoo AS SELECT * FROM getfoo3(1);
@@ -123,7 +125,7 @@ SELECT * FROM vw_getfoo;
 DROP VIEW vw_getfoo;
 
 -- sql, proretset = f, prorettype = c
-CREATE FUNCTION getfoo4(int) RETURNS foo AS 'SELECT * FROM foo WHERE fooid = $1;' LANGUAGE SQL;
+CREATE FUNCTION getfoo4(int) RETURNS foo AS 'SELECT * FROM foo WHERE fooid = $1 ORDER BY fooname DESC /* ORDER BY to force the Joe row to be returned */ ;' LANGUAGE SQL;
 SELECT * FROM getfoo4(1) AS t1;
 SELECT * FROM getfoo4(1) WITH ORDINALITY AS t1(a,b,c,o);
 CREATE VIEW vw_getfoo AS SELECT * FROM getfoo4(1);
@@ -134,7 +136,7 @@ SELECT * FROM vw_getfoo;
 DROP VIEW vw_getfoo;
 
 -- sql, proretset = t, prorettype = c
-CREATE FUNCTION getfoo5(int) RETURNS setof foo AS 'SELECT * FROM foo WHERE fooid = $1;' LANGUAGE SQL;
+CREATE FUNCTION getfoo5(int) RETURNS setof foo AS 'SELECT * FROM foo WHERE fooid = $1 ORDER BY fooname DESC /* ORDER BY to force the Joe row to be returned */ ;' LANGUAGE SQL;
 SELECT * FROM getfoo5(1) AS t1;
 SELECT * FROM getfoo5(1) WITH ORDINALITY AS t1(a,b,c,o);
 CREATE VIEW vw_getfoo AS SELECT * FROM getfoo5(1);
@@ -145,7 +147,7 @@ SELECT * FROM vw_getfoo;
 DROP VIEW vw_getfoo;
 
 -- sql, proretset = f, prorettype = record
-CREATE FUNCTION getfoo6(int) RETURNS RECORD AS 'SELECT * FROM foo WHERE fooid = $1;' LANGUAGE SQL;
+CREATE FUNCTION getfoo6(int) RETURNS RECORD AS 'SELECT * FROM foo WHERE fooid = $1 ORDER BY fooname DESC /* ORDER BY to force the Joe row to be returned */ ;' LANGUAGE SQL;
 SELECT * FROM getfoo6(1) AS t1(fooid int, foosubid int, fooname text);
 SELECT * FROM ROWS FROM( getfoo6(1) AS (fooid int, foosubid int, fooname text) ) WITH ORDINALITY;
 CREATE VIEW vw_getfoo AS SELECT * FROM getfoo6(1) AS
@@ -159,7 +161,7 @@ SELECT * FROM vw_getfoo;
 DROP VIEW vw_getfoo;
 
 -- sql, proretset = t, prorettype = record
-CREATE FUNCTION getfoo7(int) RETURNS setof record AS 'SELECT * FROM foo WHERE fooid = $1;' LANGUAGE SQL;
+CREATE FUNCTION getfoo7(int) RETURNS setof record AS 'SELECT * FROM foo WHERE fooid = $1 ORDER BY fooname DESC /* ORDER BY to force the Joe row to be returned */ ;' LANGUAGE SQL;
 SELECT * FROM getfoo7(1) AS t1(fooid int, foosubid int, fooname text);
 SELECT * FROM ROWS FROM( getfoo7(1) AS (fooid int, foosubid int, fooname text) ) WITH ORDINALITY;
 CREATE VIEW vw_getfoo AS SELECT * FROM getfoo7(1) AS
@@ -184,7 +186,7 @@ SELECT * FROM vw_getfoo;
 DROP VIEW vw_getfoo;
 
 -- plpgsql, proretset = f, prorettype = c
-CREATE FUNCTION getfoo9(int) RETURNS foo AS 'DECLARE footup foo%ROWTYPE; BEGIN SELECT * into footup FROM foo WHERE fooid = $1; RETURN footup; END;' LANGUAGE plpgsql;
+CREATE FUNCTION getfoo9(int) RETURNS foo AS 'DECLARE footup foo%ROWTYPE; BEGIN SELECT * into footup FROM foo WHERE fooid = $1 ORDER BY fooname DESC /* ORDER BY to force the Joe row to be returned */ ; RETURN footup; END;' LANGUAGE plpgsql;
 SELECT * FROM getfoo9(1) AS t1;
 SELECT * FROM getfoo9(1) WITH ORDINALITY AS t1(a,b,c,o);
 CREATE VIEW vw_getfoo AS SELECT * FROM getfoo9(1);
@@ -440,6 +442,24 @@ DROP FUNCTION foo();
 
 create temp table tt(f1 serial, data text);
 
+-- GPDB: The tests below which throw NOTICEs, throw them in indeterminate
+-- order, if the rows are hashed to different segments. Force the rows
+-- that have problem to be hashed to the same segment, using a custom hash
+-- function.
+CREATE OPERATOR FAMILY dummy_int_hash_ops USING hash;
+
+CREATE FUNCTION dummy_hashfunc(int) RETURNS int AS $$
+begin
+  return CASE WHEN $1 BETWEEN 7 AND 15 THEN 0 ELSE $1 END;
+end; $$ LANGUAGE plpgsql STRICT IMMUTABLE;
+
+CREATE OPERATOR CLASS dummy_int_hash_ops FOR TYPE int4
+  USING hash FAMILY dummy_int_hash_ops AS
+  OPERATOR 1 =,
+  FUNCTION 1 dummy_hashfunc(int);
+
+ALTER TABLE tt SET DISTRIBUTED BY (f1 dummy_int_hash_ops);
+
 create function insert_tt(text) returns int as
 $$ insert into tt(data) values($1) returning f1 $$
 language sql;
@@ -450,7 +470,7 @@ select * from tt;
 
 -- insert will execute to completion even if function needs just 1 row
 create or replace function insert_tt(text) returns int as
-$$ insert into tt(data) values($1),($1||$1) returning f1 $$
+$$ insert into tt(data) values($1),($1||$1) returning (f1>0)::int $$
 language sql;
 
 select insert_tt('fool');
@@ -643,3 +663,22 @@ explain (verbose, costs off)
 select x from int8_tbl, extractq2_2(int8_tbl) f(x);
 
 select x from int8_tbl, extractq2_2(int8_tbl) f(x);
+
+-- gpdb: test append node in subquery_motionHazard_walker(). Without that
+-- change the select query below will panic.
+create function extractq2_append(t int8_tbl) returns table(ret1 int8) as $$
+  select extractq2(t) union all select extractq2(t)
+$$ language sql immutable;
+
+explain (verbose, costs off)
+select x from int8_tbl, extractq2_append(int8_tbl) f(x);
+
+select x from int8_tbl, extractq2_append(int8_tbl) f(x);
+
+create function extractq2_wapper(t int8_tbl) returns table(ret1 int8) as $$      
+  select (select extractq2(t))                                                  
+$$ language sql immutable;                                                      
+
+explain (verbose, costs off) select x from int8_tbl, extractq2_wapper(int8_tbl) f(x);
+
+select x from int8_tbl, extractq2_wapper(int8_tbl) f(x);

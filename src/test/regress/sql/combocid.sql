@@ -1,7 +1,7 @@
 --
 -- Tests for some likely failure cases with combo cmin/cmax mechanism
 --
-CREATE TEMP TABLE combocidtest (foobar int);
+CREATE TEMP TABLE combocidtest (a int, foobar int);
 
 BEGIN;
 
@@ -17,8 +17,8 @@ INSERT INTO combocidtest SELECT 1 LIMIT 0;
 INSERT INTO combocidtest SELECT 1 LIMIT 0;
 INSERT INTO combocidtest SELECT 1 LIMIT 0;
 
-INSERT INTO combocidtest VALUES (1);
-INSERT INTO combocidtest VALUES (2);
+INSERT INTO combocidtest VALUES (1,1);
+INSERT INTO combocidtest VALUES (2,2);
 
 SELECT ctid,cmin,* FROM combocidtest;
 
@@ -42,7 +42,7 @@ SELECT ctid,cmin,* FROM combocidtest;
 -- Test combo cids with portals
 BEGIN;
 
-INSERT INTO combocidtest VALUES (333);
+INSERT INTO combocidtest VALUES (3,333);
 
 DECLARE c CURSOR FOR SELECT ctid,cmin,* FROM combocidtest;
 
@@ -69,7 +69,7 @@ INSERT INTO combocidtest SELECT 1 LIMIT 0;
 INSERT INTO combocidtest SELECT 1 LIMIT 0;
 INSERT INTO combocidtest SELECT 1 LIMIT 0;
 
-INSERT INTO combocidtest VALUES (444);
+INSERT INTO combocidtest VALUES (3,444);
 
 SELECT ctid,cmin,* FROM combocidtest;
 

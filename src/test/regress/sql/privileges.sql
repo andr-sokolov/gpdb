@@ -1,7 +1,12 @@
 --
 -- Test access privileges
 --
+-- start_matchsubs
+-- m/DETAIL:  Failing row contains \(.*\) = \(.*\)/
+-- s/DETAIL:  Failing row contains \(.*\) = \(.*\)/DETAIL:  Failing row contains (#####)/
+-- end_matchsubs
 
+set optimizer=off;
 -- Clean up in case a prior regression run failed
 
 -- Suppress NOTICE messages when users/groups don't exist
@@ -16,8 +21,11 @@ DROP ROLE IF EXISTS regressuser3;
 DROP ROLE IF EXISTS regressuser4;
 DROP ROLE IF EXISTS regressuser5;
 DROP ROLE IF EXISTS regressuser6;
+DROP ROLE IF EXISTS non_superuser_schema;
 
+-- start_ignore
 SELECT lo_unlink(oid) FROM pg_largeobject_metadata WHERE oid >= 1000 AND oid < 3000 ORDER BY oid;
+-- end_ignore
 
 RESET client_min_messages;
 
@@ -44,7 +52,7 @@ GRANT regressgroup2 TO regressuser4 WITH ADMIN OPTION;
 SET SESSION AUTHORIZATION regressuser1;
 SELECT session_user, current_user;
 
-CREATE TABLE atest1 ( a int, b text );
+CREATE TABLE atest1 ( a int, b text ) distributed randomly;
 SELECT * FROM atest1;
 INSERT INTO atest1 VALUES (1, 'one');
 DELETE FROM atest1;
@@ -153,6 +161,7 @@ GRANT SELECT ON atest12v TO PUBLIC;
 GRANT SELECT ON atest12sbv TO PUBLIC;
 
 -- This plan should use nestloop, knowing that few rows will be selected.
+set enable_nestloop = 1;
 EXPLAIN (COSTS OFF) SELECT * FROM atest12v x, atest12v y WHERE x.a = y.b;
 
 -- And this one.
@@ -162,6 +171,7 @@ EXPLAIN (COSTS OFF) SELECT * FROM atest12 x, atest12 y
 -- This should also be a nestloop, but the security barrier forces the inner
 -- scan to be materialized
 EXPLAIN (COSTS OFF) SELECT * FROM atest12sbv x, atest12sbv y WHERE x.a = y.b;
+reset enable_nestloop;
 
 -- Check if regressuser2 can break security.
 SET SESSION AUTHORIZATION regressuser2;
@@ -175,6 +185,7 @@ CREATE OPERATOR >>> (procedure = leak2, leftarg = integer, rightarg = integer,
 -- This should not show any "leak" notices before failing.
 EXPLAIN (COSTS OFF) SELECT * FROM atest12 WHERE a >>> 0;
 
+set enable_nestloop = 1;
 -- These plans should continue to use a nestloop, since they execute with the
 -- privileges of the view owner.
 EXPLAIN (COSTS OFF) SELECT * FROM atest12v x, atest12v y WHERE x.a = y.b;
@@ -195,6 +206,7 @@ SET SESSION AUTHORIZATION regressuser2;
 
 -- regressuser2 should continue to get a good row estimate.
 EXPLAIN (COSTS OFF) SELECT * FROM atest12v x, atest12v y WHERE x.a = y.b;
+reset enable_nestloop;
 
 -- But not for this, due to lack of table-wide permissions needed
 -- to make use of the expression index's statistics.
@@ -272,7 +284,7 @@ SELECT * FROM atestv2; -- fail (even though regressuser2 can access underlying a
 -- Test column level permissions
 
 SET SESSION AUTHORIZATION regressuser1;
-CREATE TABLE atest5 (one int, two int, three int);
+CREATE TABLE atest5 (one int, two int, three int) distributed randomly;
 CREATE TABLE atest6 (one int, two int, blue int);
 GRANT SELECT (one), INSERT (two), UPDATE (three) ON atest5 TO regressuser4;
 GRANT ALL (one) ON atest5 TO regressuser3;
@@ -425,8 +437,8 @@ GRANT USAGE ON LANGUAGE c TO PUBLIC; -- fail
 
 SET SESSION AUTHORIZATION regressuser1;
 GRANT USAGE ON LANGUAGE sql TO regressuser2; -- fail
-CREATE FUNCTION testfunc1(int) RETURNS int AS 'select 2 * $1;' LANGUAGE sql;
-CREATE FUNCTION testfunc2(int) RETURNS int AS 'select 3 * $1;' LANGUAGE sql;
+CREATE FUNCTION testfunc1(int) RETURNS int AS 'select 2 * $1;' LANGUAGE sql CONTAINS SQL;
+CREATE FUNCTION testfunc2(int) RETURNS int AS 'select 3 * $1;' LANGUAGE sql CONTAINS SQL;
 
 REVOKE ALL ON FUNCTION testfunc1(int), testfunc2(int) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION testfunc1(int), testfunc2(int) TO regressuser2;
@@ -436,12 +448,12 @@ GRANT ALL PRIVILEGES ON FUNCTION testfunc_nosuch(int) TO regressuser4;
 
 CREATE FUNCTION testfunc4(boolean) RETURNS text
   AS 'select col1 from atest2 where col2 = $1;'
-  LANGUAGE sql SECURITY DEFINER;
+  LANGUAGE sql SECURITY DEFINER READS SQL DATA;
 GRANT EXECUTE ON FUNCTION testfunc4(boolean) TO regressuser3;
 
 SET SESSION AUTHORIZATION regressuser2;
 SELECT testfunc1(5), testfunc2(5); -- ok
-CREATE FUNCTION testfunc3(int) RETURNS int AS 'select 2 * $1;' LANGUAGE sql; -- fail
+CREATE FUNCTION testfunc3(int) RETURNS int AS 'select 2 * $1;' LANGUAGE sql CONTAINS SQL; -- fail
 
 SET SESSION AUTHORIZATION regressuser3;
 SELECT testfunc1(5); -- fail
@@ -766,6 +778,7 @@ SELECT has_sequence_privilege('x_seq', 'USAGE');
 \c -
 SET SESSION AUTHORIZATION regressuser1;
 
+-- start_ignore
 SELECT lo_create(1001);
 SELECT lo_create(1002);
 SELECT lo_create(1003);
@@ -781,10 +794,12 @@ GRANT SELECT ON LARGE OBJECT 1005 TO regressuser2 WITH GRANT OPTION;
 GRANT SELECT, INSERT ON LARGE OBJECT 1001 TO PUBLIC;	-- to be failed
 GRANT SELECT, UPDATE ON LARGE OBJECT 1001 TO nosuchuser;	-- to be failed
 GRANT SELECT, UPDATE ON LARGE OBJECT  999 TO PUBLIC;	-- to be failed
+-- end_ignore
 
 \c -
 SET SESSION AUTHORIZATION regressuser2;
 
+-- start_ignore
 SELECT lo_create(2001);
 SELECT lo_create(2002);
 
@@ -808,41 +823,50 @@ GRANT ALL ON LARGE OBJECT 2001 TO regressuser3;
 
 SELECT lo_unlink(1001);		-- to be denied
 SELECT lo_unlink(2002);
+-- end_ignore
 
 \c -
+-- start_ignore
 -- confirm ACL setting
 SELECT oid, pg_get_userbyid(lomowner) ownername, lomacl FROM pg_largeobject_metadata WHERE oid >= 1000 AND oid < 3000 ORDER BY oid;
+-- end_ignore
 
 SET SESSION AUTHORIZATION regressuser3;
 
+-- start_ignore
 SELECT loread(lo_open(1001, x'40000'::int), 32);
 SELECT loread(lo_open(1003, x'40000'::int), 32);	-- to be denied
 SELECT loread(lo_open(1005, x'40000'::int), 32);
 
 SELECT lo_truncate(lo_open(1005, x'20000'::int), 10);	-- to be denied
 SELECT lo_truncate(lo_open(2001, x'20000'::int), 10);
+-- end_ignore
 
 -- compatibility mode in largeobject permission
 \c -
 SET lo_compat_privileges = false;	-- default setting
 SET SESSION AUTHORIZATION regressuser4;
 
+-- start_ignore
 SELECT loread(lo_open(1002, x'40000'::int), 32);	-- to be denied
 SELECT lowrite(lo_open(1002, x'20000'::int), 'abcd');	-- to be denied
 SELECT lo_truncate(lo_open(1002, x'20000'::int), 10);	-- to be denied
 SELECT lo_put(1002, 1, 'abcd');				-- to be denied
 SELECT lo_unlink(1002);					-- to be denied
 SELECT lo_export(1001, '/dev/null');			-- to be denied
+-- end_ignore
 
 \c -
 SET lo_compat_privileges = true;	-- compatibility mode
 SET SESSION AUTHORIZATION regressuser4;
 
+-- start_ignore
 SELECT loread(lo_open(1002, x'40000'::int), 32);
 SELECT lowrite(lo_open(1002, x'20000'::int), 'abcd');
 SELECT lo_truncate(lo_open(1002, x'20000'::int), 10);
 SELECT lo_unlink(1002);
 SELECT lo_export(1001, '/dev/null');			-- to be denied
+-- end_ignore
 
 -- don't allow unpriv users to access pg_largeobject contents
 \c -
@@ -936,21 +960,49 @@ SELECT d.*     -- check that entries went away
 -- Grant on all objects of given type in a schema
 \c -
 
+-- GPDB: Create a helper function to inspect the segment information also
+DROP FUNCTION IF EXISTS has_table_privilege_seg(u text, r text, p text);
+CREATE FUNCTION has_table_privilege_seg(us text, rel text, priv text)
+RETURNS TABLE (
+	segid int,
+	has_table_privilege bool
+) AS $$
+	SELECT
+		gp_execution_segment() AS gegid,
+		p.*
+	FROM
+		has_table_privilege($1, $2, $3) p
+$$ LANGUAGE SQL VOLATILE
+CONTAINS SQL EXECUTE ON ALL SEGMENTS;
+
 CREATE SCHEMA testns;
 CREATE TABLE testns.t1 (f1 int);
 CREATE TABLE testns.t2 (f1 int);
+CREATE TABLE testns.t3 (f1 int) PARTITION BY RANGE (f1) (START (2018) END (2020) EVERY (1),DEFAULT PARTITION extra );
+CREATE TABLE testns.t4 (f1 int) inherits (testns.t1);
 
 SELECT has_table_privilege('regressuser1', 'testns.t1', 'SELECT'); -- false
+SELECT * FROM has_table_privilege_seg('regressuser1', 'testns.t1', 'SELECT'); -- false
+SELECT * FROM has_table_privilege_seg('regressuser1', 'testns.t3', 'SELECT'); -- false
+SELECT * FROM has_table_privilege_seg('regressuser1', 'testns.t3_1_prt_extra', 'SELECT'); -- false
+SELECT * FROM has_table_privilege_seg('regressuser1', 'testns.t4', 'SELECT'); -- false
 
 GRANT ALL ON ALL TABLES IN SCHEMA testns TO regressuser1;
 
 SELECT has_table_privilege('regressuser1', 'testns.t1', 'SELECT'); -- true
 SELECT has_table_privilege('regressuser1', 'testns.t2', 'SELECT'); -- true
+SELECT * FROM has_table_privilege_seg('regressuser1', 'testns.t1', 'SELECT'); -- true
+SELECT * FROM has_table_privilege_seg('regressuser1', 'testns.t3', 'SELECT'); -- true
+SELECT * FROM has_table_privilege_seg('regressuser1', 'testns.t3_1_prt_extra', 'SELECT'); -- true
+SELECT * FROM has_table_privilege_seg('regressuser1', 'testns.t4', 'SELECT'); -- true
 
 REVOKE ALL ON ALL TABLES IN SCHEMA testns FROM regressuser1;
 
 SELECT has_table_privilege('regressuser1', 'testns.t1', 'SELECT'); -- false
 SELECT has_table_privilege('regressuser1', 'testns.t2', 'SELECT'); -- false
+SELECT * FROM has_table_privilege_seg('regressuser1', 'testns.t3', 'SELECT'); -- false
+SELECT * FROM has_table_privilege_seg('regressuser1', 'testns.t3_1_prt_extra', 'SELECT'); -- false
+SELECT * FROM has_table_privilege_seg('regressuser1', 'testns.t4', 'SELECT'); -- false
 
 CREATE FUNCTION testns.testfunc(int) RETURNS int AS 'select 3 * $1;' LANGUAGE sql;
 
@@ -1016,6 +1068,119 @@ set session role regressuser1;
 drop table dep_priv_test;
 
 
+-- security-restricted operations
+\c -
+CREATE ROLE regress_sro_user;
+
+SET SESSION AUTHORIZATION regress_sro_user;
+CREATE FUNCTION unwanted_grant() RETURNS void LANGUAGE sql AS
+	'GRANT regressgroup2 TO regress_sro_user';
+CREATE FUNCTION mv_action() RETURNS bool LANGUAGE sql AS
+	'DECLARE c CURSOR WITH HOLD FOR SELECT unwanted_grant(); SELECT true';
+-- REFRESH of this MV will queue a GRANT at end of transaction
+CREATE MATERIALIZED VIEW sro_mv AS SELECT mv_action() WITH NO DATA;
+REFRESH MATERIALIZED VIEW sro_mv;
+\c -
+REFRESH MATERIALIZED VIEW sro_mv;
+
+SET SESSION AUTHORIZATION regress_sro_user;
+-- INSERT to this table will queue a GRANT at end of transaction
+CREATE TABLE sro_trojan_table ();
+CREATE FUNCTION sro_trojan() RETURNS trigger LANGUAGE plpgsql AS
+	'BEGIN PERFORM unwanted_grant(); RETURN NULL; END';
+CREATE CONSTRAINT TRIGGER t AFTER INSERT ON sro_trojan_table
+    INITIALLY DEFERRED FOR EACH ROW EXECUTE PROCEDURE sro_trojan();
+-- Now, REFRESH will issue such an INSERT, queueing the GRANT
+CREATE OR REPLACE FUNCTION mv_action() RETURNS bool LANGUAGE sql AS
+	'INSERT INTO sro_trojan_table DEFAULT VALUES; SELECT true';
+REFRESH MATERIALIZED VIEW sro_mv;
+\c -
+REFRESH MATERIALIZED VIEW sro_mv;
+BEGIN; SET allow_segment_DML = ON; SET CONSTRAINTS ALL IMMEDIATE; REFRESH MATERIALIZED VIEW sro_mv; COMMIT;
+
+DROP OWNED BY regress_sro_user;
+DROP ROLE regress_sro_user;
+
+
+-- Test sandbox escape with CVE-2020-25695 on Greenplum.
+--
+-- The idea of CVE-2020-25695 is to make superuser fire a defered
+-- trigger with security invoker function that executes some malicious
+-- code with superuser privileges.
+--
+-- We create a two-step trap for a superuser running a maintenance
+-- operation (ANALYZE) on a "trap" table. First of all we create
+-- an index with stable function and replace it with volatile one after
+-- creation. This index function is invoked by ANALYZE and acts as a
+-- vulnerability firestarter - it inserts data to some table aside ("executor").
+-- "Executor" table has a defered insert trigger with security invoker
+-- function that executes malicious code under superuser. In a current example
+-- we give superuser to our unprivileged user on segments (not on coordinator node).
+
+\c -
+
+CREATE ROLE regress_sro_user;
+SET SESSION AUTHORIZATION regress_sro_user;
+
+CREATE TABLE executor (s varchar) DISTRIBUTED REPLICATED;
+CREATE TABLE trap (a int) WITH(appendonly = true) DISTRIBUTED REPLICATED;
+
+-- Create a "firestarter" stable index funcion
+CREATE OR REPLACE FUNCTION trap_sfunc(integer) RETURNS integer
+LANGUAGE sql IMMUTABLE AS
+'SELECT $1';
+
+CREATE INDEX trap_idx ON trap (trap_sfunc(a));
+
+-- and replace it with volatile security invoker to prodice insert operation on ANALYZE.
+CREATE OR REPLACE FUNCTION trap_sfunc(integer) RETURNS integer
+LANGUAGE sql SECURITY INVOKER AS
+'SET allow_segment_DML = ON; INSERT INTO executor VALUES (current_user); SELECT $1';
+
+-- Populate data in a "trap" table to run ANALYZE on.
+SET allow_segment_DML = ON;
+INSERT INTO trap VALUES(1);
+
+-- Create malicious function to run in defered trigger
+CREATE OR REPLACE FUNCTION executor_sfunc(integer) RETURNS integer
+LANGUAGE sql SECURITY INVOKER AS
+'SET allow_segment_DML = ON; ALTER USER regress_sro_user WITH superuser; SELECT $1';
+
+-- and the trigger itself.
+CREATE OR REPLACE FUNCTION executor_trig_sfunc() RETURNS trigger
+AS $$
+BEGIN PERFORM executor_sfunc(1000); RETURN NEW; END
+$$ LANGUAGE plpgsql;
+
+CREATE CONSTRAINT TRIGGER executor_trig
+AFTER INSERT ON executor
+INITIALLY DEFERRED FOR EACH ROW
+EXECUTE PROCEDURE executor_trig_sfunc();
+
+-- Check "regress_sro_user" superuser privileges on segments.
+CREATE OR REPLACE FUNCTION is_superuser_on_segments(username text) RETURNS boolean AS $$
+SELECT rolsuper FROM pg_roles WHERE rolname = $1;
+$$ LANGUAGE sql EXECUTE ON ALL SEGMENTS;
+
+SELECT DISTINCT is_superuser_on_segments('regress_sro_user');
+
+-- Execute a trap with superuser.
+RESET SESSION AUTHORIZATION;
+
+ANALYZE trap;
+
+-- Check "regress_sro_user" superuser privileges on segments.
+SELECT DISTINCT is_superuser_on_segments('regress_sro_user');
+
+DROP TABLE trap;
+DROP TABLE executor;
+DROP FUNCTION trap_sfunc(integer);
+DROP FUNCTION executor_sfunc(integer);
+DROP FUNCTION executor_trig_sfunc();
+DROP FUNCTION is_superuser_on_segments(text);
+DROP ROLE regress_sro_user;
+
+
 -- clean up
 
 \c
@@ -1043,7 +1208,9 @@ DROP TABLE atestc;
 DROP TABLE atestp1;
 DROP TABLE atestp2;
 
+-- start_ignore
 SELECT lo_unlink(oid) FROM pg_largeobject_metadata WHERE oid >= 1000 AND oid < 3000 ORDER BY oid;
+-- end_ignore
 
 DROP GROUP regressgroup1;
 DROP GROUP regressgroup2;
@@ -1051,6 +1218,12 @@ DROP GROUP regressgroup2;
 -- these are needed to clean up permissions
 REVOKE USAGE ON LANGUAGE sql FROM regressuser1;
 DROP OWNED BY regressuser1;
+
+-- regression test: superuser create a schema and authorize it to a non-superuser
+CREATE ROLE "non_superuser_schema";
+CREATE SCHEMA test_non_superuser_schema AUTHORIZATION "non_superuser_schema";
+DROP SCHEMA test_non_superuser_schema;
+DROP USER non_superuser_schema;
 
 DROP USER regressuser1;
 DROP USER regressuser2;

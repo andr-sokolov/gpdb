@@ -31,6 +31,18 @@
 #include "utils/memutils.h"
 #include "utils/tzparser.h"
 
+/*
+ * We don't support locale-aware month names or day-of-week names, or non-arabic numbers,
+ * and we know the only alpha or numeric chars we can handle are in the ASCII7 set.
+ * So we can use these replacements for the standard versions.
+ * I think these are faster.
+ */
+#undef isdigit
+#define isdigit(x) ((x) >= '0' && (x) <= '9')
+#undef isalpha
+#define isalpha(x) (((x) >= 'a' && (x) <= 'z') || ((x) >= 'A' && (x) <= 'Z'))
+#undef isalnum
+#define isalnum(x) (isalpha(x) || isdigit(x))
 
 static int DecodeNumber(int flen, char *field, bool haveTextMonth,
 			 int fmask, int *tmask,
@@ -434,10 +446,20 @@ AppendSeconds(char *cp, int sec, fsec_t fsec, int precision, bool fillzeros)
 	else
 	{
 #ifdef HAVE_INT64_TIMESTAMP
-		if (fillzeros)
-			sprintf(cp, "%02d.%0*d", abs(sec), precision, (int) Abs(fsec));
-		else
-			sprintf(cp, "%d.%0*d", abs(sec), precision, (int) Abs(fsec));
+		int			j = 0;
+
+		if (fillzeros || abs(sec)  > 9)
+			cp[j++] = abs(sec)  / 10 + '0';
+		cp[j++] = abs(sec)  % 10 + '0';
+		cp[j++] = '.';
+		cp[j++] =  ((int) Abs(fsec) )/ 100000 + '0';
+		cp[j++] = ((int) Abs(fsec) ) / 10000 % 10 + '0';
+		cp[j++] = ((int) Abs(fsec) ) / 1000 % 10 + '0';
+		cp[j++] = ((int) Abs(fsec) ) / 100 % 10 + '0';
+		cp[j++] = ((int) Abs(fsec) ) / 10 % 10 + '0';
+		cp[j++] = ((int) Abs(fsec) ) % 10 + '0';
+		cp[j] = '\0';
+
 #else
 		if (fillzeros)
 			sprintf(cp, "%0*.*f", precision + 3, precision, fabs(sec + fsec));
@@ -1134,8 +1156,11 @@ DecodeDateTime(char **field, int *ftype, int nf,
 					flen = strlen(field[i]);
 					cp = strchr(field[i], '.');
 
-					/* Embedded decimal and no date yet? */
-					if (cp != NULL && !(fmask & DTK_DATE_M))
+					/* 
+					 * Embedded decimal and no date yet? Only do this if
+					 * we're not looking at something like YYYYMMDDHHMMSS.mm
+					 */
+					if (cp != NULL && !(fmask & DTK_DATE_M) && flen <= 14)
 					{
 						dterr = DecodeDate(field[i], fmask,
 										   &tmask, &is2digits, tm);
@@ -2398,6 +2423,7 @@ DecodeDate(char *str, int fmask, int *tmask, bool *is2digits,
 				val,
 				dmask = 0;
 	char	   *field[MAXDATEFIELDS];
+	int			fieldlens[MAXDATEFIELDS];
 
 	*tmask = 0;
 
@@ -2423,6 +2449,7 @@ DecodeDate(char *str, int fmask, int *tmask, bool *is2digits,
 				str++;
 		}
 
+		fieldlens[nf] = str - field[nf];
 		/* Just get rid of any non-digit, non-alpha characters... */
 		if (*str != '\0')
 			*str++ = '\0';
@@ -2466,7 +2493,7 @@ DecodeDate(char *str, int fmask, int *tmask, bool *is2digits,
 		if (field[i] == NULL)
 			continue;
 
-		if ((len = strlen(field[i])) <= 0)
+		if ((len = fieldlens[i]) <= 0)
 			return DTERR_BAD_FORMAT;
 
 		dterr = DecodeNumber(len, field[i], haveTextMonth, fmask,
@@ -3639,6 +3666,7 @@ DecodeISO8601Interval(char *str,
 						continue;
 					}
 					/* Else fall through to extended alternative format */
+					/* FALL THROUGH */
 				case '-':		/* ISO 8601 4.4.3.3 Alternative Format,
 								 * Extended */
 					if (havefield)
@@ -3717,6 +3745,7 @@ DecodeISO8601Interval(char *str,
 						return 0;
 					}
 					/* Else fall through to extended alternative format */
+					/* FALL THROUGH */
 				case ':':		/* ISO 8601 4.4.3.3 Alternative Format,
 								 * Extended */
 					if (havefield)
@@ -3910,6 +3939,45 @@ EncodeTimezone(char *str, int tz, int style)
 		sprintf(str, "%02d", hour);
 }
 
+
+/* 
+ * Convenience routine for encoding dates faster than sprintf does.
+ * tm is the timestamp structure, str is the string, pos is position in
+ * the string which we are at. Upon returning, it is set to the offset of the
+ * last character we set in str.
+ */
+inline static void
+fast_encode_date(struct pg_tm * tm, char *str, int *pos)
+{
+	/*
+	 * sprintf() is very slow so we just convert the numbers to
+	 * a string manually. Since we allow dates in the range
+	 * 4713 BC to 5874897 AD, we have to check for years
+	 * with 7, 6 and 5 digits, being careful to not add
+	 * leading zeros for those. We only zero pad to four digits.
+	 */
+	int y = (tm->tm_year > 0) ? tm->tm_year : -(tm->tm_year - 1);
+	
+	if (y >= 1000000)
+		str[(*pos)++] = y / 1000000 % 10 + '0';
+	if (y >= 100000)
+		str[(*pos)++] = y / 100000 % 10 + '0';
+	if (y >= 10000)
+		str[(*pos)++] = y / 10000 % 10 + '0';
+	
+	str[(*pos)++] = y/1000 % 10 + '0';
+	str[(*pos)++] = y/100 % 10 + '0';
+	str[(*pos)++] = y/10 % 10 + '0';
+	str[(*pos)++] = y % 10 + '0';
+	str[(*pos)++] = '-';
+	str[(*pos)++] = tm->tm_mon/10 + '0'; 
+	str[(*pos)++] = tm->tm_mon % 10 + '0';
+	str[(*pos)++] = '-';
+	str[(*pos)++] = tm->tm_mday/10 + '0';
+	str[(*pos)++] = tm->tm_mday % 10 + '0';
+	str[(*pos)] = '\0';
+}
+
 /* EncodeDateOnly()
  * Encode date as local time.
  */
@@ -3924,8 +3992,12 @@ EncodeDateOnly(struct pg_tm * tm, int style, char *str)
 		case USE_XSD_DATES:
 			/* compatible with ISO date formats */
 			if (tm->tm_year > 0)
-				sprintf(str, "%04d-%02d-%02d",
-						tm->tm_year, tm->tm_mon, tm->tm_mday);
+			{
+				//				sprintf(str, "%04d-%02d-%02d",
+				//		tm->tm_year, tm->tm_mon, tm->tm_mday);
+				int j = 0;
+				fast_encode_date(tm, str, &j);
+			}
 			else
 				sprintf(str, "%04d-%02d-%02d %s",
 						-(tm->tm_year - 1), tm->tm_mon, tm->tm_mday, "BC");
@@ -3979,7 +4051,13 @@ EncodeDateOnly(struct pg_tm * tm, int style, char *str)
 void
 EncodeTimeOnly(struct pg_tm * tm, fsec_t fsec, bool print_tz, int tz, int style, char *str)
 {
-	sprintf(str, "%02d:%02d:", tm->tm_hour, tm->tm_min);
+	str[0] = tm->tm_hour/10 + '0';
+	str[1] = tm->tm_hour % 10 + '0';
+	str[2] = ':';
+	str[3] = tm->tm_min/10 + '0';
+	str[4] = tm->tm_min % 10 + '0';
+	str[5] = ':';
+	str[6] = '\0';
 	str += strlen(str);
 
 	AppendSeconds(str, tm->tm_sec, fsec, MAX_TIME_PRECISION, true);
@@ -4023,15 +4101,29 @@ EncodeDateTime(struct pg_tm * tm, fsec_t fsec, bool print_tz, int tz, const char
 		case USE_ISO_DATES:
 		case USE_XSD_DATES:
 			/* Compatible with ISO-8601 date formats */
-
-			if (style == USE_ISO_DATES)
-				sprintf(str, "%04d-%02d-%02d %02d:%02d:",
-						(tm->tm_year > 0) ? tm->tm_year : -(tm->tm_year - 1),
-						tm->tm_mon, tm->tm_mday, tm->tm_hour, tm->tm_min);
-			else
-				sprintf(str, "%04d-%02d-%02dT%02d:%02d:",
-						(tm->tm_year > 0) ? tm->tm_year : -(tm->tm_year - 1),
-						tm->tm_mon, tm->tm_mday, tm->tm_hour, tm->tm_min);
+			{
+                int j = 0;
+				/*
+				 * sprintf is very slow so we just convert the numbers to
+				 * a string manually. Since we allow dates in the range
+				 * 4713 BC to 5874897 AD, we have to check for years
+				 * with 7, 6 and 5 digits, being careful to not add
+				 * leading zeros for those. We only zero pad to four digits.
+				 */
+				fast_encode_date(tm, str, &j);
+				if (style == USE_ISO_DATES)
+					str[j++] = ' ';
+				else
+					str[j++] = 'T';	// XSD uses a T between date and time
+				
+				str[j++] = tm->tm_hour/10 + '0';
+				str[j++] = tm->tm_hour % 10 + '0';
+				str[j++] = ':';
+				str[j++] = tm->tm_min/10 + '0';
+				str[j++] = tm->tm_min % 10 + '0';
+				str[j++] = ':';
+				str[j] = '\0';
+			}
 
 			AppendTimestampSeconds(str + strlen(str), tm, fsec);
 

@@ -47,19 +47,19 @@ CREATE TYPE text_w_default;
 CREATE FUNCTION int42_in(cstring)
    RETURNS int42
    AS 'int4in'
-   LANGUAGE internal STRICT;
+   LANGUAGE internal IMMUTABLE STRICT;
 CREATE FUNCTION int42_out(int42)
    RETURNS cstring
    AS 'int4out'
-   LANGUAGE internal STRICT;
+   LANGUAGE internal IMMUTABLE STRICT;
 CREATE FUNCTION text_w_default_in(cstring)
    RETURNS text_w_default
    AS 'textin'
-   LANGUAGE internal STRICT;
+   LANGUAGE internal IMMUTABLE STRICT;
 CREATE FUNCTION text_w_default_out(text_w_default)
    RETURNS cstring
    AS 'textout'
-   LANGUAGE internal STRICT;
+   LANGUAGE internal IMMUTABLE STRICT;
 
 CREATE TYPE int42 (
    internallength = 4,
@@ -90,7 +90,7 @@ CREATE TYPE default_test_row AS (f1 text_w_default, f2 int42);
 
 CREATE FUNCTION get_default_test() RETURNS SETOF default_test_row AS '
   SELECT * FROM default_test;
-' LANGUAGE SQL;
+' LANGUAGE SQL READS SQL DATA;
 
 SELECT * FROM get_default_test();
 
@@ -134,3 +134,12 @@ CREATE TEMP TABLE mytab (foo widget(42,13));
 
 SELECT format_type(atttypid,atttypmod) FROM pg_attribute
 WHERE attrelid = 'mytab'::regclass AND attnum > 0;
+
+-- Create & Drop type as non-superuser
+CREATE USER user_bob;
+SET SESSION AUTHORIZATION user_bob;
+CREATE TYPE shell; -- not allowed
+CREATE TYPE compfoo as (f1 int, f2 text);
+DROP TYPE compfoo;
+RESET SESSION AUTHORIZATION;
+DROP USER user_bob;

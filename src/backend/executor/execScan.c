@@ -7,6 +7,8 @@
  *	  stuff - checking the qualification and projecting the tuple
  *	  appropriately.
  *
+ * Portions Copyright (c) 2006 - present, EMC/Greenplum
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -65,7 +67,7 @@ ExecScanFetch(ScanState *node,
 				return ExecClearTuple(slot);
 
 			/* Store test tuple in the plan node's scan slot */
-			ExecStoreTuple(estate->es_epqTuple[scanrelid - 1],
+			ExecStoreHeapTuple(estate->es_epqTuple[scanrelid - 1],
 						   slot, InvalidBuffer, false);
 
 			/* Check if it meets the access-method conditions */
@@ -112,8 +114,6 @@ ExecScan(ScanState *node,
 	ExprContext *econtext;
 	List	   *qual;
 	ProjectionInfo *projInfo;
-	ExprDoneCond isDone;
-	TupleTableSlot *resultSlot;
 
 	/*
 	 * Fetch data from node
@@ -133,24 +133,8 @@ ExecScan(ScanState *node,
 	}
 
 	/*
-	 * Check to see if we're still projecting out tuples from a previous scan
-	 * tuple (because there is a function-returning-set in the projection
-	 * expressions).  If so, try to project another one.
-	 */
-	if (node->ps.ps_TupFromTlist)
-	{
-		Assert(projInfo);		/* can't get here if not projecting */
-		resultSlot = ExecProject(projInfo, &isDone);
-		if (isDone == ExprMultipleResult)
-			return resultSlot;
-		/* Done with that source tuple... */
-		node->ps.ps_TupFromTlist = false;
-	}
-
-	/*
 	 * Reset per-tuple memory context to free any expression evaluation
-	 * storage allocated in the previous tuple cycle.  Note this can't happen
-	 * until we're done projecting out tuples from a scan tuple.
+	 * storage allocated in the previous tuple cycle.
 	 */
 	ResetExprContext(econtext);
 
@@ -163,6 +147,9 @@ ExecScan(ScanState *node,
 		TupleTableSlot *slot;
 
 		CHECK_FOR_INTERRUPTS();
+
+		if (QueryFinishPending)
+			return NULL;
 
 		slot = ExecScanFetch(node, accessMtd, recheckMtd);
 
@@ -201,15 +188,9 @@ ExecScan(ScanState *node,
 			{
 				/*
 				 * Form a projection tuple, store it in the result tuple slot
-				 * and return it --- unless we find we can project no tuples
-				 * from this scan tuple, in which case continue scan.
+				 * and return it.
 				 */
-				resultSlot = ExecProject(projInfo, &isDone);
-				if (isDone != ExprEndResult)
-				{
-					node->ps.ps_TupFromTlist = (isDone == ExprMultipleResult);
-					return resultSlot;
-				}
+				return ExecProject(projInfo, NULL);
 			}
 			else
 			{
@@ -283,8 +264,8 @@ tlist_matches_tupdesc(PlanState *ps, List *tlist, Index varno, TupleDesc tupdesc
 		var = (Var *) ((TargetEntry *) lfirst(tlist_item))->expr;
 		if (!var || !IsA(var, Var))
 			return false;		/* tlist item not a Var */
+
 		/* if these Asserts fail, planner messed up */
-		Assert(var->varno == varno);
 		Assert(var->varlevelsup == 0);
 		if (var->varattno != attrno)
 			return false;		/* out of order */
@@ -316,9 +297,21 @@ tlist_matches_tupdesc(PlanState *ps, List *tlist, Index varno, TupleDesc tupdesc
 	 * If the plan context requires a particular hasoid setting, then that has
 	 * to match, too.
 	 */
-	if (ExecContextForcesOids(ps, &hasoid) &&
-		hasoid != tupdesc->tdhasoid)
-		return false;
+ 	{
+		bool forceOids = ExecContextForcesOids(ps, &hasoid);
+
+		/* If Oid matters, and there are different requirement, then does not match */
+		if (forceOids && hasoid != tupdesc->tdhasoid)
+			return false;
+
+		/*
+		 * If Oid does not matter, but old tupdesc has oids, does not match either.
+		 * XXX: Memtuple: tupleformat is different depends on if has oid, so we cannot
+		 * mismatch.
+		 */
+		if (!forceOids && tupdesc->tdhasoid)
+			return false;
+	}
 
 	return true;
 }
@@ -335,7 +328,7 @@ ExecScanReScan(ScanState *node)
 	EState	   *estate = node->ps.state;
 
 	/* Stop projecting any tuples from SRFs in the targetlist */
-	node->ps.ps_TupFromTlist = false;
+	/* node->ps.ps_TupFromTlist = false; */
 
 	/*
 	 * We must clear the scan tuple so that observers (e.g., execCurrent.c)
